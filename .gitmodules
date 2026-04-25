@@ -1,0 +1,12 @@
+[submodule "models/kronos"]
+	path = models/kronos
+	url = https://github.com/shiyu-coder/Kronos.git
+[submodule "agents/fingpt"]
+	path = agents/fingpt
+	url = https://github.com/AI4Finance-Foundation/FinGPT.git
+[submodule "agents/trading_agents"]
+	path = agents/trading_agents
+	url = https://github.com/TauricResearch/TradingAgents.git
+[submodule "backtest/vectorbt_india"]
+	path = backtest/vectorbt_india
+	url = https://github.com/marketcalls/vectorbt-backtesting-skills.git

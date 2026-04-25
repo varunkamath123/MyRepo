@@ -1,0 +1,7 @@
+logs/
+data/
+*.pyc
+__pycache__/
+.env
+logs/upstox_token.txt
+*.csv
