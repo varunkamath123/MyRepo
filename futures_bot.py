@@ -14,7 +14,7 @@ from config import (
     MAIN_SESSION_END, MIN_ADX, KRONOS_FORECAST_BARS,
     KRONOS_CONFIDENCE_MIN,
 )
-from core.kronos_signal import forecast_direction
+from core.kronos_signal import forecast, forecast_direction
 from core.sentiment_signal import get_sentiment
 from core.conviction_selector import InstrumentSignal, select_best
 from core.exit_monitor import Position, BarData, check_exit
@@ -107,20 +107,29 @@ def run_loop(instruments: list[str], headlines: list[str], paper: bool = False):
         # ── Exit check for active position ────────────────────────────────────
         if active_position:
             try:
-                df = load_ohlcv(active_position.instrument)
+                df  = load_ohlcv(active_position.instrument)
                 ltp = get_ltp(INSTRUMENTS[active_position.instrument]["symbol"])
-                k_dir, _ = forecast_direction(df, KRONOS_FORECAST_BARS)
-                st = supertrend(df)
-                bar = BarData(close=ltp, supertrend=st, kronos_direction=k_dir, sentiment_score=sentiment)
+                kf  = forecast(df, KRONOS_FORECAST_BARS)   # full candle forecast
+                st  = supertrend(df)
+                bar = BarData(
+                    close=ltp, supertrend=st,
+                    kronos_direction=kf.direction,
+                    sentiment_score=sentiment,
+                )
                 should_exit, reason = check_exit(active_position, bar)
                 if should_exit:
-                    cfg = INSTRUMENTS[active_position.instrument]
+                    cfg  = INSTRUMENTS[active_position.instrument]
                     side = "SELL" if active_position.direction == "LONG" else "BUY"
                     place_order(cfg["symbol"], side, cfg["lot_size"] * active_position.lots,
                                 paper=paper or not cfg["live"])
                     log.info("[EXIT] %s %s → reason: %s", active_position.instrument,
                              active_position.direction, reason)
                     active_position = None
+                else:
+                    # Log current candle outlook on each check
+                    log.info("[HOLD] %s | Kronos=%s quality=%s | target=%.2f stop=%.2f",
+                             active_position.instrument, kf.direction,
+                             kf.quality.label, kf.quality.price_target, kf.quality.stop_level)
             except Exception as e:
                 log.error("[EXIT_CHECK] Error: %s", e)
 
@@ -129,20 +138,24 @@ def run_loop(instruments: list[str], headlines: list[str], paper: bool = False):
             signals = []
             for inst in instruments:
                 try:
-                    df = load_ohlcv(inst)
+                    df  = load_ohlcv(inst)
                     adx = compute_adx(df)
                     if adx < MIN_ADX:
                         log.info("[SCAN] %s ADX=%.1f < %d, skip", inst, adx, MIN_ADX)
                         continue
-                    k_dir, k_conf = forecast_direction(df, KRONOS_FORECAST_BARS)
-                    if k_conf < KRONOS_CONFIDENCE_MIN or k_dir == "NEUTRAL":
+                    kf = forecast(df, KRONOS_FORECAST_BARS)   # full candle forecast
+                    if kf.confidence < KRONOS_CONFIDENCE_MIN or kf.direction == "NEUTRAL":
+                        log.info("[SCAN] %s Kronos=%s conf=%.2f quality=%s — skip",
+                                 inst, kf.direction, kf.confidence, kf.quality.label)
                         continue
-                    st = supertrend(df)
                     mirofish_score = 0.5   # placeholder until MiroFish pre-market run integrated
                     sig = InstrumentSignal(
-                        instrument=inst, direction=k_dir,
-                        kronos_confidence=k_conf, sentiment_score=sentiment,
-                        mirofish_score=mirofish_score, adx=adx,
+                        instrument=inst,
+                        direction=kf.direction,
+                        forecast=kf,
+                        sentiment_score=sentiment,
+                        mirofish_score=mirofish_score,
+                        adx=adx,
                     )
                     signals.append(sig)
                 except Exception as e:
