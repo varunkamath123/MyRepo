@@ -2785,9 +2785,16 @@ class TradingBot:
                     _target    = self.inst_cfg.get('path_a_otm1_target',
                                       getattr(config, 'PATH_A_OTM_1_TARGET', 1.20))
                     _trail_act = getattr(config, 'PATH_A_OTM_TRAIL_ACT', 0.10)
-                else:   # ATM A_HELD uses IV-scaled target if stored, else main-session
+                else:   # ATM — use IV-scaled target if stored, else main-session
                     _target    = pos.get('target_pct', config.BASE_TARGET)
-                    _trail_act = config.TRAILING_ACTIVATION
+                    # A_HELD (ORB held past checkpoint) keeps wide 18% trail — June analysis
+                    # showed 12% trail fired prematurely on transient dips (Jun 1 BNF: exited
+                    # at +₹1.2k vs +₹4.3k at force-close). REV/RECLAIM use TRAILING_ACTIVATION
+                    # (12%) since they are shorter-lived moves where earlier protection helps.
+                    _trail_act = (getattr(config, 'TRAIL_ACT_ORB_HELD',
+                                          config.TRAILING_ACTIVATION)
+                                  if _path == 'A_HELD'
+                                  else config.TRAILING_ACTIVATION)
 
             exit_reason = None
             if _sl_triggered:

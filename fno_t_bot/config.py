@@ -204,9 +204,14 @@ BASE_TARGET         = 0.55         # 55% backstop — spike exits first on explo
                                    # trail from 18% captures sustained trends; 55% fires on exceptional days.
                                    # 55/25 stop = 2.2:1 R:R. Trail arms at 18% and is primary profit exit.
 USE_TRAILING_PROFIT = True
-TRAILING_ACTIVATION = 0.18         # Start trailing at 18% gain (was 60%)
-                                   # 18% = ~110pt NIFTY move. Trail activates on normal trending days.
-TRAILING_DISTANCE   = 0.10         # Trail distance 10% from peak (was 20%)
+TRAILING_ACTIVATION  = 0.12        # Start trailing at 12% gain — applies to REV and RECLAIM paths.
+                                   # ORB_HELD (A_HELD) uses the wider TRAIL_ACT_ORB_HELD below.
+                                   # REV/RECLAIM are shorter-lived reversals; arm trail earlier to protect gains.
+TRAIL_ACT_ORB_HELD   = 0.18        # Trail activation for ORB_HELD (held past 12:00 checkpoint).
+                                   # June comparison: 18% trail preserved +₹4,339 on Jun 1 BNF ORB_HELD
+                                   # vs 12% which fired on a transient dip, capturing only +₹1,209.
+                                   # ORB_HELD positions are strong-trend survivors — wider trail is correct.
+TRAILING_DISTANCE    = 0.10        # Trail distance 10% from peak (was 20%)
                                    # Tighter trail: locks in gains sooner on slower-moving 12-DTE options.
 
 # Dynamic profit target — scale BASE_TARGET with ATM-IV at entry (May 2026)
