@@ -1,7 +1,27 @@
 logs/
 data/
+data_breeze/
 *.pyc
 __pycache__/
 .env
 logs/upstox_token.txt
 *.csv
+
+# FnO_T_Bot — secrets and runtime artifacts
+fno_t_bot/logs/
+fno_t_bot/data/
+fno_t_bot/data_breeze/
+*.pem
+fno-t-bot-new-key
+fno-t-bot-new-key.pub
+fno_t_bot/fno-t-bot-*
+token.txt
+breeze_keys.json
+*.jsonl
+*.log
+*.html
+fyersApi.log
+fyersRequests.log
+early_session_results.json
+gap_stats_raw.csv
+backtest_trades*.csv
