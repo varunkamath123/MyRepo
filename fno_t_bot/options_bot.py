@@ -153,6 +153,11 @@ class TradingBot:
         self.entry_end     = dtime(*map(int, _ee.split(':')))
         self._last_scan_ts     = None   # throttle scan logs to once per 5-min bar
         self._bot_id           = f'MAIN_{instrument}'   # shared_state key
+        # ── Regime + Quality state ─────────────────────────────────────────
+        self._regime               = 'MIXED'   # TRENDING / CHOPPY / MIXED
+        self._regime_date          = None      # date when regime was last detected
+        self._quality_state        = 'NORMAL'  # NORMAL / REDUCED
+        self._quality_consecutive_wins = 0
 
         # ── Challenger (shadow OI-guided strategy) state ──────────────────────
         # Champion  = current live strategy (ATM strike, vX fresh-crossover only)
@@ -2923,6 +2928,7 @@ class TradingBot:
                     'exit_band'        : pos.get('last_exit_band',  None),  # HOLD/CAUTION/EXIT
                 })
                 self._save_trade_log()
+                self._compute_rolling_quality()   # re-evaluate quality after each closed trade
 
                 # ── Learner: record actual outcome ────────────────────────
                 try:
@@ -3461,6 +3467,147 @@ class TradingBot:
                 f"({'+' if delta >= 0 else ''}{delta:,.0f} vs Champion)"
             )
 
+    # ── Regime Detection ──────────────────────────────────────────────────────
+
+    def _detect_regime(self, df: 'pd.DataFrame | None' = None) -> str:
+        """Map _daily_regime posture → TRENDING/CHOPPY/MIXED.  Sets self._regime.
+        Primary: reads self._daily_regime (set by market_regime.py in _reset_daily_state).
+        Fallback: ADX@11:00 on last REGIME_LOOKBACK_DAYS past trading days."""
+        if not getattr(config, 'REGIME_DETECTION_ENABLED', True):
+            self._regime = 'MIXED'
+            return self._regime
+        try:
+            dr = getattr(self, '_daily_regime', None)
+            if dr is not None:
+                if dr.posture == 'CAUTIOUS':
+                    regime = 'CHOPPY'
+                elif dr.posture == 'AGGRESSIVE':
+                    regime = 'TRENDING'
+                else:
+                    regime = 'MIXED'
+                self._regime = regime
+                self.logger.info(
+                    f"[REGIME] {self.instrument}: {regime} "
+                    f"({dr.regime} conf={dr.confidence} streak={dr.streak}d "
+                    f"posture={dr.posture})"
+                )
+                return self._regime
+            # Fallback: live ADX@11:00 scan on recent past days
+            if df is None:
+                df_raw = self.get_index_data()
+                if df_raw is None:
+                    self._regime = 'MIXED'
+                    return self._regime
+                df = self.add_indicators(df_raw)
+            lookback    = getattr(config, 'REGIME_LOOKBACK_DAYS', 3)
+            choppy_max  = getattr(config, 'REGIME_CHOPPY_ADX_MAX', 25.0)
+            trend_min   = getattr(config, 'REGIME_TRENDING_ADX_MIN', 28.0)
+            choppy_need = getattr(config, 'REGIME_CHOPPY_DAYS_NEEDED', 2)
+            today       = datetime.now(IST).date()
+            _11h        = dtime(11, 0)
+            past_dates  = sorted(set(
+                ts.date() for ts in df.index if ts.date() < today
+            ))[-lookback:]
+            if len(past_dates) < 2:
+                self._regime = 'MIXED'
+                self.logger.info(f"[REGIME] {self.instrument}: not enough history — MIXED")
+                return self._regime
+            adx_at_11 = []
+            for d in past_dates:
+                day_bars = df[df.index.date == d]
+                eligible = day_bars[day_bars.index.time <= _11h]
+                if eligible.empty or 'ADX' not in eligible.columns:
+                    continue
+                adx_at_11.append((d, float(eligible['ADX'].iloc[-1])))
+            if not adx_at_11:
+                self._regime = 'MIXED'
+                return self._regime
+            choppy_count = sum(1 for _, a in adx_at_11 if a < choppy_max)
+            trend_count  = sum(1 for _, a in adx_at_11 if a >= trend_min)
+            if choppy_count >= choppy_need:
+                regime = 'CHOPPY'
+            elif trend_count >= choppy_need:
+                regime = 'TRENDING'
+            else:
+                regime = 'MIXED'
+            self._regime = regime
+            summary = ', '.join(f"{str(d)[-5:]}={a:.1f}" for d, a in adx_at_11)
+            self.logger.info(
+                f"[REGIME] {self.instrument}: {regime} (ADX@11:00 fallback "
+                f"[{summary}] choppy={choppy_count} trend={trend_count}/{len(adx_at_11)})"
+            )
+        except Exception as exc:
+            self.logger.warning(f"[REGIME] Detection error: {exc} — defaulting to MIXED")
+            self._regime = 'MIXED'
+        return self._regime
+
+    def _compute_rolling_quality(self) -> str:
+        """Track last QUALITY_GATE_LOOKBACK live trades. Enter REDUCED if WR and
+        combined loss both breach thresholds.  Reset after QUALITY_GATE_RESET_WINS
+        consecutive wins.  Sets self._quality_state."""
+        if not getattr(config, 'QUALITY_GATE_ENABLED', True):
+            self._quality_state = 'NORMAL'
+            return self._quality_state
+        try:
+            lookback   = getattr(config, 'QUALITY_GATE_LOOKBACK', 5)
+            wr_min     = getattr(config, 'QUALITY_GATE_WR_MIN', 0.40)
+            loss_thr   = getattr(config, 'QUALITY_GATE_LOSS_THRESHOLD', 5000.0)
+            reset_wins = getattr(config, 'QUALITY_GATE_RESET_WINS', 2)
+            today      = datetime.now(IST).date()
+            trades: list = []
+            for i in range(15):
+                d     = today - timedelta(days=i)
+                fpath = self._trade_log_path(d.strftime('%Y-%m-%d'))
+                if not os.path.exists(fpath):
+                    continue
+                try:
+                    with open(fpath) as f:
+                        for raw in f:
+                            raw = raw.strip()
+                            if not raw:
+                                continue
+                            t = json.loads(raw)
+                            if t.get('exit_reason') and t.get('mode') == 'live':
+                                trades.append(t)
+                except Exception:
+                    continue
+            if not trades:
+                self._quality_state = 'NORMAL'
+                return self._quality_state
+            trades.sort(key=lambda x: x.get('exit_time', ''))
+            recent   = trades[-lookback:]
+            wins     = sum(1 for t in recent if t.get('pnl_net', 0) > 0)
+            wr       = wins / len(recent)
+            combined = sum(t.get('pnl_net', 0) for t in recent)
+            consec   = 0
+            for t in reversed(trades):
+                if t.get('pnl_net', 0) > 0:
+                    consec += 1
+                else:
+                    break
+            self._quality_consecutive_wins = consec
+            prev = self._quality_state
+            if prev == 'REDUCED' and consec >= reset_wins:
+                new_state = 'NORMAL'
+            elif wr < wr_min and combined < -loss_thr:
+                new_state = 'REDUCED'
+            else:
+                new_state = 'NORMAL'
+            if new_state != prev:
+                self.logger.info(
+                    f"[QUALITY] {self.instrument}: {prev} → {new_state}"
+                )
+            self._quality_state = new_state
+            self.logger.info(
+                f"[QUALITY] {self.instrument}: {new_state} | "
+                f"last {len(recent)} live WR={wr:.0%} combined=₹{combined:,.0f} "
+                f"consec_wins={consec}"
+            )
+        except Exception as exc:
+            self.logger.warning(f"[QUALITY] Gate error: {exc} — defaulting to NORMAL")
+            self._quality_state = 'NORMAL'
+        return self._quality_state
+
     # ── Main Loop ─────────────────────────────────────────────────────────────
 
     def run(self) -> None:
@@ -3508,6 +3655,7 @@ class TradingBot:
 
         self._recover_positions()   # re-register any open positions after mid-session restart
         self._load_today_trades()   # restore intraday trade count + P&L from JSONL
+        self._compute_rolling_quality()   # assess recent signal quality at startup
 
         while True:
             try:
@@ -3724,6 +3872,10 @@ class TradingBot:
                     )
 
                 df            = self.add_indicators(df)
+                # ── Regime detection: once per trading day after first data ─
+                if self._regime_date != today:
+                    self._detect_regime(df)
+                    self._regime_date = today
                 current_price = float(df['Close'].iloc[-1])
                 hv            = float(df['HV'].iloc[-1])
 
@@ -4240,9 +4392,21 @@ class TradingBot:
                     # Fires after ORB window when morning trend exhausts + options
                     # reposition toward MaxPain.  Paper-only until PATH_REV_LIVE=True.
                     # Runs independently of _main_window (has its own time gate).
+                    _rev_choppy_skip = (
+                        self._regime == 'CHOPPY'
+                        and getattr(config, 'REGIME_CHOPPY_REV_SKIP', True)
+                        and getattr(config, 'REGIME_DETECTION_ENABLED', True)
+                    )
+                    if (signal is None and _rev_choppy_skip
+                            and not self._path_rev_fired and not self.positions
+                            and now.strftime('%H:%M') >= getattr(config, 'PATH_REV_START', '12:00')):
+                        self.logger.debug(
+                            f"  [REGIME] {self.instrument}: CHOPPY — REV suppressed"
+                        )
                     if (signal is None
                             and not self._path_rev_fired
-                            and not self.positions):
+                            and not self.positions
+                            and not _rev_choppy_skip):
                         _rev_sig = self.get_path_rev_signal(df, oc, now)
                         if _rev_sig:
                             if getattr(config, 'PATH_REV_LIVE', False):
@@ -4362,6 +4526,36 @@ class TradingBot:
                             self.logger.info(
                                 f"  [OI] {self.instrument}: {_oi_reason}"
                             )
+
+                        # ── Regime + Quality gate ────────────────────────────────
+                        if (signal and
+                                getattr(config, 'REGIME_DETECTION_ENABLED', True)
+                                and self._regime == 'CHOPPY'):
+                            _lots = min(_lots, getattr(config, 'REGIME_CHOPPY_LOTS_CAP', 1))
+                            if signal.get('path') == 'REV':
+                                self.logger.info(
+                                    f"  [REGIME] {self.instrument}: CHOPPY — REV blocked"
+                                )
+                                signal = None
+                            else:
+                                self.logger.info(
+                                    f"  [REGIME] {self.instrument}: CHOPPY — "
+                                    f"lots capped to {_lots}"
+                                )
+                        if (signal and
+                                getattr(config, 'QUALITY_GATE_ENABLED', True)
+                                and self._quality_state == 'REDUCED'):
+                            _lots = min(_lots, 1)
+                            if signal.get('path') == 'REV':
+                                self.logger.info(
+                                    f"  [QUALITY] {self.instrument}: REDUCED — REV blocked"
+                                )
+                                signal = None
+                            else:
+                                self.logger.info(
+                                    f"  [QUALITY] {self.instrument}: REDUCED — "
+                                    f"lots capped to 1"
+                                )
 
                         # ── Reversal Guard (trend exhaustion filter) ────────────
                         # Scores 0-100: RSI extreme, RSI divergence, VWAP stretch,

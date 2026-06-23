@@ -318,6 +318,26 @@ RISK_FREE_RATE           = 0.065
 # Enforced via shared_state.py — no new entries when grand_total ≤ -cap.
 CONSOLIDATED_DAILY_LOSS_CAP = 8000   # ₹8,000 combined across all instruments/bots
 
+# ─── Regime Detection ─────────────────────────────────────────────────────────
+# Classifies last N trading days as TRENDING/CHOPPY/MIXED via ADX at 11:00.
+# CHOPPY mode: cap lots to 1, suppress REV.
+REGIME_DETECTION_ENABLED    = True
+REGIME_LOOKBACK_DAYS        = 3      # trading days to inspect
+REGIME_CHOPPY_ADX_MAX       = 25.0   # ADX@11:00 below this = choppy day
+REGIME_TRENDING_ADX_MIN     = 28.0   # ADX@11:00 at/above this = trending day
+REGIME_CHOPPY_DAYS_NEEDED   = 2      # N choppy days in window → CHOPPY mode
+REGIME_CHOPPY_LOTS_CAP      = 1      # max lots in CHOPPY mode
+REGIME_CHOPPY_REV_SKIP      = True   # suppress REV entirely in CHOPPY mode
+
+# ─── Rolling Signal Quality Gate ──────────────────────────────────────────────
+# Tracks last N live trades. WR + combined loss both must breach thresholds
+# before reducing exposure (REDUCED: 1 lot, no REV). Resets on 2 consec wins.
+QUALITY_GATE_ENABLED        = True
+QUALITY_GATE_LOOKBACK       = 5      # rolling window (live trades)
+QUALITY_GATE_WR_MIN         = 0.40   # WR below this triggers check
+QUALITY_GATE_LOSS_THRESHOLD = 5000.0 # combined P&L must also be < -₹5,000
+QUALITY_GATE_RESET_WINS     = 2      # consecutive wins needed to exit REDUCED
+
 # ─── Path G — OI Breakout Scout ──────────────────────────────────────────────
 # Fires when price breaks through a MAJOR/WALL OI level without EMA cross.
 # Window: 10:00–13:30 (earlier than vX — catches pre-EMA breakouts).
