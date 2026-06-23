@@ -3546,9 +3546,12 @@ class TradingBot:
                 #   params (SL 25%, trail act 18%, trail dist 10%) → closes at 14:30.
                 # CLOSE → hard force-close (capital protection on noise days).
                 _path_a_fc_time   = self._get_day_cfg(now.strftime('%a'))['checkpoint']
+                _chk_t = dtime(*map(int, _path_a_fc_time.split(':')))
                 _path_a_positions = [p for p in self.positions
                                      if p.get('path') == 'A' and
-                                     not p.get('path_a_checkpoint_done', False)]
+                                     not p.get('path_a_checkpoint_done', False) and
+                                     p.get('entry_time') and
+                                     p['entry_time'].time() < _chk_t]
                 if (_path_a_positions and
                         now.strftime('%H:%M') >= _path_a_fc_time):
                     df_fc = self.get_index_data()
@@ -4636,7 +4639,7 @@ class TradingBot:
                                         # better payout if breakout continues to move the
                                         # option from OTM → near-ATM / ITM.
                                         _lots = max(1, _p11['lot_suggestion'])  # STRONG: upgrade (not cap)
-                                        if getattr(config, 'POST11_OTM_BOOST', False) and signal:
+                                        if getattr(config, 'POST11_OTM_BOOST', False) and getattr(config, 'PATH_A_OTM_ENABLED', False) and signal:
                                             _old_otm = signal.get('otm_strikes', 0)
                                             _new_otm = min(_old_otm + 1, 2)
                                             if _new_otm != _old_otm:
