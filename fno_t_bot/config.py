@@ -39,10 +39,10 @@ INSTRUMENTS = {
         'option_prefix'      : 'NSE:NIFTY',
         'lot_size'           : 65,        # confirmed Mar 2026
         'strike_gap'         : 50,
-        'expiry_weekday'     : 0,         # Monday (Mon=0) — NIFTY changed from Thu to Mon
-        'monthly_expiry_only': True,      # NIFTY now has one expiry per month (last Monday)
-                                          # Fyers uses YYMMM format: NSE:NIFTY26APR24200CE
-                                          # Compact weekly format no longer valid
+        'expiry_weekday'     : 1,         # Tuesday (Mon=0) — 2026 regime: weekly Tuesday expiry
+        'monthly_expiry_only': False,     # NIFTY has weekly Tuesday expiries (not monthly-only)
+                                          # Fyers compact format: NSE:NIFTY266DD[strike]CE
+                                          # Confirmed Jun 2026: fills land on weekly Tue contracts
         'capital'            : 26000,     # ₹26k — unified bot (ORB 09:30–11:00 + main 11:00–14:30)
     },
     'BANKNIFTY': {
@@ -50,9 +50,9 @@ INSTRUMENTS = {
         'option_prefix'      : 'NSE:BANKNIFTY',
         'lot_size'           : 30,        # confirmed Mar 2026 (SEBI raised from 15)
         'strike_gap'         : 100,
-        'expiry_weekday'     : 2,         # Wednesday (Mon=0) — monthly last Wed
+        'expiry_weekday'     : 1,         # Tuesday (Mon=0) — 2026 regime: monthly last Tuesday
         'monthly_expiry_only': True,      # SEBI Nov 2023: NSE dropped BANKNIFTY weeklies
-                                          # Only monthly expiry (last Wed of month) is valid
+                                          # Only monthly expiry (last Tue of month) is valid
         'capital'            : 26000,     # ₹26k — unified bot (ORB 09:30–11:00 + main 11:00–14:30)
     },
     'SENSEX': {
