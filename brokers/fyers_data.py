@@ -55,9 +55,9 @@ def get_fyers_client():
         )
 
     access_token = token_file.read_text().strip()
-    client_id = os.environ.get("FYERS_CLIENT_ID", "")
+    client_id = os.environ.get("FYERS_APP_ID", "")
     if not client_id:
-        raise ValueError("FYERS_CLIENT_ID not set in environment / .env")
+        raise ValueError("FYERS_APP_ID not set in environment / .env")
 
     try:
         from fyers_apiv3 import fyersModel
