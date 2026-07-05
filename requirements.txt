@@ -9,3 +9,4 @@ vectorbt>=0.26.1
 ta>=0.11.0
 schedule>=1.2.0
 python-dotenv>=1.0.0
+fyers-apiv3>=3.0.0

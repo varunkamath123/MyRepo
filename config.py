@@ -1,6 +1,6 @@
 """
 Kronos Futures Bot — Central Configuration
-Broker: Upstox API | Indices: NIFTY, BANKNIFTY, SENSEX futures
+Data: Fyers API (live OHLCV + LTP)  |  Orders: paper (Upstox when live)
 """
 
 # ── Capital ────────────────────────────────────────────────────────────────────

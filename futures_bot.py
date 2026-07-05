@@ -18,7 +18,8 @@ from core.kronos_signal import forecast, forecast_direction
 from core.sentiment_signal import get_sentiment
 from core.conviction_selector import InstrumentSignal, select_best
 from core.exit_monitor import Position, BarData, check_exit
-from brokers.upstox_orders import place_order, get_ltp
+from brokers.upstox_orders import place_order
+from brokers.fyers_data import load_ohlcv as _fyers_ohlcv, get_ltp as _fyers_ltp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,13 +52,22 @@ def in_entry_window() -> bool:
 
 
 def load_ohlcv(instrument: str) -> pd.DataFrame:
-    """Load recent 5-min OHLCV from data directory."""
+    """Fetch recent 5-min OHLCV from Fyers API (live) or fall back to CSV cache."""
     import os
-    path = f"data/{instrument.lower()}_5min.csv"
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"No data file: {path}")
-    df = pd.read_csv(path, parse_dates=["datetime"])
-    return df.tail(300).reset_index(drop=True)
+    try:
+        df = _fyers_ohlcv(instrument, bars=300)
+        # Cache to disk so backtest/eval scripts can use it offline
+        path = f"data/{instrument.lower()}_5min.csv"
+        os.makedirs("data", exist_ok=True)
+        df.to_csv(path, index=False)
+        return df
+    except Exception as e:
+        log.warning("[DATA] Fyers fetch failed (%s) — trying CSV cache.", e)
+        path = f"data/{instrument.lower()}_5min.csv"
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"No Fyers data and no CSV cache: {path}") from e
+        df = pd.read_csv(path, parse_dates=["datetime"])
+        return df.tail(300).reset_index(drop=True)
 
 
 def compute_adx(df: pd.DataFrame, period: int = 14) -> float:
@@ -108,7 +118,7 @@ def run_loop(instruments: list[str], headlines: list[str], paper: bool = False):
         if active_position:
             try:
                 df  = load_ohlcv(active_position.instrument)
-                ltp = get_ltp(INSTRUMENTS[active_position.instrument]["symbol"])
+                ltp = _fyers_ltp(active_position.instrument)
                 kf  = forecast(df, KRONOS_FORECAST_BARS)   # full candle forecast
                 st  = supertrend(df)
                 bar = BarData(
@@ -164,7 +174,7 @@ def run_loop(instruments: list[str], headlines: list[str], paper: bool = False):
             best = select_best(signals)
             if best:
                 cfg = INSTRUMENTS[best.instrument]
-                ltp = get_ltp(cfg["symbol"])
+                ltp = _fyers_ltp(best.instrument)
                 side = "BUY" if best.direction == "LONG" else "SELL"
                 place_order(cfg["symbol"], side, cfg["lot_size"],
                             paper=paper or not cfg["live"])
