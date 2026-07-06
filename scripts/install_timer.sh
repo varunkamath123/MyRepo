@@ -9,8 +9,9 @@ echo "==> Installing systemd units..."
 sudo cp $REPO/scripts/upstox_token_refresh.service /etc/systemd/system/
 sudo cp $REPO/scripts/upstox_token_refresh.timer   /etc/systemd/system/
 
-echo "==> Installing pyotp in venv..."
-/opt/kronos_bot/venv/bin/pip install pyotp --quiet
+echo "==> Installing pyotp + playwright in venv..."
+/opt/kronos_bot/venv/bin/pip install pyotp playwright --quiet
+/opt/kronos_bot/venv/bin/playwright install chromium --with-deps
 
 echo "==> Enabling and starting timer..."
 sudo systemctl daemon-reload
