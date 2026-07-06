@@ -80,45 +80,37 @@ def _headless_get_auth_code(api_key: str, redirect_uri: str,
         log.info("[PW] Loading Upstox login page…")
         page.goto(full_url, wait_until="networkidle", timeout=30000)
 
-        # ── Step 1: Mobile number ────────────────────────────────────────────
+        # ── Step 1: Mobile number → click "Get OTP" ──────────────────────────
         log.info("[PW] Entering mobile number…")
-        mobile_sel = "input[type='tel'], input[type='number'], input[type='text']"
-        page.wait_for_selector(mobile_sel, timeout=15000)
-        page.fill(mobile_sel, mobile)
+        page.wait_for_selector("input[type='text']", timeout=15000)
+        page.fill("input[type='text']", mobile)
         page.wait_for_timeout(500)
-        page.keyboard.press("Enter")
+        page.get_by_text("Get OTP").click()
         page.wait_for_load_state("networkidle", timeout=15000)
+        page.wait_for_timeout(1000)
 
-        # ── Step 2: PIN / Password ───────────────────────────────────────────
-        log.info("[PW] Entering PIN…")
+        # ── Step 2: TOTP code → click "Continue" ────────────────────────────
+        log.info("[PW] Entering TOTP…")
         try:
-            page.wait_for_selector("input[type='password']", timeout=10000)
+            page.wait_for_selector("input[type='text']", timeout=10000)
+            totp_code = pyotp.TOTP(totp_key).now()
+            page.fill("input[type='text']", totp_code)
+            page.wait_for_timeout(500)
+            page.get_by_text("Continue").click()
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except PWTimeout:
+            log.warning("[PW] No OTP field after Get OTP — check TOTP setup")
+
+        # ── Step 3: PIN (if shown as second factor) ──────────────────────────
+        try:
+            page.wait_for_selector("input[type='password']", timeout=5000)
+            log.info("[PW] Entering PIN…")
             page.fill("input[type='password']", pin)
             page.wait_for_timeout(500)
-            page.keyboard.press("Enter")
+            page.get_by_text("Continue").click()
             page.wait_for_load_state("networkidle", timeout=15000)
         except PWTimeout:
-            log.warning("[PW] No password field found — may have already progressed")
-
-        # ── Step 3: TOTP (if shown) ──────────────────────────────────────────
-        try:
-            page.wait_for_selector(
-                "input[placeholder*='OTP'], input[placeholder*='TOTP'], "
-                "input[name*='otp'], input[name*='totp']",
-                timeout=5000,
-            )
-            totp_code = pyotp.TOTP(totp_key).now()
-            log.info("[PW] Entering TOTP…")
-            page.fill(
-                "input[placeholder*='OTP'], input[placeholder*='TOTP'], "
-                "input[name*='otp'], input[name*='totp']",
-                totp_code,
-            )
-            page.wait_for_timeout(500)
-            page.keyboard.press("Enter")
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except PWTimeout:
-            log.info("[PW] No TOTP field — skipping")
+            log.info("[PW] No PIN field — skipping")
 
         # Allow a moment for the final redirect
         page.wait_for_timeout(2000)
