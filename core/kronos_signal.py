@@ -18,9 +18,15 @@ from core.candle_patterns import ForecastQuality, score_forecast
 
 log = logging.getLogger(__name__)
 
-# Add the quant_trading Kronos model directory to sys.path so we can import
-# the real KronosPredictor rather than using HuggingFace transformers.
-_KRONOS_MODEL_DIR = Path("C:/quant_trading/Kronos")
+# Add the Kronos source directory to sys.path.
+# Windows dev: C:/quant_trading/Kronos   (local clone)
+# Linux/EC2:   /opt/kronos_bot/kronos_src  (cloned from shiyu-coder/Kronos)
+import platform as _platform
+_KRONOS_MODEL_DIR = (
+    Path("C:/quant_trading/Kronos")
+    if _platform.system() == "Windows"
+    else Path("/opt/kronos_bot/kronos_src")
+)
 if str(_KRONOS_MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(_KRONOS_MODEL_DIR))
 
