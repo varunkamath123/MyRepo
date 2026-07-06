@@ -76,7 +76,7 @@ def _load_predictor():
         model.eval()
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        _predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
+        _predictor = KronosPredictor(model, tokenizer, device=device, max_context=128)
         log.info("[KRONOS] Model loaded on %s.", device)
     except Exception as e:
         log.error("[KRONOS] Failed to load model: %s", e)
@@ -155,7 +155,7 @@ def _kronos_predict(ohlcv: pd.DataFrame, bars: int) -> tuple[pd.DataFrame, str]:
     """
     predictor = _load_predictor()
 
-    df = ohlcv.copy().tail(512)   # use at most 512 bars as context
+    df = ohlcv.copy().tail(128)   # 128 bars is sufficient context; 512 is very slow on CPU
 
     # Resolve timestamp column
     if "datetime" in df.columns:

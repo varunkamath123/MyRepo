@@ -52,8 +52,9 @@ TRAIL_ACTIVATE_PCT   = 0.060   # 6%: let positional trades breathe before traili
 TRAIL_DISTANCE_PCT   = 0.025   # 2.5%: wider trail so minor pullbacks don't close winners
 KRONOS_CONF_MIN      = 0.45    # minimum ATR-normalised confidence to enter
 KRONOS_REV_CONF_MIN  = 0.45    # minimum confidence for an opposite signal to trigger exit
-FORECAST_BARS        = 12      # daily bars to predict (~2.5 weeks)
+FORECAST_BARS        = 5       # daily bars to predict (5 days = 1 week; sufficient for direction)
 MIN_CONTEXT_BARS     = 60      # minimum history before first signal
+SIGNAL_CACHE_BARS    = 3       # re-run Kronos at most every N bars (saves ~3x inference calls)
 
 EXIT_ON_KRONOS_REVERSAL  = True
 EXIT_ON_SUPERTREND_FLIP  = True
@@ -191,16 +192,31 @@ def backtest_instrument(
     trail_active: bool            = False
     trail_stop:   float           = 0.0
 
+    # Signal cache: avoid running Kronos inference every bar (expensive on CPU).
+    # Re-evaluate every SIGNAL_CACHE_BARS bars, or immediately after a position close.
+    _cached_dir:  str   = "NEUTRAL"
+    _cached_conf: float = 0.0
+    _cached_src:  str   = ""
+    _last_signal_bar: int = -999
+
     log.info("[BT] %s | %d bars | lot=%d", instrument, len(df), lot_size)
 
     for i in range(MIN_CONTEXT_BARS, len(df) - 1):
         ctx   = df.iloc[: i + 1].copy()          # history up to and including bar i
         today = df.iloc[i]
         nxt   = df.iloc[i + 1]                    # entry / exit prices come from next bar
-        close = float(today["close"])
         nxt_open  = float(nxt["open"])
         nxt_close = float(nxt["close"])
         nxt_date  = pd.Timestamp(nxt["datetime"])
+
+        # Refresh signal cache if stale
+        need_signal = (i - _last_signal_bar) >= SIGNAL_CACHE_BARS
+        if need_signal:
+            try:
+                _cached_dir, _cached_conf, _cached_src = get_signal(ctx, force_fallback)
+                _last_signal_bar = i
+            except Exception as e:
+                log.debug("[BT] Signal error bar %d: %s", i, e)
 
         # ── Exit check (against next bar's close after entry) ─────────────────
         if pos is not None:
@@ -213,6 +229,7 @@ def backtest_instrument(
             if pnl_pct <= -STOP_LOSS_PCT:
                 _close(pos, i + 1, nxt_date, price, "STOP_LOSS", trades)
                 pos = None; hwm = trail_stop = 0.0; trail_active = False
+                _last_signal_bar = -999   # force refresh after exit
                 continue
 
             # Trailing stop
@@ -229,18 +246,19 @@ def backtest_instrument(
                 if hit:
                     _close(pos, i + 1, nxt_date, price, "TRAIL_STOP", trades)
                     pos = None; hwm = trail_stop = 0.0; trail_active = False
+                    _last_signal_bar = -999
                     continue
 
-            # Signal-based exits
+            # Signal-based exits (use cached signal)
             try:
-                kdir, kconf, _ = get_signal(ctx, force_fallback)
-                st             = supertrend(ctx)
+                st = supertrend(ctx)
 
                 if EXIT_ON_KRONOS_REVERSAL:
                     opp = "SHORT" if pos.direction == "LONG" else "LONG"
-                    if kdir == opp and kconf >= KRONOS_REV_CONF_MIN:
+                    if _cached_dir == opp and _cached_conf >= KRONOS_REV_CONF_MIN:
                         _close(pos, i + 1, nxt_date, price, "KRONOS_REV", trades)
                         pos = None; hwm = trail_stop = 0.0; trail_active = False
+                        _last_signal_bar = -999
                         continue
 
                 if EXIT_ON_SUPERTREND_FLIP:
@@ -248,6 +266,7 @@ def backtest_instrument(
                        (pos.direction == "SHORT" and st == "BULL"):
                         _close(pos, i + 1, nxt_date, price, "ST_FLIP", trades)
                         pos = None; hwm = trail_stop = 0.0; trail_active = False
+                        _last_signal_bar = -999
                         continue
             except Exception as e:
                 log.debug("[BT] Exit signal error bar %d: %s", i, e)
@@ -260,7 +279,7 @@ def backtest_instrument(
             if adx < MIN_ADX:
                 continue
 
-            direction, confidence, source = get_signal(ctx, force_fallback)
+            direction, confidence, source = _cached_dir, _cached_conf, _cached_src
             if confidence < KRONOS_CONF_MIN or direction == "NEUTRAL":
                 continue
 
