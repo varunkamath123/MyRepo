@@ -53,6 +53,7 @@ INSTRUMENTS = {
         'expiry_weekday'     : 1,         # Tuesday (Mon=0) — 2026 regime: monthly last Tuesday
         'monthly_expiry_only': True,      # SEBI Nov 2023: NSE dropped BANKNIFTY weeklies
                                           # Only monthly expiry (last Tue of month) is valid
+        'skip_monday_before_expiry': True, # Mon before last-Tue rolls DTE to ~29 — wrong option
         'capital'            : 26000,     # ₹26k — unified bot (ORB 09:30–11:00 + main 11:00–14:30)
     },
     'SENSEX': {
@@ -328,6 +329,8 @@ REGIME_TRENDING_ADX_MIN     = 28.0   # ADX@11:00 at/above this = trending day
 REGIME_CHOPPY_DAYS_NEEDED   = 2      # N choppy days in window → CHOPPY mode
 REGIME_CHOPPY_LOTS_CAP      = 1      # max lots in CHOPPY mode
 REGIME_CHOPPY_REV_SKIP      = True   # suppress REV entirely in CHOPPY mode
+REGIME_CHOPPY_LATE_ORB_SKIP = True   # block late-window ORB in CHOPPY (theta trap on INSIDE days)
+REGIME_TRENDING_REV_SKIP    = True   # block REV in TRENDING regime (waning-ADX ≠ reversal in trend)
 
 # ─── Rolling Signal Quality Gate ──────────────────────────────────────────────
 # Tracks last N live trades. WR + combined loss both must breach thresholds
@@ -839,8 +842,9 @@ PATH_A_LATE_END           = '13:00'  # outer ORB scan window: 09:30 ≤ t < 13:0
 PATH_A_LATE_ADX_MIN       = 32       # raised from 25 floor — late entries need confirmed trend
 PATH_A_LATE_MIN_STRENGTH  = 1        # lowered from 2 (DI+ST gate compensates for strength req)
 PATH_A_LATE_DI_SPREAD     = 12       # NEW: min |DI+ − DI-| — directional clarity gate
-PATH_A_LATE_ST5_REQUIRED  = True     # NEW: ST5 must confirm direction — blocks counter-trend late
-PATH_A_LATE_LOTS          = 1        # NEW: late entries always 1 lot regardless of strength score
+PATH_A_LATE_ST5_REQUIRED  = True     # ST5 must confirm direction — blocks counter-trend late
+PATH_A_LATE_HTF_REQUIRED  = True     # 15m SuperTrend must align — hard gate, not just SCORER -20pts
+PATH_A_LATE_LOTS          = 1        # late entries always 1 lot regardless of strength score
 
 # Per-day ADX minimum
 PATH_A_DAY_ADX_MIN = {
@@ -920,7 +924,7 @@ GST_RATE                 = 0.18            # 18% on brokerage + exchange + SEBI
 #   1. Set INSTRUMENT_STRATEGY['SENSEX']['live_mode'] = True
 #   2. Restart fno_t_bot_sensex service
 SENSEX_LIVE_THRESHOLD     = 75_000   # ₹75k target combined NF+BNF capital
-SENSEX_LIVE_START_CAPITAL = 52_000   # ₹52k starting capital (₹26k NF + ₹26k BNF)
+SENSEX_LIVE_START_CAPITAL = 52_997   # recalibrated Jul 6 2026: Rs50k actual balance after settlement + Rs50k deposit
 LIVE_SWITCH_DATE          = '2026-04-06'  # Date NIFTY + BANKNIFTY went live (Apr 6 2026)
                                           # capital_status.py only counts trades from this date
 

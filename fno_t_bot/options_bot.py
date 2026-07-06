@@ -231,6 +231,8 @@ class TradingBot:
         self._morning_di_peak   = 0.0   # peak |DI+ − DI−| during ORB window
         self._path_rev_fired    = False  # one PATH_REV entry per day
         self._ivskew_hist       = []    # [(ts_float, ivskew), …] for 30-min drift
+        self._skip_bnf_today    = False  # set daily: Monday before BNF monthly expiry
+        self._st15m             = None   # cached 15m SuperTrend (+1/-1) from get_htf_context
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
@@ -1507,6 +1509,37 @@ class TradingBot:
                             f"late window ST5={_st5_val} — counter-trend late entry blocked"
                         )
                         return None
+
+            # ── Late window guard 4: 15m SuperTrend must align ───────────────
+            # HTF ST gives 0/20 in SCORER but does not hard-block. In the late
+            # window (short runway), a directly opposing 15m trend is sufficient
+            # to kill the trade — extreme 5m ADX still compensated the SCORER
+            # for Jun 11 NF (15m BEAR + CALL, ADX=42 → 55/100, -₹2,240).
+            if getattr(config, 'PATH_A_LATE_HTF_REQUIRED', True):
+                _st15 = getattr(self, '_st15m', None)
+                if _st15 is not None:
+                    _st15_ok = (
+                        (sig_type == 'CALL' and _st15 == 1) or
+                        (sig_type == 'PUT'  and _st15 == -1)
+                    )
+                    if not _st15_ok:
+                        _st15_str = 'BULL' if _st15 == 1 else 'BEAR'
+                        self.logger.info(
+                            f"  [PATH-A-SKIP] {self.instrument} {sig_type}: "
+                            f"late window 15m-ST={_st15_str} opposes — HTF hard gate"
+                        )
+                        return None
+
+            # ── Late window guard 5: CHOPPY regime skip ──────────────────────
+            # INSIDE_OPEN + CHOPPY + 12:xx entry = theta trap (no momentum
+            # to reach 55% target in ≤2h before 14:30 force-close).
+            if getattr(config, 'REGIME_CHOPPY_LATE_ORB_SKIP', False):
+                if getattr(self, '_regime', 'MIXED') == 'CHOPPY':
+                    self.logger.info(
+                        f"  [PATH-A-SKIP] {self.instrument} {sig_type}: "
+                        f"CHOPPY regime — late-window ORB suppressed"
+                    )
+                    return None
 
         # ── OTM degree: driven by distance to next significant S/R level ────
         # Primary signal: how far is the next MAJOR/WALL OI level in the
@@ -3109,6 +3142,20 @@ class TradingBot:
         # Reversal direction is opposite of the morning move
         rev_dir = 'CALL' if self._morning_dir == 'PUT' else 'PUT'
 
+        # ── Regime gate: TRENDING days are driven by directional conviction,
+        # not options expiry dynamics. Waning ADX in a TRENDING day = trend
+        # pause, not reversal. Evidence: Jun 4/9/10 BNF all TRENDING_BULL + PUT
+        # REV = -₹5,410 combined. After v1.3 blocks CHOPPY→REV, TRENDING is
+        # the remaining gap.
+        if getattr(config, 'REGIME_TRENDING_REV_SKIP', False):
+            _regime = getattr(self, '_regime', 'MIXED')
+            if _regime == 'TRENDING':
+                self.logger.info(
+                    f"  [PATH-REV-SKIP] {self.instrument} {rev_dir}: "
+                    f"TRENDING regime — MaxPain snap suppressed (conviction > mean-reversion)"
+                )
+                return None
+
         row  = df.iloc[-1]
         _px  = float(row['Close'])
         _adx = float(row.get('ADX',      0.0) or 0.0)
@@ -3214,6 +3261,21 @@ class TradingBot:
             'dynamic_or' : False,
         }
 
+    def _is_monday_before_bnf_monthly_expiry(self, today) -> bool:
+        """Return True on the Monday before BNF's last-Tuesday-of-month expiry.
+        On that day MIN_DAYS_TO_EXPIRY=2 rolls forward to next month (~DTE 29),
+        making the option far too long-dated for intraday gamma capture.
+        """
+        if not self.inst_cfg.get('skip_monday_before_expiry', False):
+            return False
+        if today.weekday() != 0:  # not Monday
+            return False
+        tomorrow = today + timedelta(days=1)
+        if tomorrow.weekday() != 1:  # tomorrow not Tuesday (sanity check)
+            return False
+        # Last Tuesday of month: adding 7 days pushes into next month
+        return (tomorrow + timedelta(days=7)).month != tomorrow.month
+
     def _reset_daily_state(self) -> None:
         today = datetime.now(IST).date()
         if self.current_date != today:
@@ -3283,6 +3345,14 @@ class TradingBot:
             self._morning_di_peak   = 0.0
             self._path_rev_fired    = False
             self._ivskew_hist       = []
+
+            # ── BNF Monday-before-monthly-expiry skip ─────────────────────
+            self._skip_bnf_today = self._is_monday_before_bnf_monthly_expiry(today)
+            if self._skip_bnf_today:
+                self.logger.info(
+                    f"[BNF-SKIP] {self.instrument}: Monday before monthly expiry "
+                    f"— skipping today (DTE would roll to ~29d, wrong instrument)"
+                )
 
             # ── Compute daily regime snapshot (market_regime.py) ──────────
             if _REGIME_AVAIL:
@@ -3885,6 +3955,7 @@ class TradingBot:
 
                 # ── Multi-timeframe context + option chain ────────────────
                 htf = self.get_htf_context()
+                self._st15m = htf.get('supertrend_15m')  # cache for get_path_a_signal late gate
                 oc  = self.get_option_chain_context(current_price)
                 st_label = {1: 'BULL', -1: 'BEAR'}.get(
                     htf.get('supertrend_15m'), '?')
@@ -3930,6 +4001,8 @@ class TradingBot:
                 )
                 if can_enter and self.skip_thursday and now.weekday() == 3:
                     can_enter = False   # Thursday block (SENSEX: all Thursday trades net negative)
+                if can_enter and self._skip_bnf_today:
+                    can_enter = False   # BNF Monday-before-monthly-expiry: DTE rolls ~29d
 
                 # ── VIX Goldilocks Gate (Gap 1) ───────────────────────────────
                 # Only trade when India VIX is in the "goldilocks" 11–22 zone.
@@ -4323,7 +4396,8 @@ class TradingBot:
                             self.trades_today < config.MAX_TRADES_PER_DAY and
                             self.daily_pnl > -config.MAX_DAILY_LOSS and
                             not shared_state.is_consolidated_loss_exceeded() and
-                            not (self.skip_thursday and now.weekday() == 3)
+                            not (self.skip_thursday and now.weekday() == 3) and
+                            not self._skip_bnf_today
                         )
                         if _can_orb:
                             signal = self.get_path_a_signal(df, df.iloc[-1], now)
@@ -4343,7 +4417,8 @@ class TradingBot:
                             self.trades_today < config.MAX_TRADES_PER_DAY and
                             self.daily_pnl > -config.MAX_DAILY_LOSS and
                             not shared_state.is_consolidated_loss_exceeded() and
-                            not (self.skip_thursday and now.weekday() == 3)
+                            not (self.skip_thursday and now.weekday() == 3) and
+                            not self._skip_bnf_today
                         )
                         if _can_reentry:
                             _reentry_sig = self.get_path_a_signal(df, df.iloc[-1], now)
