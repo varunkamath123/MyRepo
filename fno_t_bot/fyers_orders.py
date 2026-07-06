@@ -112,8 +112,14 @@ def get_ltp(fyers, symbol: str) -> float | None:
     try:
         resp = fyers.quotes({"symbols": symbol})
         if resp.get('s') == 'ok':
-            return float(resp['d'][0]['v']['lp'])
-        logger.warning(f"LTP fetch failed for {symbol}: {resp}")
+            v = resp['d'][0]['v']
+            # BSE options use 'ltp' instead of 'lp' (NSE/NFO standard)
+            for key in ('lp', 'ltp', 'last_price'):
+                if v.get(key) is not None:
+                    return float(v[key])
+            logger.warning(f"No LTP key in {symbol} quote. Available: {list(v.keys())}")
+        else:
+            logger.warning(f"LTP fetch failed for {symbol}: {resp}")
     except Exception as e:
         logger.error(f"get_ltp({symbol}): {e}")
     return None
