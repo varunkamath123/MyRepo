@@ -163,9 +163,14 @@ def _kronos_predict(ohlcv: pd.DataFrame, bars: int) -> tuple[pd.DataFrame, str]:
 
     df = df[["open", "high", "low", "close", "volume"]].reset_index(drop=True)
 
-    # Generate future timestamps spaced 5 min apart
-    last_ts  = pd.Timestamp(x_ts.iloc[-1])
-    y_ts     = pd.Series([last_ts + timedelta(minutes=5 * (i + 1)) for i in range(bars)])
+    # Auto-detect bar frequency from recent timestamps (daily vs intraday)
+    last_ts = pd.Timestamp(x_ts.iloc[-1])
+    if len(x_ts) >= 2:
+        deltas = x_ts.diff().dropna()
+        bar_delta = deltas.median()
+    else:
+        bar_delta = timedelta(minutes=5)
+    y_ts = pd.Series([last_ts + bar_delta * (i + 1) for i in range(bars)])
 
     pred_df = predictor.predict(
         df=df,

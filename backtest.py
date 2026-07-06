@@ -1,15 +1,27 @@
 """
-Kronos Futures Bot — Walk-Forward Backtest
-==========================================
-Fetches 5-min OHLCV from yfinance (last 60 days) for NIFTY and BANKNIFTY,
-then replays the same entry/exit logic used in futures_bot.py bar-by-bar.
+Kronos Futures Bot — Daily Walk-Forward Backtest
+=================================================
+Fetches daily OHLCV from yfinance (default 3 years) for NIFTY, BANKNIFTY,
+and SENSEX (spot index as futures proxy).
+
+Signal logic (run at each day's close):
+  - Kronos predicts next 12 daily bars (~2.5 weeks)
+  - Entry: next day's open if ADX >= 25 AND confidence >= threshold
+  - Exit: stop-loss / trailing stop / Kronos reversal / SuperTrend flip
+
+Why daily candles:
+  - Closer to Kronos training domain (it was trained on daily stock OHLCV)
+  - 3 years of history → statistically meaningful backtest
+  - Positional holds of 1–20 days; realistic for futures
 
 Run:
-    python backtest.py                      # both instruments
-    python backtest.py NIFTY                # single instrument
-    python backtest.py --fallback           # force EMA fallback (skip Kronos model)
+    python backtest.py                         # NIFTY + BANKNIFTY + SENSEX
+    python backtest.py NIFTY BANKNIFTY         # specific instruments
+    python backtest.py --fallback              # force EMA signal (skip Kronos)
+    python backtest.py --years 5               # extend lookback to 5 years
+    python backtest.py --out my_results.csv    # custom output path
 
-Output: per-trade log + summary metrics to stdout and backtest_results.csv
+Output: per-trade log + summary metrics → stdout + CSV
 """
 from __future__ import annotations
 
@@ -17,8 +29,8 @@ import argparse
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
-from datetime import datetime, time as dtime, timedelta, timezone
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -30,62 +42,55 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Make sure project imports resolve ────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import (
-    INSTRUMENTS, MIN_ADX, ORB_WINDOW_START, MAIN_SESSION_END,
-    KRONOS_FORECAST_BARS, KRONOS_CONFIDENCE_MIN,
-    STOP_LOSS_PCT, TRAIL_ACTIVATE_PCT, TRAIL_DISTANCE_PCT,
-    EXIT_ON_KRONOS_REVERSAL, EXIT_ON_SUPERTREND_FLIP,
-)
+from config import INSTRUMENTS, MIN_ADX
 
-# ── yfinance symbols for NSE indices (spot — futures price closely tracks) ───
+# ── Backtest-specific risk params (calibrated for futures price moves, not options premium) ──
+STOP_LOSS_PCT        = 0.030   # 3%: daily NSE bars gap 1-2% on news; 2% stops out noise
+TRAIL_ACTIVATE_PCT   = 0.060   # 6%: let positional trades breathe before trailing
+TRAIL_DISTANCE_PCT   = 0.025   # 2.5%: wider trail so minor pullbacks don't close winners
+KRONOS_CONF_MIN      = 0.45    # minimum ATR-normalised confidence to enter
+KRONOS_REV_CONF_MIN  = 0.45    # minimum confidence for an opposite signal to trigger exit
+FORECAST_BARS        = 12      # daily bars to predict (~2.5 weeks)
+MIN_CONTEXT_BARS     = 60      # minimum history before first signal
+
+EXIT_ON_KRONOS_REVERSAL  = True
+EXIT_ON_SUPERTREND_FLIP  = True
+
+# ── yfinance symbols ──────────────────────────────────────────────────────────
 _YF_SYMBOLS = {
     "NIFTY":     "^NSEI",
     "BANKNIFTY": "^NSEBANK",
+    "SENSEX":    "^BSESN",
 }
-
-IST = timezone(timedelta(hours=5, minutes=30))
-
 
 # ── Data fetch ────────────────────────────────────────────────────────────────
 
-def fetch_5min(instrument: str) -> pd.DataFrame:
-    """Download last 60 days of 5-min bars from yfinance."""
+def fetch_daily(instrument: str, years: int = 3) -> pd.DataFrame:
     import yfinance as yf
 
     symbol = _YF_SYMBOLS[instrument]
-    log.info("[DATA] Downloading 5-min data for %s (%s) …", instrument, symbol)
-    raw = yf.download(symbol, period="60d", interval="5m", progress=False, auto_adjust=True)
+    log.info("[DATA] Downloading %d-year daily data for %s (%s) …", years, instrument, symbol)
+    raw = yf.download(symbol, period=f"{years}y", interval="1d",
+                      progress=False, auto_adjust=True)
 
     if raw.empty:
         raise RuntimeError(f"yfinance returned no data for {symbol}")
 
-    # Flatten multi-level columns if present
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = [c[0].lower() for c in raw.columns]
     else:
         raw.columns = [c.lower() for c in raw.columns]
 
-    raw = raw.rename(columns={"open": "open", "high": "high", "low": "low",
-                               "close": "close", "volume": "volume"})
     raw = raw[["open", "high", "low", "close", "volume"]].dropna()
     raw.index = pd.to_datetime(raw.index)
-    if raw.index.tzinfo is None:
-        raw.index = raw.index.tz_localize("Asia/Kolkata")
-    else:
-        raw.index = raw.index.tz_convert("Asia/Kolkata")
-
-    # Keep only market hours 09:15 – 15:30
-    raw = raw.between_time("09:15", "15:30")
     raw = raw.sort_index().reset_index()
-    raw = raw.rename(columns={"index": "datetime", "Datetime": "datetime"})
-    if "datetime" not in raw.columns:
-        raw = raw.rename(columns={raw.columns[0]: "datetime"})
+    raw = raw.rename(columns={raw.columns[0]: "datetime"})
 
-    log.info("[DATA] %s: %d bars (%.1f days)", instrument, len(raw),
-             (raw["datetime"].iloc[-1] - raw["datetime"].iloc[0]).days)
+    log.info("[DATA] %s: %d daily bars (%.1f years)",
+             instrument, len(raw),
+             (raw["datetime"].iloc[-1] - raw["datetime"].iloc[0]).days / 365)
     return raw
 
 
@@ -98,52 +103,71 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> float:
         (high - close.shift()).abs(),
         (low  - close.shift()).abs(),
     ], axis=1).max(axis=1)
-    atr      = tr.ewm(span=period).mean()
+    atr      = tr.ewm(span=period, min_periods=period).mean()
     dm_plus  = (high.diff()).clip(lower=0)
     dm_minus = (-low.diff()).clip(lower=0)
-    di_plus  = 100 * dm_plus.ewm(span=period).mean() / atr
-    di_minus = 100 * dm_minus.ewm(span=period).mean() / atr
-    dx       = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus)
-    return float(dx.ewm(span=period).mean().iloc[-1])
+    di_plus  = 100 * dm_plus.ewm(span=period, min_periods=period).mean() / atr
+    di_minus = 100 * dm_minus.ewm(span=period, min_periods=period).mean() / atr
+    dx       = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus + 1e-8)
+    return float(dx.ewm(span=period, min_periods=period).mean().iloc[-1])
 
 
-def supertrend(df: pd.DataFrame, period: int = 7, multiplier: float = 2.5) -> str:
-    hl2 = (df["high"] + df["low"]) / 2
-    tr  = pd.concat([
+def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> str:
+    hl2   = (df["high"] + df["low"]) / 2
+    tr    = pd.concat([
         df["high"] - df["low"],
         (df["high"] - df["close"].shift()).abs(),
         (df["low"]  - df["close"].shift()).abs(),
     ], axis=1).max(axis=1)
-    atr   = tr.ewm(span=period).mean()
+    atr   = tr.ewm(span=period, min_periods=period).mean()
     lower = hl2 - multiplier * atr
     return "BULL" if df["close"].iloc[-1] > lower.iloc[-1] else "BEAR"
 
 
-# ── Entry window check ────────────────────────────────────────────────────────
+# ── Signal ────────────────────────────────────────────────────────────────────
 
-def _in_entry_window(ts: pd.Timestamp) -> bool:
-    t = ts.time()
-    start = dtime(*map(int, ORB_WINDOW_START.split(":")))
-    end   = dtime(*map(int, MAIN_SESSION_END.split(":")))
-    return start <= t <= end
+def get_signal(ctx: pd.DataFrame, force_fallback: bool = False) -> tuple[str, float, str]:
+    """
+    Returns (direction, confidence, source).
+    direction ∈ {"LONG", "SHORT", "NEUTRAL"}
+    """
+    from core.kronos_signal import forecast as _kf
+
+    if force_fallback:
+        from core import kronos_signal as _ks
+        _orig = _ks._load_predictor
+        _ks._load_predictor = _force_fail
+        try:
+            f = _kf(ctx, FORECAST_BARS)
+        finally:
+            _ks._load_predictor = _orig
+    else:
+        f = _kf(ctx, FORECAST_BARS)
+
+    return f.direction, f.confidence, f.source
 
 
-# ── Trade record ─────────────────────────────────────────────────────────────
+def _force_fail():
+    raise RuntimeError("fallback forced")
+
+
+# ── Trade record ──────────────────────────────────────────────────────────────
 
 @dataclass
 class Trade:
-    instrument: str
-    direction: str
-    entry_bar: int
-    entry_time: pd.Timestamp
+    instrument:  str
+    direction:   str
+    entry_bar:   int
+    entry_date:  pd.Timestamp
     entry_price: float
-    exit_bar: int = 0
-    exit_time: pd.Timestamp = None
-    exit_price: float = 0.0
-    exit_reason: str = ""
-    lot_size: int = 1
-    pnl_pts: float = 0.0
-    pnl_inr: float = 0.0
+    lot_size:    int
+    exit_bar:    int             = 0
+    exit_date:   Optional[pd.Timestamp] = None
+    exit_price:  float          = 0.0
+    exit_reason: str            = ""
+    pnl_pts:     float          = 0.0
+    pnl_inr:     float          = 0.0
+    hold_days:   int            = 0
 
 
 # ── Backtest engine ───────────────────────────────────────────────────────────
@@ -154,297 +178,304 @@ def backtest_instrument(
     force_fallback: bool = False,
 ) -> list[Trade]:
     """
-    Walk forward through df bar-by-bar, applying the bot's entry/exit logic.
-    Returns list of completed Trade objects.
+    Walk forward through daily bars.
+
+    Signal computed on bar i close → entry at bar i+1 open.
+    Exits checked each subsequent bar against close price.
     """
-    from core.kronos_signal import forecast as kronos_forecast
-
-    lot_size = INSTRUMENTS[instrument]["lot_size"]
-    min_context = 256   # bars needed before first signal
-
+    lot_size = INSTRUMENTS.get(instrument, {}).get("lot_size", 1)
     trades: list[Trade] = []
-    position: Trade | None = None
-    hwm: float = 0.0
-    trail_active: bool = False
-    trail_stop: float = 0.0
 
-    log.info("[BT] Starting backtest: %s | %d bars | lot=%d", instrument, len(df), lot_size)
+    pos:          Optional[Trade] = None
+    hwm:          float           = 0.0
+    trail_active: bool            = False
+    trail_stop:   float           = 0.0
 
-    for i in range(min_context, len(df)):
-        ctx  = df.iloc[: i + 1].copy()     # bars up to and including bar i
-        bar  = df.iloc[i]
-        ts   = pd.Timestamp(bar["datetime"])
-        close = float(bar["close"])
+    log.info("[BT] %s | %d bars | lot=%d", instrument, len(df), lot_size)
 
-        # ── Exit logic ────────────────────────────────────────────────────────
-        if position is not None:
-            pnl_pct = ((close - position.entry_price) / position.entry_price
-                       if position.direction == "LONG"
-                       else (position.entry_price - close) / position.entry_price)
+    for i in range(MIN_CONTEXT_BARS, len(df) - 1):
+        ctx   = df.iloc[: i + 1].copy()          # history up to and including bar i
+        today = df.iloc[i]
+        nxt   = df.iloc[i + 1]                    # entry / exit prices come from next bar
+        close = float(today["close"])
+        nxt_open  = float(nxt["open"])
+        nxt_close = float(nxt["close"])
+        nxt_date  = pd.Timestamp(nxt["datetime"])
+
+        # ── Exit check (against next bar's close after entry) ─────────────────
+        if pos is not None:
+            price = nxt_close
+            pnl_pct = ((price - pos.entry_price) / pos.entry_price
+                       if pos.direction == "LONG"
+                       else (pos.entry_price - price) / pos.entry_price)
 
             # Hard stop
             if pnl_pct <= -STOP_LOSS_PCT:
-                _close_trade(position, i, ts, close, "STOP_LOSS", trades)
-                position = None
-                hwm = trail_stop = 0.0
-                trail_active = False
+                _close(pos, i + 1, nxt_date, price, "STOP_LOSS", trades)
+                pos = None; hwm = trail_stop = 0.0; trail_active = False
                 continue
 
-            # Trail
+            # Trailing stop
             if pnl_pct >= TRAIL_ACTIVATE_PCT:
                 trail_active = True
-                if close > hwm or hwm == 0.0:
-                    hwm = close
-                    trail_stop = (hwm * (1 - TRAIL_DISTANCE_PCT) if position.direction == "LONG"
+                if price > hwm or hwm == 0.0:
+                    hwm = price
+                    trail_stop = (hwm * (1 - TRAIL_DISTANCE_PCT) if pos.direction == "LONG"
                                   else hwm * (1 + TRAIL_DISTANCE_PCT))
 
             if trail_active:
-                hit = (position.direction == "LONG" and close < trail_stop) or \
-                      (position.direction == "SHORT" and close > trail_stop)
+                hit = ((pos.direction == "LONG"  and price < trail_stop) or
+                       (pos.direction == "SHORT" and price > trail_stop))
                 if hit:
-                    _close_trade(position, i, ts, close, "TRAIL_STOP", trades)
-                    position = None
-                    hwm = trail_stop = 0.0
-                    trail_active = False
+                    _close(pos, i + 1, nxt_date, price, "TRAIL_STOP", trades)
+                    pos = None; hwm = trail_stop = 0.0; trail_active = False
                     continue
 
-            # Kronos reversal / SuperTrend flip
-            if EXIT_ON_KRONOS_REVERSAL or EXIT_ON_SUPERTREND_FLIP:
-                try:
-                    kf = kronos_forecast(ctx, KRONOS_FORECAST_BARS)
-                    st = supertrend(ctx)
+            # Signal-based exits
+            try:
+                kdir, kconf, _ = get_signal(ctx, force_fallback)
+                st             = supertrend(ctx)
 
-                    if EXIT_ON_KRONOS_REVERSAL:
-                        opp = "SHORT" if position.direction == "LONG" else "LONG"
-                        if kf.direction == opp:
-                            _close_trade(position, i, ts, close, "KRONOS_REVERSAL", trades)
-                            position = None
-                            hwm = trail_stop = 0.0
-                            trail_active = False
-                            continue
+                if EXIT_ON_KRONOS_REVERSAL:
+                    opp = "SHORT" if pos.direction == "LONG" else "LONG"
+                    if kdir == opp and kconf >= KRONOS_REV_CONF_MIN:
+                        _close(pos, i + 1, nxt_date, price, "KRONOS_REV", trades)
+                        pos = None; hwm = trail_stop = 0.0; trail_active = False
+                        continue
 
-                    if EXIT_ON_SUPERTREND_FLIP:
-                        if (position.direction == "LONG" and st == "BEAR") or \
-                           (position.direction == "SHORT" and st == "BULL"):
-                            _close_trade(position, i, ts, close, "ST_FLIP", trades)
-                            position = None
-                            hwm = trail_stop = 0.0
-                            trail_active = False
-                            continue
-                except Exception as e:
-                    log.debug("[BT] Exit signal error at bar %d: %s", i, e)
+                if EXIT_ON_SUPERTREND_FLIP:
+                    if (pos.direction == "LONG"  and st == "BEAR") or \
+                       (pos.direction == "SHORT" and st == "BULL"):
+                        _close(pos, i + 1, nxt_date, price, "ST_FLIP", trades)
+                        pos = None; hwm = trail_stop = 0.0; trail_active = False
+                        continue
+            except Exception as e:
+                log.debug("[BT] Exit signal error bar %d: %s", i, e)
 
-            continue   # still holding, nothing else to do this bar
+            continue   # still holding
 
-        # ── Entry logic (no position) ─────────────────────────────────────────
-        if not _in_entry_window(ts):
-            continue
-
+        # ── Entry (signal on today's close, enter at next open) ──────────────
         try:
             adx = compute_adx(ctx)
             if adx < MIN_ADX:
                 continue
 
-            if force_fallback:
-                # Monkey-patch to use EMA fallback
-                from core import kronos_signal as _ks
-                orig = _ks._load_predictor
-                _ks._load_predictor = lambda: (_ for _ in ()).throw(RuntimeError("forced fallback"))
-                try:
-                    kf = kronos_forecast(ctx, KRONOS_FORECAST_BARS)
-                finally:
-                    _ks._load_predictor = orig
-            else:
-                kf = kronos_forecast(ctx, KRONOS_FORECAST_BARS)
-
-            if kf.confidence < KRONOS_CONFIDENCE_MIN or kf.direction == "NEUTRAL":
+            direction, confidence, source = get_signal(ctx, force_fallback)
+            if confidence < KRONOS_CONF_MIN or direction == "NEUTRAL":
                 continue
 
             st = supertrend(ctx)
-            # Require SuperTrend aligned with Kronos direction
-            if kf.direction == "LONG" and st != "BULL":
+            if direction == "LONG"  and st != "BULL":
                 continue
-            if kf.direction == "SHORT" and st != "BEAR":
+            if direction == "SHORT" and st != "BEAR":
                 continue
 
-            position = Trade(
+            pos = Trade(
                 instrument=instrument,
-                direction=kf.direction,
-                entry_bar=i,
-                entry_time=ts,
-                entry_price=close,
+                direction=direction,
+                entry_bar=i + 1,
+                entry_date=nxt_date,
+                entry_price=nxt_open,
                 lot_size=lot_size,
             )
-            hwm = close
+            hwm = nxt_open
             trail_active = False
-            trail_stop = 0.0
-            log.info("[BT] ENTRY  %s %s @ %.2f  bar=%d  conf=%.0f%%  src=%s",
-                     instrument, kf.direction, close, i, kf.confidence * 100, kf.source)
+            trail_stop   = 0.0
+            log.info("[BT] ENTRY  %s %-5s @ %8.1f  conf=%.0f%%  src=%s  adx=%.1f",
+                     instrument, direction, nxt_open, confidence * 100, source, adx)
 
         except Exception as e:
-            log.debug("[BT] Entry error at bar %d: %s", i, e)
+            log.debug("[BT] Entry error bar %d: %s", i, e)
 
     # Close any open position at end of data
-    if position is not None:
-        last_bar  = df.iloc[-1]
-        _close_trade(position, len(df) - 1,
-                     pd.Timestamp(last_bar["datetime"]),
-                     float(last_bar["close"]),
-                     "EOD_CLOSE", trades)
+    if pos is not None:
+        last = df.iloc[-1]
+        _close(pos, len(df) - 1,
+               pd.Timestamp(last["datetime"]),
+               float(last["close"]),
+               "END_OF_DATA", trades)
 
     return trades
 
 
-def _close_trade(pos: Trade, bar: int, ts: pd.Timestamp,
-                 price: float, reason: str, trades: list[Trade]):
-    pos.exit_bar    = bar
-    pos.exit_time   = ts
-    pos.exit_price  = price
+def _close(pos: Trade, bar: int, date: pd.Timestamp,
+           price: float, reason: str, trades: list[Trade]):
+    pos.exit_bar   = bar
+    pos.exit_date  = date
+    pos.exit_price = price
     pos.exit_reason = reason
+    pos.hold_days  = bar - pos.entry_bar
     pts = (price - pos.entry_price) if pos.direction == "LONG" else (pos.entry_price - price)
     pos.pnl_pts = pts
     pos.pnl_inr = pts * pos.lot_size
     trades.append(pos)
-    log.info("[BT] EXIT   %s %s @ %.2f  reason=%-16s  P&L=%.0f pts / ₹%.0f",
-             pos.instrument, pos.direction, price, reason, pts, pos.pnl_inr)
+    log.info("[BT] EXIT   %s %s @ %.1f  %-12s  %+.0f pts / INR %+.0f  [%d days]",
+             pos.instrument, pos.direction, price, reason, pts, pos.pnl_inr, pos.hold_days)
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
 
-def compute_metrics(trades: list[Trade]) -> dict:
+def compute_metrics(trades: list[Trade], instrument: str = "ALL") -> dict:
     if not trades:
         return {}
 
-    pnl = [t.pnl_inr for t in trades]
-    wins = [p for p in pnl if p > 0]
-    losses = [p for p in pnl if p <= 0]
+    pnl  = np.array([t.pnl_inr for t in trades])
+    wins  = pnl[pnl > 0]
+    losses = pnl[pnl <= 0]
 
-    total_pnl    = sum(pnl)
-    win_rate     = len(wins) / len(pnl) if pnl else 0
-    avg_win      = np.mean(wins) if wins else 0
-    avg_loss     = np.mean(losses) if losses else 0
-    profit_factor = abs(sum(wins) / sum(losses)) if losses and sum(losses) != 0 else float("inf")
+    total_pnl     = float(pnl.sum())
+    win_rate      = len(wins) / len(pnl)
+    avg_win       = float(wins.mean())   if len(wins)   else 0.0
+    avg_loss      = float(losses.mean()) if len(losses) else 0.0
+    profit_factor = abs(wins.sum() / losses.sum()) if losses.sum() != 0 else float("inf")
 
-    # Sharpe (per-trade, annualised approx)
-    pnl_arr = np.array(pnl)
-    sharpe  = (np.mean(pnl_arr) / (np.std(pnl_arr) + 1e-8)) * np.sqrt(252) if len(pnl) > 1 else 0
+    # Expectancy per trade
+    expectancy = total_pnl / len(pnl)
 
-    # Max drawdown on cumulative P&L
-    cum = np.cumsum(pnl_arr)
-    peak = np.maximum.accumulate(cum)
-    dd   = cum - peak
+    # Sharpe: per-trade series, annualised (~252 trading days)
+    sharpe = (pnl.mean() / (pnl.std() + 1e-8)) * np.sqrt(252) if len(pnl) > 1 else 0.0
+
+    # Max drawdown on cumulative INR P&L
+    cum   = np.cumsum(pnl)
+    peak  = np.maximum.accumulate(cum)
+    dd    = cum - peak
     max_dd = float(dd.min())
 
-    durations = [(t.exit_bar - t.entry_bar) * 5 for t in trades]  # minutes
+    hold_days = [t.hold_days for t in trades]
+    reasons   = {}
+    for t in trades:
+        reasons[t.exit_reason] = reasons.get(t.exit_reason, 0) + 1
+
+    # Calendar span
+    first = trades[0].entry_date
+    last  = trades[-1].exit_date or trades[-1].entry_date
+    span_days = (last - first).days if last and first else 0
 
     return {
-        "trades":         len(trades),
-        "wins":           len(wins),
-        "losses":         len(losses),
-        "win_rate":       win_rate,
-        "total_pnl_inr":  total_pnl,
-        "avg_win_inr":    avg_win,
-        "avg_loss_inr":   avg_loss,
-        "profit_factor":  profit_factor,
-        "sharpe":         sharpe,
+        "instrument":       instrument,
+        "trades":           len(trades),
+        "wins":             int(len(wins)),
+        "losses":           int(len(losses)),
+        "win_rate":         win_rate,
+        "total_pnl_inr":    total_pnl,
+        "avg_win_inr":      avg_win,
+        "avg_loss_inr":     avg_loss,
+        "expectancy_inr":   expectancy,
+        "profit_factor":    profit_factor,
+        "sharpe_ann":       sharpe,
         "max_drawdown_inr": max_dd,
-        "avg_duration_min": np.mean(durations) if durations else 0,
+        "avg_hold_days":    float(np.mean(hold_days)) if hold_days else 0.0,
+        "exit_reasons":     reasons,
+        "span_days":        span_days,
     }
 
 
 # ── Report ────────────────────────────────────────────────────────────────────
 
-def print_report(instrument: str, trades: list[Trade], metrics: dict):
-    sep = "=" * 68
+def print_report(trades: list[Trade], m: dict):
+    sep = "=" * 70
+    inst = m.get("instrument", "")
     print(f"\n{sep}")
-    print(f"  BACKTEST REPORT — {instrument}")
+    print(f"  BACKTEST REPORT  --  {inst}")
     print(sep)
-    if not metrics:
+
+    if not m:
         print("  No trades generated.")
+        print(sep)
         return
 
-    print(f"  Trades        : {metrics['trades']}  ({metrics['wins']}W / {metrics['losses']}L)")
-    print(f"  Win rate      : {metrics['win_rate']:.1%}")
-    print(f"  Total P&L     : ₹{metrics['total_pnl_inr']:,.0f}")
-    print(f"  Avg win       : ₹{metrics['avg_win_inr']:,.0f}")
-    print(f"  Avg loss      : ₹{metrics['avg_loss_inr']:,.0f}")
-    print(f"  Profit factor : {metrics['profit_factor']:.2f}")
-    print(f"  Sharpe (ann)  : {metrics['sharpe']:.2f}")
-    print(f"  Max drawdown  : ₹{metrics['max_drawdown_inr']:,.0f}")
-    print(f"  Avg hold time : {metrics['avg_duration_min']:.0f} min")
+    if trades and trades[-1].exit_date:
+        print(f"  Period        : {trades[0].entry_date.date()} to {trades[-1].exit_date.date()}"
+              f"  ({m['span_days']} days)")
+    print(f"  Trades        : {m['trades']}  ({m['wins']}W / {m['losses']}L)")
+    print(f"  Win rate      : {m['win_rate']:.1%}")
+    print(f"  Total P&L     : INR {m['total_pnl_inr']:>12,.0f}")
+    print(f"  Avg win       : INR {m['avg_win_inr']:>12,.0f}")
+    print(f"  Avg loss      : INR {m['avg_loss_inr']:>12,.0f}")
+    print(f"  Expectancy    : INR {m['expectancy_inr']:>12,.0f}  per trade")
+    print(f"  Profit factor : {m['profit_factor']:.2f}")
+    print(f"  Sharpe (ann)  : {m['sharpe_ann']:.2f}")
+    print(f"  Max drawdown  : INR {m['max_drawdown_inr']:>12,.0f}")
+    print(f"  Avg hold      : {m['avg_hold_days']:.1f} days")
+    if m["exit_reasons"]:
+        reasons_str = "  |  ".join(f"{k}: {v}" for k, v in sorted(m["exit_reasons"].items()))
+        print(f"  Exit reasons  : {reasons_str}")
     print(sep)
 
     if trades:
-        print(f"\n  Trade log ({len(trades)} trades):")
-        hdr = f"  {'#':>3}  {'Dir':6}  {'Entry':>10}  {'Exit':>10}  {'P&L pts':>8}  {'P&L ₹':>10}  Reason"
+        print(f"\n  Trade log:")
+        hdr = (f"  {'#':>3}  {'Inst':<10}  {'Dir':5}  {'Entry':>10}  "
+               f"{'Entry Price':>11}  {'Exit Price':>10}  {'Hold':>5}  "
+               f"{'P&L pts':>8}  {'P&L INR':>10}  Reason")
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
         for n, t in enumerate(trades, 1):
-            print(f"  {n:>3}  {t.direction:6}  {t.entry_price:>10.1f}  {t.exit_price:>10.1f}"
-                  f"  {t.pnl_pts:>8.1f}  {t.pnl_inr:>10,.0f}  {t.exit_reason}")
+            ep = t.exit_date.date() if t.exit_date else "open"
+            print(f"  {n:>3}  {t.instrument:<10}  {t.direction:5}  "
+                  f"{str(t.entry_date.date()):>10}  {t.entry_price:>11.1f}  "
+                  f"{t.exit_price:>10.1f}  {t.hold_days:>5}d  "
+                  f"{t.pnl_pts:>+8.1f}  {t.pnl_inr:>+10,.0f}  {t.exit_reason}")
 
 
-def save_csv(all_trades: list[Trade], path: str = "backtest_results.csv"):
+def save_csv(all_trades: list[Trade], path: str):
     if not all_trades:
+        log.info("No trades to save.")
         return
     rows = [{
-        "instrument":    t.instrument,
-        "direction":     t.direction,
-        "entry_time":    t.entry_time,
-        "entry_price":   t.entry_price,
-        "exit_time":     t.exit_time,
-        "exit_price":    t.exit_price,
-        "exit_reason":   t.exit_reason,
-        "pnl_pts":       t.pnl_pts,
-        "pnl_inr":       t.pnl_inr,
-        "lot_size":      t.lot_size,
+        "instrument":  t.instrument,
+        "direction":   t.direction,
+        "entry_date":  t.entry_date,
+        "entry_price": t.entry_price,
+        "exit_date":   t.exit_date,
+        "exit_price":  t.exit_price,
+        "exit_reason": t.exit_reason,
+        "hold_days":   t.hold_days,
+        "pnl_pts":     t.pnl_pts,
+        "pnl_inr":     t.pnl_inr,
+        "lot_size":    t.lot_size,
     } for t in all_trades]
     pd.DataFrame(rows).to_csv(path, index=False)
-    print(f"\n  Results saved → {path}")
+    log.info("Results saved -> %s", path)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Kronos Futures Bot backtest")
-    parser.add_argument("instruments", nargs="*", default=["NIFTY", "BANKNIFTY"],
-                        help="Instruments to backtest (default: NIFTY BANKNIFTY)")
+    parser = argparse.ArgumentParser(description="Kronos Futures daily backtest")
+    parser.add_argument("instruments", nargs="*",
+                        default=["NIFTY", "BANKNIFTY", "SENSEX"],
+                        help="Instruments (default: NIFTY BANKNIFTY SENSEX)")
     parser.add_argument("--fallback", action="store_true",
-                        help="Force EMA fallback — skip loading Kronos model")
-    parser.add_argument("--out", default="backtest_results.csv",
+                        help="Force EMA fallback -- skip Kronos model")
+    parser.add_argument("--years", type=int, default=3,
+                        help="Years of history to download (default: 3)")
+    parser.add_argument("--out", default="backtest_results_daily.csv",
                         help="CSV output path")
     args = parser.parse_args()
 
-    instruments = [i.upper() for i in args.instruments if i.upper() in INSTRUMENTS]
+    valid = {**INSTRUMENTS, "SENSEX": {"lot_size": 20, "live": False}}
+    instruments = [i.upper() for i in args.instruments if i.upper() in valid]
     if not instruments:
-        log.error("No valid instruments. Choose from: %s", list(INSTRUMENTS.keys()))
+        log.error("No valid instruments. Choose from: %s", list(valid.keys()))
         sys.exit(1)
 
     all_trades: list[Trade] = []
 
     for inst in instruments:
         try:
-            df = fetch_5min(inst)
+            df = fetch_daily(inst, years=args.years)
         except Exception as e:
             log.error("[BT] Cannot fetch data for %s: %s", inst, e)
             continue
 
-        trades = backtest_instrument(inst, df, force_fallback=args.fallback)
-        metrics = compute_metrics(trades)
-        print_report(inst, trades, metrics)
+        trades  = backtest_instrument(inst, df, force_fallback=args.fallback)
+        metrics = compute_metrics(trades, inst)
+        print_report(trades, metrics)
         all_trades.extend(trades)
 
     if len(instruments) > 1 and all_trades:
-        print("\n" + "=" * 68)
-        print("  COMBINED SUMMARY")
-        combined = compute_metrics(all_trades)
-        print(f"  Total trades  : {combined['trades']}")
-        print(f"  Win rate      : {combined['win_rate']:.1%}")
-        print(f"  Total P&L     : ₹{combined['total_pnl_inr']:,.0f}")
-        print(f"  Profit factor : {combined['profit_factor']:.2f}")
-        print(f"  Sharpe (ann)  : {combined['sharpe']:.2f}")
-        print(f"  Max drawdown  : ₹{combined['max_drawdown_inr']:,.0f}")
-        print("=" * 68)
+        combined = compute_metrics(all_trades, "COMBINED")
+        print_report(all_trades, combined)
 
     save_csv(all_trades, args.out)
 
