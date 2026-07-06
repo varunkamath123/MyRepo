@@ -1,22 +1,30 @@
 """
-Kronos signal layer — loads Kronos-mini from HuggingFace, predicts full OHLCV candles,
-labels patterns, and returns a rich KronosForecast object.
+Kronos signal layer — uses the real KronosPredictor (NeoQuasar/Kronos-base +
+NeoQuasar/Kronos-Tokenizer-base) to predict full OHLCV candles, then labels
+patterns and returns a KronosForecast.
 
-Runs on CPU (Kronos-mini = 4.1M params, ~1–2s per inference on t3.small).
-Falls back to synthetic candles via EMA/ATR if model unavailable.
+Falls back to EMA/ATR synthetic candles if model is unavailable.
 """
 from __future__ import annotations
 from dataclasses import dataclass
+import sys
 import numpy as np
 import pandas as pd
 import logging
+from datetime import timedelta
+from pathlib import Path
 
 from core.candle_patterns import ForecastQuality, score_forecast
 
 log = logging.getLogger(__name__)
 
-_model     = None
-_tokenizer = None
+# Add the quant_trading Kronos model directory to sys.path so we can import
+# the real KronosPredictor rather than using HuggingFace transformers.
+_KRONOS_MODEL_DIR = Path("C:/quant_trading/Kronos")
+if str(_KRONOS_MODEL_DIR) not in sys.path:
+    sys.path.insert(0, str(_KRONOS_MODEL_DIR))
+
+_predictor = None
 
 
 # ── Public return type ────────────────────────────────────────────────────────
@@ -25,7 +33,7 @@ _tokenizer = None
 class KronosForecast:
     direction: str              # "LONG" | "SHORT" | "NEUTRAL"
     confidence: float           # 0–1
-    candles: pd.DataFrame       # predicted OHLCV bars (index = bar offset from now)
+    candles: pd.DataFrame       # predicted OHLCV bars
     quality: ForecastQuality    # pattern labels + score + notes
     source: str                 # "kronos" | "ema_fallback"
 
@@ -47,76 +55,76 @@ class KronosForecast:
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
-def _load_model() -> None:
-    global _model, _tokenizer
-    if _model is not None:
-        return
+def _load_predictor():
+    global _predictor
+    if _predictor is not None:
+        return _predictor
+
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
         import torch
-        model_id = "NeoQuasar/Kronos-mini"
-        log.info("[KRONOS] Loading %s ...", model_id)
-        _tokenizer = AutoTokenizer.from_pretrained(model_id)
-        _model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
-        _model.eval()
-        log.info("[KRONOS] Model loaded.")
+        from model.kronos import Kronos, KronosTokenizer, KronosPredictor
+
+        log.info("[KRONOS] Loading NeoQuasar/Kronos-base + Kronos-Tokenizer-base …")
+        tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+        model     = Kronos.from_pretrained("NeoQuasar/Kronos-base")
+        model.eval()
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
+        log.info("[KRONOS] Model loaded on %s.", device)
     except Exception as e:
         log.error("[KRONOS] Failed to load model: %s", e)
         raise
+
+    return _predictor
 
 
 # ── Main public API ───────────────────────────────────────────────────────────
 
 def forecast(ohlcv: pd.DataFrame, bars: int = 12) -> KronosForecast:
     """
-    Given a DataFrame with columns [open, high, low, close, volume],
-    returns a KronosForecast with predicted candles, pattern labels, and quality score.
+    Predict `bars` future 5-min candles from `ohlcv` (needs datetime column or index).
 
-    Args:
-        ohlcv   : historical 5-min OHLCV bars (recommend 256+ bars)
-        bars    : number of future bars to predict
-
-    Returns:
-        KronosForecast — see .summary() for a human-readable breakdown
+    Returns KronosForecast with direction, confidence, predicted candles, quality score.
     """
     entry_price = float(ohlcv["close"].iloc[-1])
 
     try:
-        _load_model()
-        predicted = _kronos_predict_candles(ohlcv, bars)
-        source = "kronos"
-        log.info("[KRONOS] Predicted %d candles via model.", bars)
+        predicted, source = _kronos_predict(ohlcv, bars)
     except Exception as e:
         log.warning("[KRONOS] Model unavailable (%s) — using EMA/ATR fallback.", e)
         predicted = _synthetic_candles(ohlcv, bars)
         source = "ema_fallback"
 
-    # Direction from predicted close trajectory
-    last_close    = entry_price
+    last_close     = entry_price
     forecast_close = float(predicted["close"].iloc[-1])
     mid_close      = float(predicted["close"].iloc[bars // 2])
     move_pct       = (forecast_close - last_close) / last_close
 
-    if move_pct > 0.003:
-        direction = "LONG"
-        # confidence scales with magnitude of predicted move (capped at 1.0)
-        confidence = min(abs(move_pct) * 60, 1.0)
-    elif move_pct < -0.003:
-        direction = "SHORT"
-        confidence = min(abs(move_pct) * 60, 1.0)
+    # ATR-normalised confidence: compare predicted move against recent volatility.
+    # Raw `move_pct * 60` calibrated for individual stocks (big moves); for NSE
+    # futures indices a 0.3% move in 1 hour is already a strong directional bar.
+    atr_pct = _recent_atr_pct(ohlcv)          # ATR as fraction of close
+    # Confidence = how many ATRs the predicted move covers (capped at 1.0)
+    atrs_covered = abs(move_pct) / max(atr_pct, 1e-6)
+
+    if move_pct > atr_pct * 0.5:              # must move at least half an ATR
+        direction  = "LONG"
+        confidence = min(atrs_covered * 0.35, 1.0)
+    elif move_pct < -atr_pct * 0.5:
+        direction  = "SHORT"
+        confidence = min(atrs_covered * 0.35, 1.0)
     else:
-        direction = "NEUTRAL"
+        direction  = "NEUTRAL"
         confidence = 0.0
 
-    # Penalise confidence if mid-point contradicts final direction (U-shape / whipsaw)
+    # Penalise if mid-point contradicts final direction (U-shape / whipsaw)
     if direction == "LONG" and mid_close < last_close:
         confidence *= 0.7
-        log.debug("[KRONOS] Mid-forecast dip detected — confidence penalised.")
     elif direction == "SHORT" and mid_close > last_close:
         confidence *= 0.7
 
     quality = score_forecast(predicted, direction, entry_price)
-
     return KronosForecast(
         direction=direction,
         confidence=confidence,
@@ -126,72 +134,80 @@ def forecast(ohlcv: pd.DataFrame, bars: int = 12) -> KronosForecast:
     )
 
 
-# Backwards-compatible alias used by existing code
 def forecast_direction(ohlcv: pd.DataFrame, forecast_bars: int = 12) -> tuple[str, float]:
     f = forecast(ohlcv, forecast_bars)
     return f.direction, f.confidence
 
 
-# ── Kronos model inference ────────────────────────────────────────────────────
+# ── Real Kronos inference ─────────────────────────────────────────────────────
 
-def _kronos_predict_candles(ohlcv: pd.DataFrame, bars: int) -> pd.DataFrame:
+def _kronos_predict(ohlcv: pd.DataFrame, bars: int) -> tuple[pd.DataFrame, str]:
     """
-    Run Kronos model to predict full OHLCV candles.
-
-    Kronos tokenizes each OHLCV bar into discrete tokens via its proprietary
-    tokenizer, then autoregressively generates future tokens.
-    We decode the token sequence back to price space using the input stats.
+    Run the real KronosPredictor.  ohlcv must have columns:
+      open, high, low, close, volume  (amount is optional — filled from volume × price)
+    and either a 'datetime' column or a DatetimeIndex.
     """
-    import torch
+    predictor = _load_predictor()
 
-    # Use last 256 bars; normalise per-column
-    window = ohlcv[["open", "high", "low", "close", "volume"]].tail(256).copy()
-    stats  = {col: (window[col].mean(), window[col].std() + 1e-8) for col in window.columns}
+    df = ohlcv.copy().tail(512)   # use at most 512 bars as context
 
-    norm = pd.DataFrame({
-        col: (window[col] - stats[col][0]) / stats[col][1]
-        for col in window.columns
-    })
+    # Resolve timestamp column
+    if "datetime" in df.columns:
+        x_ts = pd.to_datetime(df["datetime"])
+        df = df.drop(columns=["datetime"])
+    elif isinstance(df.index, pd.DatetimeIndex):
+        x_ts = df.index.to_series().reset_index(drop=True)
+        df = df.reset_index(drop=True)
+    else:
+        raise ValueError("[KRONOS] ohlcv needs a 'datetime' column or DatetimeIndex")
 
-    # Flatten to sequence: [o1,h1,l1,c1,v1, o2,h2,...] — 5 tokens per bar
-    seq = norm.values.flatten().astype(np.float32)
-    input_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
+    df = df[["open", "high", "low", "close", "volume"]].reset_index(drop=True)
 
-    with torch.no_grad():
-        outputs = _model.generate(
-            input_tensor,
-            max_new_tokens=bars * 5,     # 5 tokens per predicted bar
-            do_sample=False,
-        )
+    # Generate future timestamps spaced 5 min apart
+    last_ts  = pd.Timestamp(x_ts.iloc[-1])
+    y_ts     = pd.Series([last_ts + timedelta(minutes=5 * (i + 1)) for i in range(bars)])
 
-    # Extract predicted tokens and reshape to (bars, 5)
-    new_tokens = outputs[0, -(bars * 5):].numpy().reshape(bars, 5)
+    pred_df = predictor.predict(
+        df=df,
+        x_timestamp=x_ts,
+        y_timestamp=y_ts,
+        pred_len=bars,
+        T=1.0,
+        top_k=0,
+        top_p=0.9,
+        sample_count=1,
+        verbose=False,
+    )
 
-    # Denormalise back to price space
-    predicted_rows = []
-    for row in new_tokens:
-        denorm = {
-            col: float(row[j] * stats[col][1] + stats[col][0])
-            for j, col in enumerate(["open", "high", "low", "close", "volume"])
-        }
-        # Enforce OHLC consistency: high >= max(o,c), low <= min(o,c)
-        denorm["high"] = max(denorm["high"], denorm["open"], denorm["close"])
-        denorm["low"]  = min(denorm["low"],  denorm["open"], denorm["close"])
-        denorm["volume"] = max(denorm["volume"], 0)
-        predicted_rows.append(denorm)
+    # Normalise column names to lowercase open/high/low/close/volume
+    pred_df = pred_df.rename(columns=str.lower).reset_index(drop=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col not in pred_df.columns:
+            pred_df[col] = float("nan")
 
-    return pd.DataFrame(predicted_rows)
+    # Enforce OHLC consistency
+    pred_df["high"] = pred_df[["high", "open", "close"]].max(axis=1)
+    pred_df["low"]  = pred_df[["low",  "open", "close"]].min(axis=1)
+    pred_df["volume"] = pred_df["volume"].clip(lower=0)
+
+    return pred_df[["open", "high", "low", "close", "volume"]], "kronos"
 
 
-# ── EMA/ATR fallback — realistic synthetic candles ────────────────────────────
+# ── EMA/ATR fallback ──────────────────────────────────────────────────────────
+
+def _recent_atr_pct(ohlcv: pd.DataFrame, period: int = 14) -> float:
+    """Return ATR as a fraction of the last close price."""
+    tr = pd.concat([
+        ohlcv["high"] - ohlcv["low"],
+        (ohlcv["high"] - ohlcv["close"].shift()).abs(),
+        (ohlcv["low"]  - ohlcv["close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    atr = float(tr.ewm(span=period).mean().iloc[-1])
+    last_close = float(ohlcv["close"].iloc[-1])
+    return atr / last_close if last_close > 0 else 1e-4
+
 
 def _synthetic_candles(ohlcv: pd.DataFrame, bars: int) -> pd.DataFrame:
-    """
-    When Kronos is unavailable, generate plausible candles using:
-    - EMA 9/21 for direction
-    - ATR(14) for volatility sizing
-    - Slight random perturbation for realism
-    """
     closes = ohlcv["close"]
     ema9   = closes.ewm(span=9).mean().iloc[-1]
     ema21  = closes.ewm(span=21).mean().iloc[-1]
@@ -202,24 +218,24 @@ def _synthetic_candles(ohlcv: pd.DataFrame, bars: int) -> pd.DataFrame:
         (ohlcv["high"] - ohlcv["close"].shift()).abs(),
         (ohlcv["low"]  - ohlcv["close"].shift()).abs(),
     ], axis=1).max(axis=1)
-    atr = tr.ewm(span=14).mean().iloc[-1]
-
+    atr     = tr.ewm(span=14).mean().iloc[-1]
     avg_vol = float(ohlcv["volume"].tail(20).mean())
-    rng     = np.random.default_rng(seed=42)
+    # Use the last close value as seed so different bars give different predictions
+    seed    = int(abs(closes.iloc[-1]) * 100) % (2 ** 31)
+    rng     = np.random.default_rng(seed=seed)
     rows    = []
-    prev_close = float(closes.iloc[-1])
+    prev    = float(closes.iloc[-1])
 
     for _ in range(bars):
-        # Bias move in trend direction with noise
         body_size = atr * rng.uniform(0.3, 0.8)
-        direction = trend if rng.random() > 0.3 else -trend
-        o = prev_close
-        c = o + direction * body_size
-        wick_factor = rng.uniform(0.1, 0.4)
-        h = max(o, c) + atr * wick_factor
-        l = min(o, c) - atr * wick_factor
+        d = trend if rng.random() > 0.3 else -trend
+        o = prev
+        c = o + d * body_size
+        wick = atr * rng.uniform(0.1, 0.4)
+        h = max(o, c) + wick
+        l = min(o, c) - wick
         v = avg_vol * rng.uniform(0.7, 1.3)
         rows.append({"open": o, "high": h, "low": l, "close": c, "volume": v})
-        prev_close = c
+        prev = c
 
     return pd.DataFrame(rows)

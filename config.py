@@ -12,14 +12,14 @@ CAPITAL_PER_TRADE = 250_000      # all-in on highest conviction
 INSTRUMENTS = {
     "NIFTY": {
         "symbol": "NSE_FO|NIFTY",
-        "lot_size": 75,
+        "lot_size": 65,
         "tick_size": 0.05,
         "margin_approx": 95_000,   # approx per lot at current levels
         "live": True,
     },
     "BANKNIFTY": {
         "symbol": "NSE_FO|BANKNIFTY",
-        "lot_size": 35,
+        "lot_size": 30,
         "tick_size": 0.05,
         "margin_approx": 85_000,
         "live": True,
@@ -36,7 +36,7 @@ INSTRUMENTS = {
 # ── Signal layers ──────────────────────────────────────────────────────────────
 KRONOS_MODEL = "NeoQuasar/Kronos-mini"   # 4.1M params, CPU-feasible
 KRONOS_FORECAST_BARS = 12                # bars ahead to forecast (12 × 5min = 1hr intraday)
-KRONOS_CONFIDENCE_MIN = 0.60            # min directional confidence to use signal
+KRONOS_CONFIDENCE_MIN = 0.40            # min directional confidence (ATR-normalised)
 
 FINGPT_SENTIMENT_MODEL = "FinGPT/fingpt-sentiment-all-llama2-13b-lora"
 SENTIMENT_BEARISH_THRESHOLD = -0.3      # below → bearish
