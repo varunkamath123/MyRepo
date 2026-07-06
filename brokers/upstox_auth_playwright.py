@@ -55,10 +55,15 @@ def _headless_get_auth_code(api_key: str, redirect_uri: str,
         context = browser.new_context()
         page = context.new_page()
 
-        # Intercept the redirect-to-localhost and capture the auth code
+        # Intercept the redirect-to-localhost and capture the auth code.
+        # Check the actual host — not just a substring — so the initial auth URL
+        # (which contains 127.0.0.1 as a query param) is not accidentally aborted.
+        from urllib.parse import urlparse as _urlparse
+
         def handle_route(route):
             url = route.request.url
-            if "127.0.0.1" in url:
+            host = _urlparse(url).netloc
+            if host.startswith("127.0.0.1"):
                 m = re.search(r"[?&]code=([^&]+)", url)
                 if m:
                     auth_code.append(m.group(1))
