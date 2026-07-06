@@ -41,118 +41,117 @@ def token_is_valid() -> bool:
         return False
 
 
+def _start_local_server(port: int = 8080):
+    """Start a tiny HTTP server on localhost to receive the OAuth redirect."""
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse as _up, parse_qs as _pqs
+
+    captured: list[str] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            code = _pqs(_up(self.path).query).get("code", [None])[0]
+            if code:
+                captured.append(code)
+                log.info("[SRV] Auth code captured from redirect!")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"<h2>Auth complete. You can close this window.</h2>")
+
+        def log_message(self, *_):
+            pass  # silence default request logging
+
+    srv = HTTPServer(("127.0.0.1", port), _Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return srv, captured
+
+
 def _headless_get_auth_code(api_key: str, redirect_uri: str,
                              mobile: str, pin: str, totp_key: str) -> str:
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-    auth_code: list[str] = []
+    # Start a local HTTP server that will receive the OAuth redirect from Upstox.
+    # Much more reliable than route interception for capturing the auth code.
+    srv, auth_code = _start_local_server(port=8080)
+    log.info("[PW] Local redirect server started on port 8080")
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
-        context = browser.new_context()
-        page = context.new_page()
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            context = browser.new_context()
+            page = context.new_page()
 
-        # Intercept the redirect-to-localhost and capture the auth code.
-        # Check the actual host — not just a substring — so the initial auth URL
-        # (which contains 127.0.0.1 as a query param) is not accidentally aborted.
-        from urllib.parse import urlparse as _urlparse
+            full_url = (
+                f"{_AUTH_URL}?client_id={api_key}"
+                f"&redirect_uri={redirect_uri}&response_type=code&state=kronos"
+            )
+            log.info("[PW] Loading Upstox login page…")
+            page.goto(full_url, wait_until="networkidle", timeout=30000)
 
-        def handle_route(route):
-            url = route.request.url
-            host = _urlparse(url).netloc
-            if host.startswith("127.0.0.1"):
-                m = re.search(r"[?&]code=([^&]+)", url)
-                if m:
-                    auth_code.append(m.group(1))
-                route.abort()
-            else:
-                route.continue_()
-
-        page.route("**", handle_route)
-
-        full_url = (
-            f"{_AUTH_URL}?client_id={api_key}"
-            f"&redirect_uri={redirect_uri}&response_type=code&state=kronos"
-        )
-        log.info("[PW] Loading Upstox login page…")
-        page.goto(full_url, wait_until="networkidle", timeout=30000)
-
-        SCREENSHOTS = Path(__file__).parent.parent / "logs"
-        SCREENSHOTS.mkdir(parents=True, exist_ok=True)
-
-        # ── Step 1: Mobile number → click "Get OTP" ──────────────────────────
-        log.info("[PW] Entering mobile number…")
-        page.wait_for_selector("input[type='text']", timeout=15000)
-        mobile_input = page.locator("input[type='text']").first
-        mobile_input.fill(mobile)
-        page.wait_for_timeout(500)
-        page.screenshot(path=str(SCREENSHOTS / "debug_step1_mobile.png"))
-        log.info("[PW] Clicking Get OTP…")
-        page.get_by_text("Get OTP").click()
-
-        # Wait for the page to transition away from the mobile input screen.
-        # The OTP/TOTP field appears AFTER "Get OTP" — we detect the transition
-        # by waiting for the mobile input to detach or for a second text input.
-        log.info("[PW] Waiting for OTP screen…")
-        page.wait_for_timeout(2000)
-        page.screenshot(path=str(SCREENSHOTS / "debug_step2_after_getotp.png"))
-
-        # ── Step 2: TOTP code → click "Continue" ────────────────────────────
-        log.info("[PW] Entering TOTP…")
-        try:
-            # After "Get OTP", Upstox renders the OTP input. The mobile input
-            # is gone; a fresh input[type='text'] is now the OTP/TOTP field.
-            # We wait up to 10 s for any visible text input, then clear+fill it.
-            otp_input = page.locator("input[type='text']").first
-            otp_input.wait_for(state="visible", timeout=10000)
-            totp_code = pyotp.TOTP(totp_key).now()
-            log.info("[PW] TOTP code: %s", totp_code)
-            otp_input.fill(totp_code)
+            # ── Step 1: Mobile number → click "Get OTP" ──────────────────────
+            log.info("[PW] Entering mobile number…")
+            page.wait_for_selector("input[type='text']", timeout=15000)
+            page.locator("input[type='text']").first.fill(mobile)
             page.wait_for_timeout(500)
-            page.screenshot(path=str(SCREENSHOTS / "debug_step3_totp.png"))
-            page.get_by_text("Continue").click()
-            page.wait_for_timeout(2000)
-            page.screenshot(path=str(SCREENSHOTS / "debug_step4_after_totp.png"))
-        except PWTimeout:
-            page.screenshot(path=str(SCREENSHOTS / "debug_step3_totp_timeout.png"))
-            log.warning("[PW] No OTP field after Get OTP — check TOTP setup")
+            log.info("[PW] Clicking Get OTP…")
+            page.get_by_text("Get OTP").click()
 
-        # ── Step 3: PIN ───────────────────────────────────────────────────────
-        # Upstox PIN may be input[type='password'] or input[type='text']
-        log.info("[PW] Looking for PIN field…")
-        pin_found = False
-        for pin_selector in ("input[type='password']", "input[type='text']"):
+            # Wait for the OTP screen to appear (mobile input transitions away)
+            log.info("[PW] Waiting for OTP screen…")
+            page.wait_for_timeout(2500)
+
+            # ── Step 2: TOTP → Continue ───────────────────────────────────────
+            log.info("[PW] Entering TOTP…")
             try:
-                pin_loc = page.locator(pin_selector).first
-                pin_loc.wait_for(state="visible", timeout=4000)
-                current_val = pin_loc.input_value()
-                # Skip if it still contains the TOTP we just typed
-                if current_val and len(current_val) == 6 and current_val.isdigit():
-                    log.info("[PW] Input still has TOTP value — not PIN, skipping")
-                    continue
-                log.info("[PW] Entering PIN via %s…", pin_selector)
-                pin_loc.fill(pin)
+                otp_input = page.locator("input[type='text']").first
+                otp_input.wait_for(state="visible", timeout=10000)
+                totp_code = pyotp.TOTP(totp_key).now()
+                log.info("[PW] TOTP code: %s", totp_code)
+                otp_input.fill(totp_code)
                 page.wait_for_timeout(500)
-                page.screenshot(path=str(SCREENSHOTS / "debug_step5_pin.png"))
                 page.get_by_text("Continue").click()
-                page.wait_for_timeout(2000)
-                page.screenshot(path=str(SCREENSHOTS / "debug_step6_after_pin.png"))
-                pin_found = True
-                break
+                page.wait_for_timeout(2500)
             except PWTimeout:
-                continue
-        if not pin_found:
-            log.info("[PW] No separate PIN field detected — skipping")
-            page.screenshot(path=str(SCREENSHOTS / "debug_step5_nopin.png"))
+                log.warning("[PW] No OTP field after Get OTP — check TOTP setup")
 
-        # Allow a moment for the final redirect
-        page.wait_for_timeout(3000)
-        page.screenshot(path=str(SCREENSHOTS / "debug_step7_final.png"))
-        log.info("[PW] Final URL: %s", page.url)
-        browser.close()
+            # ── Step 3: PIN ───────────────────────────────────────────────────
+            log.info("[PW] Looking for PIN field…")
+            pin_found = False
+            for pin_selector in ("input[type='password']", "input[type='text']"):
+                try:
+                    pin_loc = page.locator(pin_selector).first
+                    pin_loc.wait_for(state="visible", timeout=4000)
+                    current_val = pin_loc.input_value()
+                    if current_val and len(current_val) == 6 and current_val.isdigit():
+                        log.info("[PW] Field still has TOTP value — not PIN, skipping")
+                        continue
+                    log.info("[PW] Entering PIN via %s…", pin_selector)
+                    pin_loc.fill(pin)
+                    page.wait_for_timeout(500)
+                    page.get_by_text("Continue").click()
+                    pin_found = True
+                    break
+                except PWTimeout:
+                    continue
+            if not pin_found:
+                log.info("[PW] No separate PIN field — skipping")
+
+            # Wait for the browser to follow the redirect to our local server
+            log.info("[PW] Waiting for OAuth redirect…")
+            for _ in range(30):   # up to 15 s
+                if auth_code:
+                    break
+                page.wait_for_timeout(500)
+
+            log.info("[PW] Final URL: %s", page.url)
+            browser.close()
+    finally:
+        srv.shutdown()
 
     if not auth_code:
         raise RuntimeError(
