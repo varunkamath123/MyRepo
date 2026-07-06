@@ -80,40 +80,78 @@ def _headless_get_auth_code(api_key: str, redirect_uri: str,
         log.info("[PW] Loading Upstox login page…")
         page.goto(full_url, wait_until="networkidle", timeout=30000)
 
+        SCREENSHOTS = Path(__file__).parent.parent / "logs"
+        SCREENSHOTS.mkdir(parents=True, exist_ok=True)
+
         # ── Step 1: Mobile number → click "Get OTP" ──────────────────────────
         log.info("[PW] Entering mobile number…")
         page.wait_for_selector("input[type='text']", timeout=15000)
-        page.fill("input[type='text']", mobile)
+        mobile_input = page.locator("input[type='text']").first
+        mobile_input.fill(mobile)
         page.wait_for_timeout(500)
+        page.screenshot(path=str(SCREENSHOTS / "debug_step1_mobile.png"))
+        log.info("[PW] Clicking Get OTP…")
         page.get_by_text("Get OTP").click()
-        page.wait_for_load_state("networkidle", timeout=15000)
-        page.wait_for_timeout(1000)
+
+        # Wait for the page to transition away from the mobile input screen.
+        # The OTP/TOTP field appears AFTER "Get OTP" — we detect the transition
+        # by waiting for the mobile input to detach or for a second text input.
+        log.info("[PW] Waiting for OTP screen…")
+        page.wait_for_timeout(2000)
+        page.screenshot(path=str(SCREENSHOTS / "debug_step2_after_getotp.png"))
 
         # ── Step 2: TOTP code → click "Continue" ────────────────────────────
         log.info("[PW] Entering TOTP…")
         try:
-            page.wait_for_selector("input[type='text']", timeout=10000)
+            # After "Get OTP", Upstox renders the OTP input. The mobile input
+            # is gone; a fresh input[type='text'] is now the OTP/TOTP field.
+            # We wait up to 10 s for any visible text input, then clear+fill it.
+            otp_input = page.locator("input[type='text']").first
+            otp_input.wait_for(state="visible", timeout=10000)
             totp_code = pyotp.TOTP(totp_key).now()
-            page.fill("input[type='text']", totp_code)
+            log.info("[PW] TOTP code: %s", totp_code)
+            otp_input.fill(totp_code)
             page.wait_for_timeout(500)
+            page.screenshot(path=str(SCREENSHOTS / "debug_step3_totp.png"))
             page.get_by_text("Continue").click()
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.wait_for_timeout(2000)
+            page.screenshot(path=str(SCREENSHOTS / "debug_step4_after_totp.png"))
         except PWTimeout:
+            page.screenshot(path=str(SCREENSHOTS / "debug_step3_totp_timeout.png"))
             log.warning("[PW] No OTP field after Get OTP — check TOTP setup")
 
-        # ── Step 3: PIN (if shown as second factor) ──────────────────────────
-        try:
-            page.wait_for_selector("input[type='password']", timeout=5000)
-            log.info("[PW] Entering PIN…")
-            page.fill("input[type='password']", pin)
-            page.wait_for_timeout(500)
-            page.get_by_text("Continue").click()
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except PWTimeout:
-            log.info("[PW] No PIN field — skipping")
+        # ── Step 3: PIN ───────────────────────────────────────────────────────
+        # Upstox PIN may be input[type='password'] or input[type='text']
+        log.info("[PW] Looking for PIN field…")
+        pin_found = False
+        for pin_selector in ("input[type='password']", "input[type='text']"):
+            try:
+                pin_loc = page.locator(pin_selector).first
+                pin_loc.wait_for(state="visible", timeout=4000)
+                current_val = pin_loc.input_value()
+                # Skip if it still contains the TOTP we just typed
+                if current_val and len(current_val) == 6 and current_val.isdigit():
+                    log.info("[PW] Input still has TOTP value — not PIN, skipping")
+                    continue
+                log.info("[PW] Entering PIN via %s…", pin_selector)
+                pin_loc.fill(pin)
+                page.wait_for_timeout(500)
+                page.screenshot(path=str(SCREENSHOTS / "debug_step5_pin.png"))
+                page.get_by_text("Continue").click()
+                page.wait_for_timeout(2000)
+                page.screenshot(path=str(SCREENSHOTS / "debug_step6_after_pin.png"))
+                pin_found = True
+                break
+            except PWTimeout:
+                continue
+        if not pin_found:
+            log.info("[PW] No separate PIN field detected — skipping")
+            page.screenshot(path=str(SCREENSHOTS / "debug_step5_nopin.png"))
 
         # Allow a moment for the final redirect
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(3000)
+        page.screenshot(path=str(SCREENSHOTS / "debug_step7_final.png"))
+        log.info("[PW] Final URL: %s", page.url)
         browser.close()
 
     if not auth_code:
