@@ -49,7 +49,13 @@ def _claude_sentiment(headlines: list[str]) -> float:
         max_tokens=64,
         messages=[{"role": "user", "content": prompt}],
     )
-    result = json.loads(response.content[0].text)
+    raw = response.content[0].text.strip()
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    result = json.loads(raw.strip())
     return float(result["score"])
 
 
