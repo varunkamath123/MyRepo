@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Upstox token refresh at 08:30 IST (03:00 UTC)
+
+[Timer]
+# 03:00 UTC = 08:30 IST
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true
+Unit=upstox_token_refresh.service
+
+[Install]
+WantedBy=timers.target

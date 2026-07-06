@@ -1,0 +1,16 @@
+[Unit]
+Description=Upstox daily token refresh for Kronos Futures Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/opt/kronos_bot/repo
+ExecStart=/opt/kronos_bot/venv/bin/python brokers/upstox_auth_auto.py
+EnvironmentFile=/opt/kronos_bot/repo/.env
+StandardOutput=journal
+StandardError=journal
+
+# Restart the main bot after successful token refresh
+ExecStartPost=/bin/systemctl restart kronos_futures_bot.service
