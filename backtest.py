@@ -46,18 +46,44 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from config import INSTRUMENTS, MIN_ADX
 
-# ── Backtest-specific risk params (calibrated for futures price moves, not options premium) ──
-STOP_LOSS_PCT        = 0.030   # 3%: daily NSE bars gap 1-2% on news; 2% stops out noise
-TRAIL_ACTIVATE_PCT   = 0.060   # 6%: let positional trades breathe before trailing
-TRAIL_DISTANCE_PCT   = 0.025   # 2.5%: wider trail so minor pullbacks don't close winners
-KRONOS_CONF_MIN      = 0.45    # minimum ATR-normalised confidence to enter
-KRONOS_REV_CONF_MIN  = 0.45    # minimum confidence for an opposite signal to trigger exit
-FORECAST_BARS        = 5       # daily bars to predict (5 days = 1 week; sufficient for direction)
-MIN_CONTEXT_BARS     = 60      # minimum history before first signal
-SIGNAL_CACHE_BARS    = 3       # re-run Kronos at most every N bars (saves ~3x inference calls)
+# ── Global defaults ───────────────────────────────────────────────────────────
+FORECAST_BARS        = 5       # daily bars ahead (1 week; enough for direction)
+MIN_CONTEXT_BARS     = 60      # minimum history bars before first signal
+SIGNAL_CACHE_BARS    = 3       # re-run Kronos every N bars to save CPU
 
 EXIT_ON_KRONOS_REVERSAL  = True
 EXIT_ON_SUPERTREND_FLIP  = True
+
+# ── Per-instrument risk params ────────────────────────────────────────────────
+# Tuned separately based on 3-year Kronos backtest results.
+# NIFTY: avg loss was > avg win with shared 3% stop → raise conf_min to filter
+#        weak entries and tighten stop slightly.
+# BANKNIFTY: PF 1.97 / Sharpe 4.32 — keep working params, earlier trail activate.
+# SENSEX: no backtest data yet; start conservative, same as NIFTY.
+INSTRUMENT_PARAMS = {
+    "NIFTY": {
+        "stop_loss_pct":       0.025,   # 2.5%: tighter stop, smaller losses
+        "trail_activate_pct":  0.060,   # 6%
+        "trail_distance_pct":  0.025,   # 2.5%
+        "kronos_conf_min":     0.55,    # higher bar: only high-conviction entries
+        "kronos_rev_conf_min": 0.50,
+    },
+    "BANKNIFTY": {
+        "stop_loss_pct":       0.030,   # 3%: BNF moves bigger, needs room
+        "trail_activate_pct":  0.050,   # 5%: activate trail earlier to lock in big moves
+        "trail_distance_pct":  0.025,   # 2.5%
+        "kronos_conf_min":     0.45,    # keep as-is (PF 1.97 already)
+        "kronos_rev_conf_min": 0.45,
+    },
+    "SENSEX": {
+        "stop_loss_pct":       0.025,   # conservative until we have backtest
+        "trail_activate_pct":  0.060,
+        "trail_distance_pct":  0.025,
+        "kronos_conf_min":     0.55,
+        "kronos_rev_conf_min": 0.50,
+    },
+}
+_DEFAULT_PARAMS = INSTRUMENT_PARAMS["NIFTY"]  # fallback for unknown instruments
 
 # ── yfinance symbols ──────────────────────────────────────────────────────────
 _YF_SYMBOLS = {
@@ -185,6 +211,15 @@ def backtest_instrument(
     Exits checked each subsequent bar against close price.
     """
     lot_size = INSTRUMENTS.get(instrument, {}).get("lot_size", 1)
+    if instrument not in INSTRUMENTS and instrument == "SENSEX":
+        lot_size = 20
+    p = INSTRUMENT_PARAMS.get(instrument, _DEFAULT_PARAMS)
+    stop_loss_pct       = p["stop_loss_pct"]
+    trail_activate_pct  = p["trail_activate_pct"]
+    trail_distance_pct  = p["trail_distance_pct"]
+    kronos_conf_min     = p["kronos_conf_min"]
+    kronos_rev_conf_min = p["kronos_rev_conf_min"]
+
     trades: list[Trade] = []
 
     pos:          Optional[Trade] = None
@@ -226,19 +261,19 @@ def backtest_instrument(
                        else (pos.entry_price - price) / pos.entry_price)
 
             # Hard stop
-            if pnl_pct <= -STOP_LOSS_PCT:
+            if pnl_pct <= -stop_loss_pct:
                 _close(pos, i + 1, nxt_date, price, "STOP_LOSS", trades)
                 pos = None; hwm = trail_stop = 0.0; trail_active = False
                 _last_signal_bar = -999   # force refresh after exit
                 continue
 
             # Trailing stop
-            if pnl_pct >= TRAIL_ACTIVATE_PCT:
+            if pnl_pct >= trail_activate_pct:
                 trail_active = True
                 if price > hwm or hwm == 0.0:
                     hwm = price
-                    trail_stop = (hwm * (1 - TRAIL_DISTANCE_PCT) if pos.direction == "LONG"
-                                  else hwm * (1 + TRAIL_DISTANCE_PCT))
+                    trail_stop = (hwm * (1 - trail_distance_pct) if pos.direction == "LONG"
+                                  else hwm * (1 + trail_distance_pct))
 
             if trail_active:
                 hit = ((pos.direction == "LONG"  and price < trail_stop) or
@@ -255,7 +290,7 @@ def backtest_instrument(
 
                 if EXIT_ON_KRONOS_REVERSAL:
                     opp = "SHORT" if pos.direction == "LONG" else "LONG"
-                    if _cached_dir == opp and _cached_conf >= KRONOS_REV_CONF_MIN:
+                    if _cached_dir == opp and _cached_conf >= kronos_rev_conf_min:
                         _close(pos, i + 1, nxt_date, price, "KRONOS_REV", trades)
                         pos = None; hwm = trail_stop = 0.0; trail_active = False
                         _last_signal_bar = -999
@@ -280,7 +315,7 @@ def backtest_instrument(
                 continue
 
             direction, confidence, source = _cached_dir, _cached_conf, _cached_src
-            if confidence < KRONOS_CONF_MIN or direction == "NEUTRAL":
+            if confidence < kronos_conf_min or direction == "NEUTRAL":
                 continue
 
             st = supertrend(ctx)
