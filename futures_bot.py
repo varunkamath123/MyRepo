@@ -19,7 +19,7 @@ from core.sentiment_signal import get_sentiment
 from core.conviction_selector import InstrumentSignal, select_best
 from core.exit_monitor import Position, BarData, check_exit
 from brokers.upstox_orders import place_order
-from brokers.fyers_data import load_ohlcv as _fyers_ohlcv, get_ltp as _fyers_ltp
+from brokers.upstox_data import load_ohlcv as _upstox_ohlcv, get_ltp as _upstox_ltp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,7 +55,7 @@ def load_ohlcv(instrument: str) -> pd.DataFrame:
     """Fetch recent 5-min OHLCV from Fyers API (live) or fall back to CSV cache."""
     import os
     try:
-        df = _fyers_ohlcv(instrument, bars=300)
+        df = _upstox_ohlcv(instrument, bars=300)
         # Cache to disk so backtest/eval scripts can use it offline
         path = f"data/{instrument.lower()}_5min.csv"
         os.makedirs("data", exist_ok=True)
@@ -118,7 +118,7 @@ def run_loop(instruments: list[str], headlines: list[str], paper: bool = False):
         if active_position:
             try:
                 df  = load_ohlcv(active_position.instrument)
-                ltp = _fyers_ltp(active_position.instrument)
+                ltp = _upstox_ltp(active_position.instrument)
                 kf  = forecast(df, KRONOS_FORECAST_BARS)   # full candle forecast
                 st  = supertrend(df)
                 bar = BarData(
@@ -174,7 +174,7 @@ def run_loop(instruments: list[str], headlines: list[str], paper: bool = False):
             best = select_best(signals)
             if best:
                 cfg = INSTRUMENTS[best.instrument]
-                ltp = _fyers_ltp(best.instrument)
+                ltp = _upstox_ltp(best.instrument)
                 side = "BUY" if best.direction == "LONG" else "SELL"
                 place_order(cfg["symbol"], side, cfg["lot_size"],
                             paper=paper or not cfg["live"])
