@@ -70,6 +70,51 @@ def load_ohlcv(instrument: str, bars: int = 300) -> pd.DataFrame:
     return df
 
 
+def load_daily_ohlcv(instrument: str, bars: int = 200) -> pd.DataFrame:
+    """
+    Fetch last `bars` COMPLETE daily candles for the index via Upstox historical API.
+
+    Excludes any partial current-day bar, so the returned frame is always
+    complete bars through the last closed session — the correct context for a
+    daily-candle Kronos signal generated during market hours.
+    """
+    key = INDEX_KEYS[instrument]
+    encoded_key = quote(key, safe="")
+
+    now = datetime.now()
+    # Daily bars: fetch generously (weekends/holidays reduce count)
+    days_back = int(bars * 1.6) + 10
+    from_date = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    to_date = now.strftime("%Y-%m-%d")
+
+    url = f"{_BASE}/historical-candle/{encoded_key}/day/{to_date}/{from_date}"
+    resp = requests.get(url, headers=_headers(), timeout=15)
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"[UPSTOX] daily history error for {instrument}: {resp.text}")
+
+    data = resp.json()
+    if data.get("status") != "success":
+        raise RuntimeError(f"[UPSTOX] daily history failed for {instrument}: {data}")
+
+    candles = data["data"]["candles"]  # [[ts, o, h, l, c, v, oi], ...]
+    if not candles:
+        raise RuntimeError(f"[UPSTOX] no daily candles returned for {instrument}")
+
+    df = pd.DataFrame(candles, columns=["datetime", "open", "high", "low", "close", "volume", "oi"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.drop(columns=["oi"])
+    df = df.sort_values("datetime").reset_index(drop=True)
+
+    # Drop today's partial bar if market is still open (only keep complete sessions)
+    today = pd.Timestamp(datetime.now().date())
+    df = df[df["datetime"].dt.normalize() < today].reset_index(drop=True)
+
+    df = df.tail(bars).reset_index(drop=True)
+    log.debug("[UPSTOX] Loaded %d complete daily bars for %s", len(df), instrument)
+    return df
+
+
 def get_ltp(instrument: str) -> float:
     """Return latest traded price of the index (used as futures proxy in paper mode)."""
     key = INDEX_KEYS[instrument]

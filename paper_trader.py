@@ -1,23 +1,31 @@
 """
-Kronos Futures — Daily Paper Trader
-====================================
-Runs once per day (after market close, 15:35 IST) via cron.
+Kronos Futures — Daily Paper Trader (same-day close entry)
+==========================================================
+Runs once per day near market close (~15:20 IST) via cron.
 
-Workflow:
-  1. Fetch latest daily OHLCV from yfinance
-  2. Compute Kronos signal for each active instrument
-  3. If not in a position and signal is valid → queue entry at tomorrow's open
-  4. If in a position → check stop/trail/Kronos-reversal/SuperTrend exit
-  5. At 09:20 IST the next day, "fill" queued entries at today's open price
-  6. Log all actions to paper_trades.jsonl and print daily summary
+Why near-close, same-day entry?
+  The old flow generated a signal at 15:35 and only entered at the NEXT day's
+  open — burning the overnight gap plus the first day of the forecast window.
+  This version signals on the last 128 COMPLETE daily candles (through the last
+  closed session) and enters immediately at the live price (~today's close),
+  so the full multi-day forecast window is captured.
 
-Capital: one lot per instrument, max one open position at a time across all instruments.
+Workflow (single daily run):
+  1. Fetch complete daily OHLCV (Upstox, fallback yfinance) — context bars
+  2. Fetch live price (Upstox LTP) — the same-day entry/exit price
+  3. PASS 1 — exits: for each open position, check stop/trail/Kronos-rev/ST-flip
+     against the live price; close same-day if any fires
+  4. PASS 2 — entries: if flat and no other position open, evaluate the Kronos
+     signal; if all gates pass, ENTER at the live price today
+  5. Log all actions to paper_trades.jsonl and print the daily summary
+
+Capital: one lot per instrument, max one open position across all instruments.
 
 Run manually:
-    python paper_trader.py                  # signal check (normal daily run)
-    python paper_trader.py --fill-open      # fill pending entries at today's open
+    python paper_trader.py                  # daily run (signal + same-day entry/exit)
     python paper_trader.py --status         # print current positions + P&L
     python paper_trader.py --reset          # wipe all state (fresh start)
+    python paper_trader.py --sensex         # include SENSEX in active instruments
 """
 from __future__ import annotations
 
@@ -42,6 +50,13 @@ from backtest import (
     compute_adx, supertrend, fetch_daily, get_signal,
 )
 from config import INSTRUMENTS
+
+# Live Upstox data (complete daily bars + LTP). Falls back to yfinance if unavailable.
+try:
+    from brokers.upstox_data import load_daily_ohlcv as _upstox_daily, get_ltp as _upstox_ltp
+    _UPSTOX_OK = True
+except Exception:
+    _UPSTOX_OK = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,18 +93,9 @@ class Position:
     trail_stop:    float
 
 @dataclass
-class PendingEntry:
-    instrument:  str
-    direction:   str
-    confidence:  float
-    signal_date: str            # date signal was generated
-    lot_size:    int
-
-@dataclass
 class PaperState:
     capital:       float
     positions:     dict[str, Position]    # instrument -> Position
-    pending:       dict[str, PendingEntry]  # instrument -> PendingEntry
     realised_pnl:  float
     trade_count:   int
 
@@ -98,18 +104,15 @@ def _load_state() -> PaperState:
     if Path(STATE_FILE).exists():
         raw = json.loads(Path(STATE_FILE).read_text())
         positions = {k: Position(**v) for k, v in raw.get("positions", {}).items()}
-        pending   = {k: PendingEntry(**v) for k, v in raw.get("pending", {}).items()}
         return PaperState(
             capital=raw["capital"],
             positions=positions,
-            pending=pending,
             realised_pnl=raw.get("realised_pnl", 0.0),
             trade_count=raw.get("trade_count", 0),
         )
     return PaperState(
         capital=TOTAL_CAPITAL,
         positions={},
-        pending={},
         realised_pnl=0.0,
         trade_count=0,
     )
@@ -121,9 +124,46 @@ def _save_state(state: PaperState):
         "realised_pnl": state.realised_pnl,
         "trade_count":  state.trade_count,
         "positions":    {k: asdict(v) for k, v in state.positions.items()},
-        "pending":      {k: asdict(v) for k, v in state.pending.items()},
     }
     Path(STATE_FILE).write_text(json.dumps(raw, indent=2))
+
+
+# ── Data access: complete daily context + live entry price ────────────────────
+
+def get_context(instrument: str, bars: int = 150) -> pd.DataFrame:
+    """
+    Return complete daily OHLCV bars (through the last closed session) as context.
+    Prefers Upstox (reliable, no lag); falls back to yfinance.
+    """
+    if _UPSTOX_OK:
+        try:
+            df = _upstox_daily(instrument, bars=bars)
+            if len(df) >= 60:
+                return df
+            log.warning("[%s] Upstox returned only %d daily bars — falling back to yfinance",
+                        instrument, len(df))
+        except Exception as e:
+            log.warning("[%s] Upstox daily fetch failed (%s) — falling back to yfinance",
+                        instrument, e)
+    df = fetch_daily(instrument, years=1)
+    # Drop a partial current-day bar if yfinance included one
+    today = pd.Timestamp(date.today())
+    df = df[pd.to_datetime(df["datetime"]).dt.normalize() < today].reset_index(drop=True)
+    return df
+
+
+def get_entry_price(instrument: str, context: pd.DataFrame) -> tuple[float, str]:
+    """
+    Return (price, source) for the same-day entry/exit fill.
+    Prefers live Upstox LTP (~today's close during market hours);
+    falls back to the last complete daily close.
+    """
+    if _UPSTOX_OK:
+        try:
+            return float(_upstox_ltp(instrument)), "upstox_ltp"
+        except Exception as e:
+            log.warning("[%s] LTP fetch failed (%s) — using last daily close", instrument, e)
+    return float(context["close"].iloc[-1]), "last_close"
 
 
 def _log_trade(record: dict):
@@ -133,44 +173,57 @@ def _log_trade(record: dict):
 
 # ── Signal evaluation ─────────────────────────────────────────────────────────
 
-def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float, float]:
-    """Returns (direction, confidence, last_close)."""
+def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float]:
+    """
+    Evaluate the full entry gate chain on complete daily context `df`.
+    Returns (direction, confidence); direction is NEUTRAL if any gate fails.
+    """
     p = INSTRUMENT_PARAMS.get(instrument, _DEFAULT_PARAMS)
     ctx = df.copy()
-    last_close = float(ctx["close"].iloc[-1])
 
     adx = compute_adx(ctx)
     if adx < MIN_ADX:
-        log.info("[%s] ADX %.1f < %d — no signal", instrument, adx, MIN_ADX)
-        return "NEUTRAL", 0.0, last_close
+        log.info("[%s] Gate FAIL: ADX %.1f < %d (ranging market)", instrument, adx, MIN_ADX)
+        return "NEUTRAL", 0.0
 
     direction, confidence, source = get_signal(ctx, force_fallback=False)
     log.info("[%s] Kronos: %s conf=%.0f%% src=%s adx=%.1f",
              instrument, direction, confidence * 100, source, adx)
 
-    if confidence < p["kronos_conf_min"] or direction == "NEUTRAL":
-        return "NEUTRAL", 0.0, last_close
+    if direction == "NEUTRAL":
+        return "NEUTRAL", 0.0
+    if confidence < p["kronos_conf_min"]:
+        log.info("[%s] Gate FAIL: confidence %.0f%% < %.0f%%",
+                 instrument, confidence * 100, p["kronos_conf_min"] * 100)
+        return "NEUTRAL", 0.0
 
     st = supertrend(ctx)
     if direction == "LONG" and st != "BULL":
-        log.info("[%s] SuperTrend is BEAR — skipping LONG entry", instrument)
-        return "NEUTRAL", 0.0, last_close
-    if direction == "SHORT" and st != "BULL":
-        pass  # SHORT + BEAR ST is fine
+        log.info("[%s] Gate FAIL: SuperTrend %s not aligned with LONG", instrument, st)
+        return "NEUTRAL", 0.0
+    if direction == "SHORT" and st != "BEAR":
+        log.info("[%s] Gate FAIL: SuperTrend %s not aligned with SHORT", instrument, st)
+        return "NEUTRAL", 0.0
 
-    return direction, confidence, last_close
+    log.info("[%s] Gate PASS: %s conf=%.0f%% adx=%.1f st=%s — entry qualified",
+             instrument, direction, confidence * 100, adx, st)
+    return direction, confidence
 
 
 # ── Exit check ────────────────────────────────────────────────────────────────
 
-def check_exit(instrument: str, pos: Position, df: pd.DataFrame) -> Optional[str]:
-    """Return exit reason string if position should be closed, else None."""
+def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
+               price: float) -> Optional[str]:
+    """
+    Return exit reason if the position should close at `price` (live), else None.
+    Indicators/signal are computed on the complete daily context `df`; the P&L
+    and stop/trail checks use the live `price`.
+    """
     p = INSTRUMENT_PARAMS.get(instrument, _DEFAULT_PARAMS)
-    last_close = float(df["close"].iloc[-1])
 
-    pnl_pct = ((last_close - pos.entry_price) / pos.entry_price
+    pnl_pct = ((price - pos.entry_price) / pos.entry_price
                if pos.direction == "LONG"
-               else (pos.entry_price - last_close) / pos.entry_price)
+               else (pos.entry_price - price) / pos.entry_price)
 
     # Hard stop
     if pnl_pct <= -p["stop_loss_pct"]:
@@ -179,17 +232,17 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame) -> Optional[str
     # Trail
     if pnl_pct >= p["trail_activate_pct"]:
         pos.trail_active = True
-        if pos.direction == "LONG" and last_close > pos.hwm:
-            pos.hwm = last_close
+        if pos.direction == "LONG" and price > pos.hwm:
+            pos.hwm = price
             pos.trail_stop = pos.hwm * (1 - p["trail_distance_pct"])
-        elif pos.direction == "SHORT" and last_close < pos.hwm:
-            pos.hwm = last_close
+        elif pos.direction == "SHORT" and price < pos.hwm:
+            pos.hwm = price
             pos.trail_stop = pos.hwm * (1 + p["trail_distance_pct"])
 
     if pos.trail_active:
-        if pos.direction == "LONG" and last_close < pos.trail_stop:
+        if pos.direction == "LONG" and price < pos.trail_stop:
             return "TRAIL_STOP"
-        if pos.direction == "SHORT" and last_close > pos.trail_stop:
+        if pos.direction == "SHORT" and price > pos.trail_stop:
             return "TRAIL_STOP"
 
     # Signal exits
@@ -215,120 +268,99 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame) -> Optional[str
 
 # ── Main commands ─────────────────────────────────────────────────────────────
 
-def cmd_signal_check(instruments: list[str]):
-    """Run at 15:35 IST: generate signals for tomorrow's potential entries."""
+def cmd_daily_run(instruments: list[str]):
+    """
+    Single daily run near market close (~15:20 IST).
+    PASS 1 closes any exits at the live price; PASS 2 enters new signals
+    at the live price the same day.
+    """
     state = _load_state()
     today = date.today().isoformat()
 
+    # Fetch context + live price once per instrument
+    ctx: dict[str, pd.DataFrame] = {}
+    px:  dict[str, float]        = {}
     for inst in instruments:
-        log.info("=== %s ===", inst)
-        df = fetch_daily(inst, years=1)   # 1 year is enough for signal context
+        try:
+            df = get_context(inst, bars=150)
+            price, src = get_entry_price(inst, df)
+            ctx[inst] = df
+            px[inst]  = price
+            log.info("[%s] context=%d bars  last_close=%.1f  live=%.1f (%s)",
+                     inst, len(df), float(df["close"].iloc[-1]), price, src)
+        except Exception as e:
+            log.error("[%s] Data fetch failed: %s — skipping", inst, e)
 
-        # ── Exit check for open positions ──────────────────────────────────
-        if inst in state.positions:
-            pos = state.positions[inst]
-            reason = check_exit(inst, pos, df)
-            if reason:
-                last_close = float(df["close"].iloc[-1])
-                pts = ((last_close - pos.entry_price) if pos.direction == "LONG"
-                       else (pos.entry_price - last_close))
-                pnl = pts * pos.lot_size
-                state.realised_pnl += pnl
-                state.trade_count  += 1
-                log.info("[%s] EXIT %s @ %.1f  reason=%s  PnL INR %+.0f",
-                         inst, pos.direction, last_close, reason, pnl)
-                _log_trade({
-                    "event":       "EXIT",
-                    "instrument":  inst,
-                    "direction":   pos.direction,
-                    "entry_date":  pos.entry_date,
-                    "entry_price": pos.entry_price,
-                    "exit_date":   today,
-                    "exit_price":  last_close,
-                    "exit_reason": reason,
-                    "pnl_pts":     pts,
-                    "pnl_inr":     pnl,
-                    "lot_size":    pos.lot_size,
-                })
-                del state.positions[inst]
-            else:
-                last_close = float(df["close"].iloc[-1])
-                pts = ((last_close - pos.entry_price) if pos.direction == "LONG"
-                       else (pos.entry_price - last_close))
-                log.info("[%s] HOLD %s  entry=%.1f  close=%.1f  unrealised INR %+.0f",
-                         inst, pos.direction, pos.entry_price, last_close, pts * pos.lot_size)
-            continue   # already in a position — don't generate new entry signal
-
-        # ── Entry signal check ─────────────────────────────────────────────
-        # Only enter if no position and capital is available
-        if len(state.positions) >= 1:
-            log.info("[%s] Another position is open — skipping entry check", inst)
+    # ── PASS 1: exits ──────────────────────────────────────────────────────
+    for inst in list(state.positions.keys()):
+        if inst not in ctx:
             continue
-
-        direction, confidence, last_close = evaluate_signal(inst, df)
-        if direction != "NEUTRAL":
-            lot = LOT_SIZES.get(inst, 1)
-            state.pending[inst] = PendingEntry(
-                instrument=inst,
-                direction=direction,
-                confidence=confidence,
-                signal_date=today,
-                lot_size=lot,
-            )
-            log.info("[%s] SIGNAL %s conf=%.0f%%  -> pending entry at tomorrow's open",
-                     inst, direction, confidence * 100)
+        pos    = state.positions[inst]
+        price  = px[inst]
+        reason = check_exit(inst, pos, ctx[inst], price)
+        pts = ((price - pos.entry_price) if pos.direction == "LONG"
+               else (pos.entry_price - price))
+        if reason:
+            pnl = pts * pos.lot_size
+            state.realised_pnl += pnl
+            state.trade_count  += 1
+            log.info("[%s] EXIT %s @ %.1f  reason=%s  PnL INR %+.0f  [held from %s]",
+                     inst, pos.direction, price, reason, pnl, pos.entry_date)
+            _log_trade({
+                "event":       "EXIT",
+                "instrument":  inst,
+                "direction":   pos.direction,
+                "entry_date":  pos.entry_date,
+                "entry_price": pos.entry_price,
+                "exit_date":   today,
+                "exit_price":  price,
+                "exit_reason": reason,
+                "pnl_pts":     pts,
+                "pnl_inr":     pnl,
+                "lot_size":    pos.lot_size,
+            })
+            del state.positions[inst]
         else:
-            if inst in state.pending:
-                del state.pending[inst]
-                log.info("[%s] Previous pending signal cleared (no signal today)", inst)
+            log.info("[%s] HOLD %s  entry=%.1f  live=%.1f  unrealised INR %+.0f",
+                     inst, pos.direction, pos.entry_price, price, pts * pos.lot_size)
 
-    _save_state(state)
-    print_status(state)
-
-
-def cmd_fill_open(instruments: list[str]):
-    """Run at 09:20 IST: fill pending entries at today's open price."""
-    state = _load_state()
-    today = date.today().isoformat()
-
+    # ── PASS 2: entries (max one open position across all instruments) ─────
     for inst in instruments:
-        if inst not in state.pending:
+        if inst not in ctx:
+            continue
+        if inst in state.positions:
+            continue
+        if len(state.positions) >= 1:
+            log.info("[%s] A position is already open — one at a time, skipping entry", inst)
             continue
 
-        pending = state.pending[inst]
-
-        # Don't fill if signal is stale (more than 1 day old)
-        signal_dt = date.fromisoformat(pending.signal_date)
-        if (date.today() - signal_dt).days > 1:
-            log.info("[%s] Pending signal is stale (%s) — skipping fill", inst, pending.signal_date)
-            del state.pending[inst]
+        direction, confidence = evaluate_signal(inst, ctx[inst])
+        if direction == "NEUTRAL":
             continue
 
-        # Use today's open from yfinance (or fallback to yesterday's close)
-        df = fetch_daily(inst, years=1)
-        today_open = float(df["open"].iloc[-1])
-
-        log.info("[%s] FILL %s @ %.1f (today's open)", inst, pending.direction, today_open)
+        price = px[inst]
+        lot   = LOT_SIZES.get(inst, 1)
         state.positions[inst] = Position(
             instrument=inst,
-            direction=pending.direction,
+            direction=direction,
             entry_date=today,
-            entry_price=today_open,
-            lot_size=pending.lot_size,
-            hwm=today_open,
+            entry_price=price,
+            lot_size=lot,
+            hwm=price,
             trail_active=False,
             trail_stop=0.0,
         )
+        log.info("[%s] ENTRY %s @ %.1f  conf=%.0f%%  lot=%d  (same-day close)",
+                 inst, direction, price, confidence * 100, lot)
         _log_trade({
             "event":       "ENTRY",
             "instrument":  inst,
-            "direction":   pending.direction,
+            "direction":   direction,
             "entry_date":  today,
-            "entry_price": today_open,
-            "confidence":  pending.confidence,
-            "lot_size":    pending.lot_size,
+            "entry_price": price,
+            "confidence":  confidence,
+            "lot_size":    lot,
         })
-        del state.pending[inst]
 
     _save_state(state)
     print_status(state)
@@ -348,12 +380,6 @@ def print_status(state: PaperState):
                   f"date={pos.entry_date}  lot={pos.lot_size}")
     else:
         print("  No open positions.")
-
-    if state.pending:
-        print("  PENDING ENTRIES (fill at tomorrow's open):")
-        for inst, pnd in state.pending.items():
-            print(f"    {inst:<10} {pnd.direction}  conf={pnd.confidence:.0%}  "
-                  f"signal={pnd.signal_date}")
     print(sep)
 
 
@@ -373,9 +399,7 @@ def cmd_reset():
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Kronos paper trader")
-    parser.add_argument("--fill-open",  action="store_true",
-                        help="Fill pending entries at today's open (run at 09:20 IST)")
+    parser = argparse.ArgumentParser(description="Kronos paper trader (same-day close entry)")
     parser.add_argument("--status",     action="store_true",
                         help="Print current positions and P&L")
     parser.add_argument("--reset",      action="store_true",
@@ -392,10 +416,8 @@ def main():
         cmd_reset()
     elif args.status:
         cmd_status()
-    elif args.fill_open:
-        cmd_fill_open(instruments)
     else:
-        cmd_signal_check(instruments)
+        cmd_daily_run(instruments)
 
 
 if __name__ == "__main__":
