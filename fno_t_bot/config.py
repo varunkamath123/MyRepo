@@ -215,6 +215,18 @@ TRAIL_ACT_ORB_HELD   = 0.18        # Trail activation for ORB_HELD (held past 12
 TRAILING_DISTANCE    = 0.10        # Trail distance 10% from peak (was 20%)
                                    # Tighter trail: locks in gains sooner on slower-moving 12-DTE options.
 
+# Never-Progressed exit (Jul 2026, from live-trade analysis Apr-Jun):
+# Trades that never gained traction bled to EOD force-close: the 90-180min hold
+# bucket ran 24% WR / -₹18.8k while every trailing-stop winner passed +12% well
+# before 90min. Cuts a position that is (a) ≥90min old, (b) never peaked +3%,
+# and (c) currently red — instead of letting it ride to 14:30.
+# Covers the gap left by the checkpoint loss-stop: entries AFTER the checkpoint
+# (REV at 12:00, late PATH-A) previously had no progress-based exit at all
+# (e.g. Jun 9 BNF REV -₹4,180 bled the full 150min to force-close).
+NEVER_PROGRESS_ENABLED   = True
+NEVER_PROGRESS_MINUTES   = 90      # minimum age before the check applies
+NEVER_PROGRESS_MIN_PEAK  = 0.03    # peaked ≥ +3% at any point = exempt (has shown life)
+
 # Dynamic profit target — scale BASE_TARGET with ATM-IV at entry (May 2026)
 # High IV = bigger daily swings → option can reach 50% gain on same move
 # that only earns 20% on a quiet low-IV day. Formula: BASE_TARGET * (atm_iv / REF).
@@ -924,7 +936,11 @@ GST_RATE                 = 0.18            # 18% on brokerage + exchange + SEBI
 #   1. Set INSTRUMENT_STRATEGY['SENSEX']['live_mode'] = True
 #   2. Restart fno_t_bot_sensex service
 SENSEX_LIVE_THRESHOLD     = 75_000   # ₹75k target combined NF+BNF capital
-SENSEX_LIVE_START_CAPITAL = 52_997   # recalibrated Jul 6 2026: Rs50k actual balance after settlement + Rs50k deposit
+SENSEX_LIVE_START_CAPITAL = 56_116   # recalibrated Jul 8 2026 after JSONL dedup cleanup:
+                                     # cleaned NF+BNF cumulative P&L = -6,116; actual Fyers
+                                     # balance Rs50,000 (Jul 6 deposit, no trades since)
+                                     # → 56,116 - 6,116 = 50,000. (Jul 6 value 52,997 was
+                                     # calibrated against dup-inflated JSONL data.)
 LIVE_SWITCH_DATE          = '2026-04-06'  # Date NIFTY + BANKNIFTY went live (Apr 6 2026)
                                           # capital_status.py only counts trades from this date
 
@@ -1180,6 +1196,11 @@ STRATEGY_PHASE3_TARGET_SCALE = 0.70    # Phase 3 target = 70% of normal (take pr
 # Raise threshold to 60-65 after 30+ calibration trades.
 UNIFIED_SCORER_ENABLED  = True   # gate: True = block weak signals; False = log only
 UNIFIED_SCORE_THRESHOLD = 55     # minimum score to enter (0-100)
+# Per-band threshold offsets, added to UNIFIED_SCORE_THRESHOLD for entries in
+# that time band. Live trades Apr-Jul: 11:00-12:00 entries ran 0/4 (-₹7,420) —
+# lunchtime-drift breakouts fail; demand extra quality there. Other bands: no
+# offset (early window 50% WR, noon REV is the top live earner — leave alone).
+UNIFIED_BAND_THRESHOLD_OFFSET = {'11:00': 5}
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_DIRECTORY    = "logs"

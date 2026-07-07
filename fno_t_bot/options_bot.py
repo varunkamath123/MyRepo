@@ -128,6 +128,7 @@ class TradingBot:
 
         self.positions    = []
         self.trade_log    = []
+        self._persisted_trade_keys: set = set()   # trades already written to JSONL
         self.trades_today = 0
         self.daily_pnl    = 0.0
         self.total_pnl    = 0.0
@@ -2901,6 +2902,20 @@ class TradingBot:
                     exit_reason = "Trailing Stop"
                 elif elapsed_days >= config.MAX_HOLDING_DAYS:
                     exit_reason = "Max Hold Period"
+                elif (getattr(config, 'NEVER_PROGRESS_ENABLED', False)
+                      and pnl_pct < 0
+                      and pos['highest_pnl_pct']
+                          < getattr(config, 'NEVER_PROGRESS_MIN_PEAK', 0.03)
+                      and elapsed_days * 1440.0
+                          >= getattr(config, 'NEVER_PROGRESS_MINUTES', 90)):
+                    # Never-Progressed: ≥90min old, never peaked +3%, currently
+                    # red → dead trade; cut before it bleeds to force-close.
+                    # Winners pass trail activation (+12-18%) well inside 90min;
+                    # the checkpoint loss-stop misses entries made after it.
+                    exit_reason = (
+                        f"Never-Progressed ({elapsed_days*1440:.0f}m, "
+                        f"peak {pos['highest_pnl_pct']*100:+.1f}%)"
+                    )
 
             if exit_reason:
                 if self.live and pos.get('option_symbol'):
@@ -2941,6 +2956,7 @@ class TradingBot:
                     'entry_underlying' : round(pos.get('entry_underlying', 0), 2),
                     'exit_price'       : round(current_opt, 2),
                     'pnl_pct'          : round(pnl_pct * 100, 2),
+                    'max_pnl_pct'      : round(pos.get('highest_pnl_pct', 0.0) * 100, 2),
                     'costs'            : round(costs, 2),
                     'pnl_net'          : round(pnl_net, 2),
                     'exit_reason'      : exit_reason,
@@ -3440,15 +3456,24 @@ class TradingBot:
         """
         if not self.trade_log:
             return
+        record = self.trade_log[-1]   # only append the most recent trade
+        # Idempotency guard: the shutdown handler (KeyboardInterrupt in run())
+        # also calls this method, re-appending a trade that was already saved
+        # at exit time. Every bot stop after a trade produced a duplicate JSONL
+        # line (Jun 23 appeared ×4). Skip if this exact trade is already on disk.
+        key = (record.get('entry_time', ''), record.get('type', ''),
+               str(record.get('strike', '')))
+        if key in self._persisted_trade_keys:
+            return
         log_dir = self._trade_log_dir()
         os.makedirs(log_dir, exist_ok=True)
-        record = self.trade_log[-1]   # only append the most recent trade
         # Use trade's entry date (not current clock) for file naming
         entry_ts = record.get('entry_time', '')
         trade_date = entry_ts[:10] if entry_ts else datetime.now(IST).strftime('%Y-%m-%d')
         path  = self._trade_log_path(trade_date)
         with open(path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(record) + '\n')
+        self._persisted_trade_keys.add(key)
 
     def _load_today_trades(self) -> None:
         """On startup, reload today's JSONL trade file to restore intraday state.
@@ -3491,6 +3516,8 @@ class TradingBot:
                         continue
                     seen.add(key)
                     loaded.append(t)
+                    # Mark as persisted so _save_trade_log never re-appends it
+                    self._persisted_trade_keys.add(key)
         except (json.JSONDecodeError, OSError) as e:
             self.logger.warning(f'[TRADE-LOAD] Could not read {path}: {e}')
             return
@@ -4787,6 +4814,11 @@ class TradingBot:
                                     morning_dir      = self._morning_dir,
                                 )
                                 _ub_thr  = getattr(config, 'UNIFIED_SCORE_THRESHOLD', 55)
+                                # Per-band offset: 11:00-12:00 lunchtime entries ran
+                                # 0/4 (-₹7,420) live — demand extra quality there.
+                                _ub_thr += getattr(
+                                    config, 'UNIFIED_BAND_THRESHOLD_OFFSET', {}
+                                ).get(_ub.get('band', ''), 0)
                                 _ub_pass = _ub['score'] >= _ub_thr
                                 signal['unified_score']      = _ub['score']
                                 signal['unified_band']       = _ub['band']

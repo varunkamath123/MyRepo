@@ -229,10 +229,20 @@ def _load_trades(instrument: str) -> list[dict]:
     log_trades   = _load_from_logs(instrument)
     jsonl_trades = _load_from_jsonl(instrument)
 
-    # Start with JSONL records (richer fields)
-    merged      = list(jsonl_trades)
+    # Start with JSONL records (richer fields).
+    # Dedup WITHIN the JSONL list too: the bot's shutdown handler used to
+    # re-append the last trade on every restart, so files can contain exact
+    # duplicate lines. Key on (entry_time, type, strike) — same key the bot
+    # itself uses in _load_today_trades().
+    merged      = []
     seen_keys: set = set()
+    _seen_jsonl: set = set()
     for t in jsonl_trades:
+        jk = (t.get('entry_time', ''), t.get('type', ''), str(t.get('strike', '')))
+        if jk in _seen_jsonl:
+            continue
+        _seen_jsonl.add(jk)
+        merged.append(t)
         dt = t.get('date', t.get('exit_time', ''))[:10]
         seen_keys.add((dt, t.get('type', ''), round(t.get('pnl_net', 0))))
 
