@@ -103,6 +103,9 @@ def load_daily_ohlcv(instrument: str, bars: int = 200) -> pd.DataFrame:
 
     df = pd.DataFrame(candles, columns=["datetime", "open", "high", "low", "close", "volume", "oi"])
     df["datetime"] = pd.to_datetime(df["datetime"])
+    # Upstox timestamps are tz-aware (UTC+05:30); strip tz for consistent comparison
+    if getattr(df["datetime"].dt, "tz", None) is not None:
+        df["datetime"] = df["datetime"].dt.tz_localize(None)
     df = df.drop(columns=["oi"])
     df = df.sort_values("datetime").reset_index(drop=True)
 
