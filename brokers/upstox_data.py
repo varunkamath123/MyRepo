@@ -85,11 +85,13 @@ def load_daily_ohlcv(instrument: str, bars: int = 200) -> pd.DataFrame:
     key = INDEX_KEYS[instrument]
     encoded_key = quote(key, safe="")
 
-    now = datetime.now()
-    # Daily bars: fetch generously (weekends/holidays reduce count)
+    now_ist = datetime.now(IST)
+    # Daily bars: fetch generously (weekends/holidays reduce count).
+    # Upstox treats `to_date` as exclusive of the returned range end, so set it
+    # to IST-tomorrow to ensure the latest complete session is included.
     days_back = int(bars * 1.6) + 10
-    from_date = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    to_date = now.strftime("%Y-%m-%d")
+    from_date = (now_ist - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    to_date = (now_ist + timedelta(days=1)).strftime("%Y-%m-%d")
 
     url = f"{_BASE}/historical-candle/{encoded_key}/day/{to_date}/{from_date}"
     resp = requests.get(url, headers=_headers(), timeout=15)
