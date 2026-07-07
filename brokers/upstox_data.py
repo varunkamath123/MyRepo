@@ -6,13 +6,17 @@ Token read from logs/upstox_token.txt — run brokers/upstox_auth.py first.
 from __future__ import annotations
 import logging
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 import requests
 
 log = logging.getLogger(__name__)
+
+# Indian Standard Time — the market's timezone. The server may run on UTC, so
+# "today" for session-completeness must be computed in IST, not server-local.
+IST = timezone(timedelta(hours=5, minutes=30))
 
 _BASE = "https://api.upstox.com/v2"
 _TOKEN_PATH = Path(__file__).parent.parent / "logs" / "upstox_token.txt"
@@ -109,8 +113,10 @@ def load_daily_ohlcv(instrument: str, bars: int = 200) -> pd.DataFrame:
     df = df.drop(columns=["oi"])
     df = df.sort_values("datetime").reset_index(drop=True)
 
-    # Drop today's partial bar if market is still open (only keep complete sessions)
-    today = pd.Timestamp(datetime.now().date())
+    # Drop today's partial bar if market is still open (only keep complete sessions).
+    # "Today" must be evaluated in IST — the server may be on UTC, which would
+    # otherwise discard the most recent complete NSE session.
+    today = pd.Timestamp(datetime.now(IST).date())
     df = df[df["datetime"].dt.normalize() < today].reset_index(drop=True)
 
     df = df.tail(bars).reset_index(drop=True)
