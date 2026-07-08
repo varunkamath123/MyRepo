@@ -215,6 +215,18 @@ TRAIL_ACT_ORB_HELD   = 0.18        # Trail activation for ORB_HELD (held past 12
 TRAILING_DISTANCE    = 0.10        # Trail distance 10% from peak (was 20%)
                                    # Tighter trail: locks in gains sooner on slower-moving 12-DTE options.
 
+# Never-Progressed exit (Jul 2026, from live-trade analysis Apr-Jun):
+# Trades that never gained traction bled to EOD force-close: the 90-180min hold
+# bucket ran 24% WR / -₹18.8k while every trailing-stop winner passed +12% well
+# before 90min. Cuts a position that is (a) ≥90min old, (b) never peaked +3%,
+# and (c) currently red — instead of letting it ride to 14:30.
+# Covers the gap left by the checkpoint loss-stop: entries AFTER the checkpoint
+# (REV at 12:00, late PATH-A) previously had no progress-based exit at all
+# (e.g. Jun 9 BNF REV -₹4,180 bled the full 150min to force-close).
+NEVER_PROGRESS_ENABLED   = True
+NEVER_PROGRESS_MINUTES   = 90      # minimum age before the check applies
+NEVER_PROGRESS_MIN_PEAK  = 0.03    # peaked ≥ +3% at any point = exempt (has shown life)
+
 # Dynamic profit target — scale BASE_TARGET with ATM-IV at entry (May 2026)
 # High IV = bigger daily swings → option can reach 50% gain on same move
 # that only earns 20% on a quiet low-IV day. Formula: BASE_TARGET * (atm_iv / REF).
@@ -319,6 +331,22 @@ RISK_FREE_RATE           = 0.065
 # Enforced via shared_state.py — no new entries when grand_total ≤ -cap.
 CONSOLIDATED_DAILY_LOSS_CAP = 8000   # ₹8,000 combined across all instruments/bots
 
+# Per-trade rupee risk cap (REINSTATED Jul 8 2026 / v1.6 — the original Jun 10
+# gate lived only on EC2 and was destroyed by deploy drift, same as the funds
+# check and progress-decay exit). risk = premium × contracts × stop%.
+# Sizing ladder in enter_trade(): a multi-lot entry that busts the cap first
+# tries one strike further OTM at the same lots (cheaper premium — "multiple
+# lots at the appropriate strike"), then shaves to 1 lot, and only then skips.
+# Jun 11 live evidence: the original gate blocked 2 BNF CALLs whose Challenger
+# shadow twins lost ₹5,988 + ₹6,222 (~₹12.2k saved on day one).
+# ₹5,000 ≈ 10% of the ₹50k book — retune upward only when capital grows.
+MAX_RISK_PER_TRADE = 5000
+
+# Hard ceiling on lots per position regardless of conviction upgrades.
+# At ₹50k capital, 2 ATM lots ≈ the entire per-instrument allocation; the
+# risk cap above is what usually converts a 2-lot request into 2×OTM+1.
+DYN_MAX_LOTS = 2
+
 # ─── Regime Detection ─────────────────────────────────────────────────────────
 # Classifies last N trading days as TRENDING/CHOPPY/MIXED via ADX at 11:00.
 # CHOPPY mode: cap lots to 1, suppress REV.
@@ -406,10 +434,16 @@ MP_TRAP_TARGET_SPEND    = 3_000   # target ₹3k deployment per trade
 #
 # Set PATH_B_ENABLED = False to revert to EMA 9/21 fresh crossover.
 PATH_B_ENABLED         = True        # True = EMA crossover archived (don't revert)
-PATH_B_LIVE            = False       # True = Path B actively fires in paper_bot. Currently False:
-                                     # backtest (vB) showed 37.5% WR / -₹249k — needs a
-                                     # different signal design before going live.
-                                     # With PATH_B_LIVE=False: Path C/D/E run as fallbacks.
+PATH_B_LIVE            = True        # ENABLED Jul 8 2026 (v1.6). Was False on a 37.5% WR /
+                                     # -₹249k backtest — but that was BS-premium-priced
+                                     # (Jun 12 lesson: BS sims distort materially — REV showed
+                                     # -₹4.9k on BS vs +₹66k on real premiums) and predates the
+                                     # full live gate stack (UNIFIED, OI-BIAS, risk gate, regime
+                                     # caps) that Path B signals now pass through. Live evidence
+                                     # for the gap it fills: Jul 7 BNF 350-pt afternoon PUT drop
+                                     # and Jul 8 waterfall (NF 24,20x→23,901 from 13:45) both
+                                     # missed — no live path could fire 11:00-14:00.
+                                     # Revert: git tag v1.5-live-calibration.
 PATH_B_RANGE_END       = '10:55'     # morning range = 09:15–10:55 (all bars before entry window)
 PATH_B_ADX_MIN         = 25          # uniform for CALL and PUT (no 2-DTE asymmetry at 12 DTE)
 PATH_B_BUFFER          = 0.0008      # 0.08% buffer above MR_high / below MR_low
@@ -924,7 +958,11 @@ GST_RATE                 = 0.18            # 18% on brokerage + exchange + SEBI
 #   1. Set INSTRUMENT_STRATEGY['SENSEX']['live_mode'] = True
 #   2. Restart fno_t_bot_sensex service
 SENSEX_LIVE_THRESHOLD     = 75_000   # ₹75k target combined NF+BNF capital
-SENSEX_LIVE_START_CAPITAL = 52_997   # recalibrated Jul 6 2026: Rs50k actual balance after settlement + Rs50k deposit
+SENSEX_LIVE_START_CAPITAL = 56_116   # recalibrated Jul 8 2026 after JSONL dedup cleanup:
+                                     # cleaned NF+BNF cumulative P&L = -6,116; actual Fyers
+                                     # balance Rs50,000 (Jul 6 deposit, no trades since)
+                                     # → 56,116 - 6,116 = 50,000. (Jul 6 value 52,997 was
+                                     # calibrated against dup-inflated JSONL data.)
 LIVE_SWITCH_DATE          = '2026-04-06'  # Date NIFTY + BANKNIFTY went live (Apr 6 2026)
                                           # capital_status.py only counts trades from this date
 
@@ -1180,6 +1218,11 @@ STRATEGY_PHASE3_TARGET_SCALE = 0.70    # Phase 3 target = 70% of normal (take pr
 # Raise threshold to 60-65 after 30+ calibration trades.
 UNIFIED_SCORER_ENABLED  = True   # gate: True = block weak signals; False = log only
 UNIFIED_SCORE_THRESHOLD = 55     # minimum score to enter (0-100)
+# Per-band threshold offsets, added to UNIFIED_SCORE_THRESHOLD for entries in
+# that time band. Live trades Apr-Jul: 11:00-12:00 entries ran 0/4 (-₹7,420) —
+# lunchtime-drift breakouts fail; demand extra quality there. Other bands: no
+# offset (early window 50% WR, noon REV is the top live earner — leave alone).
+UNIFIED_BAND_THRESHOLD_OFFSET = {'11:00': 5}
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_DIRECTORY    = "logs"
