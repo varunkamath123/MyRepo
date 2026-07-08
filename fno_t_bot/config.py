@@ -331,6 +331,22 @@ RISK_FREE_RATE           = 0.065
 # Enforced via shared_state.py — no new entries when grand_total ≤ -cap.
 CONSOLIDATED_DAILY_LOSS_CAP = 8000   # ₹8,000 combined across all instruments/bots
 
+# Per-trade rupee risk cap (REINSTATED Jul 8 2026 / v1.6 — the original Jun 10
+# gate lived only on EC2 and was destroyed by deploy drift, same as the funds
+# check and progress-decay exit). risk = premium × contracts × stop%.
+# Sizing ladder in enter_trade(): a multi-lot entry that busts the cap first
+# tries one strike further OTM at the same lots (cheaper premium — "multiple
+# lots at the appropriate strike"), then shaves to 1 lot, and only then skips.
+# Jun 11 live evidence: the original gate blocked 2 BNF CALLs whose Challenger
+# shadow twins lost ₹5,988 + ₹6,222 (~₹12.2k saved on day one).
+# ₹5,000 ≈ 10% of the ₹50k book — retune upward only when capital grows.
+MAX_RISK_PER_TRADE = 5000
+
+# Hard ceiling on lots per position regardless of conviction upgrades.
+# At ₹50k capital, 2 ATM lots ≈ the entire per-instrument allocation; the
+# risk cap above is what usually converts a 2-lot request into 2×OTM+1.
+DYN_MAX_LOTS = 2
+
 # ─── Regime Detection ─────────────────────────────────────────────────────────
 # Classifies last N trading days as TRENDING/CHOPPY/MIXED via ADX at 11:00.
 # CHOPPY mode: cap lots to 1, suppress REV.
@@ -418,10 +434,16 @@ MP_TRAP_TARGET_SPEND    = 3_000   # target ₹3k deployment per trade
 #
 # Set PATH_B_ENABLED = False to revert to EMA 9/21 fresh crossover.
 PATH_B_ENABLED         = True        # True = EMA crossover archived (don't revert)
-PATH_B_LIVE            = False       # True = Path B actively fires in paper_bot. Currently False:
-                                     # backtest (vB) showed 37.5% WR / -₹249k — needs a
-                                     # different signal design before going live.
-                                     # With PATH_B_LIVE=False: Path C/D/E run as fallbacks.
+PATH_B_LIVE            = True        # ENABLED Jul 8 2026 (v1.6). Was False on a 37.5% WR /
+                                     # -₹249k backtest — but that was BS-premium-priced
+                                     # (Jun 12 lesson: BS sims distort materially — REV showed
+                                     # -₹4.9k on BS vs +₹66k on real premiums) and predates the
+                                     # full live gate stack (UNIFIED, OI-BIAS, risk gate, regime
+                                     # caps) that Path B signals now pass through. Live evidence
+                                     # for the gap it fills: Jul 7 BNF 350-pt afternoon PUT drop
+                                     # and Jul 8 waterfall (NF 24,20x→23,901 from 13:45) both
+                                     # missed — no live path could fire 11:00-14:00.
+                                     # Revert: git tag v1.5-live-calibration.
 PATH_B_RANGE_END       = '10:55'     # morning range = 09:15–10:55 (all bars before entry window)
 PATH_B_ADX_MIN         = 25          # uniform for CALL and PUT (no 2-DTE asymmetry at 12 DTE)
 PATH_B_BUFFER          = 0.0008      # 0.08% buffer above MR_high / below MR_low

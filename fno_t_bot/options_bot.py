@@ -2585,6 +2585,57 @@ class TradingBot:
         _stop_pct  = (self.inst_cfg.get('path_a_stop', config.PATH_A_STOP)
                       if _path == 'A' else config.STOP_LOSS)
 
+        # ── Risk-cap sizing ladder (reinstated Jul 8 — Jun 10 gate lost to deploy drift)
+        # Rupee risk = premium × contracts × stop%. Multi-lot entries that bust
+        # MAX_RISK_PER_TRADE first try one strike further OTM at the same lots
+        # (cheaper premium), then shave to 1 lot; if even 1 lot busts, skip.
+        _risk_cap = getattr(config, 'MAX_RISK_PER_TRADE', 5000)
+        if _fb_price:
+            _risk = _fb_price * eff_lot_size * _stop_pct
+            if _risk > _risk_cap and lots > 1:
+                _alt_strike = (strike + self.strike_gap if signal['type'] == 'CALL'
+                               else strike - self.strike_gap)
+                if self.live:
+                    from fyers_orders import (build_option_symbol,
+                                              get_next_expiry, get_ltp)
+                    _alt_prem = get_ltp(self.fyers, build_option_symbol(
+                        self.instrument, _alt_strike, signal['type'],
+                        get_next_expiry(self.instrument)))
+                else:
+                    _alt_prem = bs_price(signal['type'], underlying, _alt_strike,
+                                         config.DAYS_TO_EXPIRY / 365, hv)
+                if (_alt_prem
+                        and _alt_prem >= config.MIN_OPTION_PRICE
+                        and _alt_prem * eff_lot_size * _stop_pct <= _risk_cap):
+                    self.logger.info(
+                        f"  [RISK-FIT] {self.instrument}: {lots}-lot risk "
+                        f"₹{_risk:,.0f} > cap ₹{_risk_cap:,.0f} → strike "
+                        f"{strike}→{_alt_strike} (₹{_alt_prem:.0f}) keeps {lots} lots"
+                    )
+                    strike           = _alt_strike
+                    _fb_price        = float(_alt_prem)
+                    signal['strike'] = strike
+                else:
+                    self.logger.info(
+                        f"  [RISK-FIT] {self.instrument}: {lots}-lot risk "
+                        f"₹{_risk:,.0f} > cap ₹{_risk_cap:,.0f}, OTM shift "
+                        f"unavailable → shaving to 1 lot"
+                    )
+                    lots         = 1
+                    eff_lot_size = self.lot_size
+                _risk = _fb_price * eff_lot_size * _stop_pct
+            if _risk > _risk_cap:
+                self.logger.info(
+                    f"  [RISK-GATE] {self.instrument} {signal['type']}: 1-lot risk "
+                    f"₹{_risk:,.0f} > cap ₹{_risk_cap:,.0f} — skipping trade"
+                )
+                return
+        else:
+            self.logger.warning(
+                f"  [RISK-GATE] {self.instrument}: premium unavailable — cannot "
+                f"pre-size risk; relying on SL-M + polling stop"
+            )
+
         if self.live:
             # ── LIVE: place real order ────────────────────────────────────────
             from fyers_orders import enter_live_position
@@ -2641,6 +2692,11 @@ class TradingBot:
             'lots'             : lots,
             'regime'           : getattr(getattr(self, '_daily_regime', None), 'regime', 'UNKNOWN'),
             'posture'          : getattr(getattr(self, '_daily_regime', None), 'posture', 'NORMAL'),
+            # v1.6: conviction scores + sizing rationale — closes the data gap
+            # that made size-vs-outcome calibration impossible on the first 46 trades
+            'unified_score'    : signal.get('unified_score'),
+            'composite_score'  : signal.get('composite_score'),
+            'size_reason'      : signal.get('size_reason', ''),
         }
         self.positions.append(position)
         self.trades_today += 1
@@ -2975,6 +3031,10 @@ class TradingBot:
                     # ── Exit scorer fields ────────────────────────────────
                     'exit_score'       : pos.get('last_exit_score', None),  # score at last checkpoint
                     'exit_band'        : pos.get('last_exit_band',  None),  # HOLD/CAUTION/EXIT
+                    # ── Conviction/sizing fields (v1.6) ───────────────────
+                    'unified_score'    : pos.get('unified_score'),
+                    'composite_score'  : pos.get('composite_score'),
+                    'size_reason'      : pos.get('size_reason', ''),
                 })
                 self._save_trade_log()
                 self._compute_rolling_quality()   # re-evaluate quality after each closed trade
@@ -4467,10 +4527,11 @@ class TradingBot:
 
                     # ── Path B: Morning Range Breakout ─────────────────────────
                     # PATH_B_ENABLED = True keeps EMA crossover archived (old vX).
-                    # PATH_B_LIVE    = False until backtest-validated (vB: 37.5% WR /
-                    #                  -₹249k Apr 2026 — afternoon range breakouts are
-                    #                  fakeouts, not continuations, in Indian markets).
-                    # With PATH_B_LIVE=False: Path C/D/E run as fallbacks.
+                    # PATH_B_LIVE    = True since Jul 8 2026 (v1.6): the disabling
+                    #                  backtest was BS-premium-priced and predates the
+                    #                  live gate stack; Jul 7/8 afternoon breakdowns
+                    #                  had no live path that could fire 11:00-14:00.
+                    #                  Once/day, full downstream gates apply.
                     if signal is None and _main_window:
                         if config.PATH_B_ENABLED and config.PATH_B_LIVE and not self._path_b_fired:
                             signal = self.get_path_b_signal(df, htf, oc)
@@ -4980,6 +5041,36 @@ class TradingBot:
                                     )
 
                             if signal:
+                                # ── Final sizing clamp (v1.6) ─────────────────
+                                # The composite-scorer (≥65 → 2 lots) and post-11
+                                # STRONG upgrades run AFTER the regime/quality
+                                # caps, so they could silently override them.
+                                # Re-assert caps as the last word. Live data:
+                                # CHOPPY 32% WR / avg -₹453 per trade vs
+                                # TRENDING 50% WR / avg +₹989 — multi-lot
+                                # conviction belongs in trending tape only.
+                                _lots_pre_clamp = _lots
+                                _lots = min(_lots, getattr(config, 'DYN_MAX_LOTS', 2))
+                                if (getattr(config, 'REGIME_DETECTION_ENABLED', True)
+                                        and self._regime == 'CHOPPY'):
+                                    _lots = min(_lots, getattr(
+                                        config, 'REGIME_CHOPPY_LOTS_CAP', 1))
+                                if (getattr(config, 'QUALITY_GATE_ENABLED', True)
+                                        and self._quality_state == 'REDUCED'):
+                                    _lots = min(_lots, 1)
+                                if _lots != _lots_pre_clamp:
+                                    self.logger.info(
+                                        f"  [DYN-SIZE] {self.instrument}: final clamp "
+                                        f"{_lots_pre_clamp}→{_lots} lots "
+                                        f"(regime={self._regime}, "
+                                        f"quality={self._quality_state})"
+                                    )
+                                signal['size_reason'] = (
+                                    f"sig={signal.get('lots', 1)} "
+                                    f"pre_clamp={_lots_pre_clamp} final={_lots} "
+                                    f"regime={self._regime} "
+                                    f"quality={self._quality_state}"
+                                )
                                 signal['atm_iv'] = oc.get('atm_iv')   # IV-scaled target
                                 self.enter_trade(signal, hv, lots=_lots)
                                 self.enter_challenger_trade(signal, hv, oc, lots=_lots)

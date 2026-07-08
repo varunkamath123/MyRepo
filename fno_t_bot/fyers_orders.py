@@ -314,6 +314,29 @@ def get_order_fill_price(fyers, order_id: str,
 
 # ─── Convenience wrapper ─────────────────────────────────────────────────────
 
+def get_available_funds(fyers) -> float | None:
+    """Return available trading balance from Fyers funds API, or None on failure.
+
+    Reinstated Jul 8 2026 (v1.6) — the original Jun 10 funds check lived only
+    on EC2 and was destroyed by deploy drift. Pre-checking funds avoids broker
+    margin rejections (7 occurred before the original gate, including a missed
+    Jun 5 BNF +₹13k winner whose retry window had closed).
+    """
+    try:
+        resp = fyers.funds()
+        if resp.get('s') != 'ok':
+            logger.warning(f"[FUNDS] API response not ok: {resp}")
+            return None
+        for row in resp.get('fund_limit', []):
+            title = str(row.get('title', '')).lower()
+            if 'available balance' in title:
+                return float(row.get('equityAmount', 0.0))
+        logger.warning("[FUNDS] 'Available Balance' row not found in fund_limit")
+    except Exception as e:
+        logger.error(f"get_available_funds: {e}")
+    return None
+
+
 def enter_live_position(fyers, instrument: str,
                         signal: dict,
                         stop_pct: float = 0.25,
@@ -348,6 +371,19 @@ def enter_live_position(fyers, instrument: str,
     ltp = get_ltp(fyers, symbol)
     if ltp is None:
         logger.error(f"Cannot get LTP for {symbol}, skipping entry")
+        return None
+
+    # ── Pre-order funds check (reinstated v1.6) ──────────────────────────────
+    # Skip when order cost exceeds 98% of the live available balance — a broker
+    # margin rejection burns the entry moment; better to know before placing.
+    # Fail-open: if the funds API errors, proceed (broker rejects if truly short).
+    _cost  = ltp * lot_size
+    _avail = get_available_funds(fyers)
+    if _avail is not None and _cost > _avail * 0.98:
+        logger.error(
+            f"[FUNDS] {symbol}: cost ₹{_cost:,.0f} > available "
+            f"₹{_avail:,.0f} ×0.98 — skipping entry (insufficient funds)"
+        )
         return None
 
     logger.info(f"Entering {instrument} {signal['type']} | {symbol} | LTP=₹{ltp:.2f}")
