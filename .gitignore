@@ -20,6 +20,8 @@ breeze_keys.json
 *.jsonl
 *.log
 *.html
+paper_state.json
+mirofish_scores.json
 fyersApi.log
 fyersRequests.log
 early_session_results.json

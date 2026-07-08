@@ -16,8 +16,14 @@ Workflow (single daily run):
   3. PASS 1 — exits: for each open position, check stop/trail/Kronos-rev/ST-flip
      against the live price; close same-day if any fires
   4. PASS 2 — entries: if flat and no other position open, evaluate the Kronos
-     signal; if all gates pass, ENTER at the live price today
+     signal; if all gates pass (incl. MiroFish news veto), ENTER at live price
   5. Log all actions to paper_trades.jsonl and print the daily summary
+
+MiroFish news gate:
+  Kronos reads price shape only — no news, macro, or flow awareness. Run
+  mirofish_swarm.py before this script (see cron) to write mirofish_scores.json;
+  a strongly opposing news lean vetoes an otherwise-qualified Kronos entry.
+  Missing/stale MiroFish data does not block entries (gate is skipped, logged).
 
 Capital: one lot per instrument, max one open position across all instruments.
 
@@ -78,6 +84,13 @@ LOT_SIZES = {
     "BANKNIFTY": 30,
     "SENSEX":    20,
 }
+
+# MiroFish news veto: only block on a fairly strong OPPOSING lean, not a mild
+# one — this is a veto for outright contradiction, not a confirmation filter.
+MIROFISH_FILE            = Path(__file__).parent / "mirofish_scores.json"
+MIROFISH_MAX_AGE_HOURS   = 6      # ignore stale data (e.g. yesterday's run)
+MIROFISH_BEARISH_VETO    = 0.35   # score below this vetoes a LONG entry
+MIROFISH_BULLISH_VETO    = 0.65   # score above this vetoes a SHORT entry
 
 # ── State schema ──────────────────────────────────────────────────────────────
 
@@ -166,6 +179,27 @@ def get_entry_price(instrument: str, context: pd.DataFrame) -> tuple[float, str]
     return float(context["close"].iloc[-1]), "last_close"
 
 
+def get_mirofish(instrument: str) -> Optional[dict]:
+    """
+    Return {"lean": ..., "score": ..., "reasons": [...]} for `instrument` if
+    mirofish_scores.json exists and is fresh, else None (gate is skipped).
+    """
+    if not MIROFISH_FILE.exists():
+        return None
+    try:
+        raw = json.loads(MIROFISH_FILE.read_text())
+        generated_at = datetime.fromisoformat(raw["generated_at"])
+        age_hours = (datetime.now(generated_at.tzinfo) - generated_at).total_seconds() / 3600
+        if age_hours > MIROFISH_MAX_AGE_HOURS:
+            log.info("[%s] MiroFish data is %.1fh old (max %dh) — skipping news gate",
+                     instrument, age_hours, MIROFISH_MAX_AGE_HOURS)
+            return None
+        return raw.get(instrument)
+    except Exception as e:
+        log.warning("[%s] Failed to read MiroFish data (%s) — skipping news gate", instrument, e)
+        return None
+
+
 def _log_trade(record: dict):
     with open(TRADES_LOG, "a") as f:
         f.write(json.dumps(record) + "\n")
@@ -204,6 +238,20 @@ def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float]:
     if direction == "SHORT" and st != "BEAR":
         log.info("[%s] Gate FAIL: SuperTrend %s not aligned with SHORT", instrument, st)
         return "NEUTRAL", 0.0
+
+    mf = get_mirofish(instrument)
+    if mf is not None:
+        mf_score = float(mf["score"])
+        if direction == "LONG" and mf_score < MIROFISH_BEARISH_VETO:
+            log.info("[%s] Gate FAIL: MiroFish bearish (score=%.2f) vetoes LONG — %s",
+                     instrument, mf_score, "; ".join(mf.get("reasons", [])[:2]))
+            return "NEUTRAL", 0.0
+        if direction == "SHORT" and mf_score > MIROFISH_BULLISH_VETO:
+            log.info("[%s] Gate FAIL: MiroFish bullish (score=%.2f) vetoes SHORT — %s",
+                     instrument, mf_score, "; ".join(mf.get("reasons", [])[:2]))
+            return "NEUTRAL", 0.0
+        log.info("[%s] MiroFish %s (score=%.2f) does not contradict %s",
+                 instrument, mf.get("lean"), mf_score, direction)
 
     log.info("[%s] Gate PASS: %s conf=%.0f%% adx=%.1f st=%s — entry qualified",
              instrument, direction, confidence * 100, adx, st)
