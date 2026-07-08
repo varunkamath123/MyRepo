@@ -41,7 +41,7 @@ log = logging.getLogger(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 OUT_FILE = Path(__file__).parent / "mirofish_scores.json"
-MAX_HEADLINE_AGE_HOURS = 36     # discard stale news per angle
+MAX_HEADLINE_AGE_HOURS = 168     # 7 days — niche angles (banking, FII/DII) post less often
 HEADLINES_PER_ANGLE    = 6
 
 ANGLES = {
@@ -127,6 +127,8 @@ BANKNIFTY over the next few trading days. Banking-sector news (category "banking
 should weigh more heavily on BANKNIFTY than on NIFTY. Global cues and macro news affect both \
 roughly equally.
 
+Each headline is prefixed with its publish date — weigh more recent headlines (last 1-2 days)
+much more heavily than older ones (up to 7 days back); older items are context, not drivers.
 If headlines are sparse, contradictory, or clearly stale/irrelevant, lean toward "neutral" with \
 a score near 0.5 rather than overreacting to a single ambiguous item.
 
@@ -139,7 +141,7 @@ score: 0.0 = strongly bearish, 0.5 = neutral, 1.0 = strongly bullish.
 reasons: at most 2 short items (under 15 words each), citing the specific headline driving the lean.
 
 HEADLINES:
-{headlines_block}
+__HEADLINES_BLOCK__
 """
 
 
@@ -149,14 +151,14 @@ def synthesize(headlines_by_angle: dict[str, list[dict]]) -> dict:
         if not items:
             blocks.append(f"[{angle}] (no recent headlines)")
             continue
-        lines = "\n".join(f"  - {h['title']}" for h in items)
+        lines = "\n".join(f"  - ({h['published'] or 'date unknown'}) {h['title']}" for h in items)
         blocks.append(f"[{angle}]\n{lines}")
     headlines_block = "\n\n".join(blocks)
 
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-    prompt = _SYNTHESIS_PROMPT.format(headlines_block=headlines_block)
+    prompt = _SYNTHESIS_PROMPT.replace("__HEADLINES_BLOCK__", headlines_block)
     resp = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=600,
