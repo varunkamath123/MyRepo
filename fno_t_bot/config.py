@@ -61,7 +61,14 @@ INSTRUMENTS = {
         'option_prefix' : 'BSE:SENSEX',  # BSE weekly options: BSE:SENSEX26515[strike]PE
         'lot_size'      : 20,        # confirmed Mar 2026
         'strike_gap'    : 200,       # SENSEX ~77,000+; 200pt gaps
-        'expiry_weekday': 4,         # Friday (Mon=0) — SENSEX has weekly Friday expiry
+        'expiry_weekday': 3,         # Thursday (Mon=0) — 2026 regime: SENSEX weekly Thu +
+                                     # monthly last-Thu (verified via Breeze Jun 12 2026).
+                                     # FIXED Jul 9: was 4 (Friday) — the Jun 12 fix was made
+                                     # on EC2 but never committed (deploy-drift casualty #5).
+                                     # Friday built invalid symbols (e.g. SENSEX26717...CE,
+                                     # Jul 17 = Friday) → Fyers errmsg → LTP None → every
+                                     # SENSEX weekly-contract live order aborted (Jul 9), and
+                                     # position monitoring was blind (May 4 -52% overrun).
         'capital'       : 26000,     # Live capital — same allocation as NIFTY/BNF (May 2026)
     },
 }
