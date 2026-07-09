@@ -2503,6 +2503,27 @@ class TradingBot:
 
     # ── Trade Entry ───────────────────────────────────────────────────────────
 
+    def _get_risk_params(self) -> tuple:
+        """Daily-cached capital-scaled (risk_cap_rs, max_lots) — v1.7.
+
+        Reads the combined live book once per day (JSONL scan via
+        capital_gate.get_risk_params) so the cap tracks capital growth and
+        drawdown without re-reading files on every entry evaluation.
+        """
+        _today = datetime.now(IST).date()
+        if getattr(self, '_risk_params_date', None) != _today:
+            from capital_gate import get_risk_params
+            _cap, _max_lots, _book = get_risk_params(self.logger)
+            self._risk_cap_today   = _cap
+            self._max_lots_today   = _max_lots
+            self._risk_params_date = _today
+            _book_s = f"₹{_book:,.0f}" if _book is not None else "unreadable"
+            self.logger.info(
+                f"[RISK-SCALE] {self.instrument}: book={_book_s} → "
+                f"risk cap ₹{_cap:,.0f}/trade | max lots {_max_lots}"
+            )
+        return self._risk_cap_today, self._max_lots_today
+
     def enter_trade(self, signal: dict, hv: float, lots: int = 1) -> None:
         underlying   = signal['price']
         _atm         = int(round(underlying / self.strike_gap) * self.strike_gap)
@@ -2587,9 +2608,10 @@ class TradingBot:
 
         # ── Risk-cap sizing ladder (reinstated Jul 8 — Jun 10 gate lost to deploy drift)
         # Rupee risk = premium × contracts × stop%. Multi-lot entries that bust
-        # MAX_RISK_PER_TRADE first try one strike further OTM at the same lots
-        # (cheaper premium), then shave to 1 lot; if even 1 lot busts, skip.
-        _risk_cap = getattr(config, 'MAX_RISK_PER_TRADE', 5000)
+        # the cap first try one strike further OTM at the same lots (cheaper
+        # premium), then shave to 1 lot; if even 1 lot busts, skip.
+        # v1.7: cap is capital-scaled (book × 10%, floor ₹2,500) — see _get_risk_params.
+        _risk_cap, _ = self._get_risk_params()
         if _fb_price:
             _risk = _fb_price * eff_lot_size * _stop_pct
             if _risk > _risk_cap and lots > 1:
@@ -5050,7 +5072,10 @@ class TradingBot:
                                 # TRENDING 50% WR / avg +₹989 — multi-lot
                                 # conviction belongs in trending tape only.
                                 _lots_pre_clamp = _lots
-                                _lots = min(_lots, getattr(config, 'DYN_MAX_LOTS', 2))
+                                # v1.7: lot ceiling scales with book capital
+                                # (DYN_MAX_LOTS_LADDER: 2 now, 3 at ₹75k, 4 at ₹1L)
+                                _, _max_lots_cap = self._get_risk_params()
+                                _lots = min(_lots, _max_lots_cap)
                                 if (getattr(config, 'REGIME_DETECTION_ENABLED', True)
                                         and self._regime == 'CHOPPY'):
                                     _lots = min(_lots, getattr(

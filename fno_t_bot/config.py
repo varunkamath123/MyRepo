@@ -61,7 +61,14 @@ INSTRUMENTS = {
         'option_prefix' : 'BSE:SENSEX',  # BSE weekly options: BSE:SENSEX26515[strike]PE
         'lot_size'      : 20,        # confirmed Mar 2026
         'strike_gap'    : 200,       # SENSEX ~77,000+; 200pt gaps
-        'expiry_weekday': 4,         # Friday (Mon=0) — SENSEX has weekly Friday expiry
+        'expiry_weekday': 3,         # Thursday (Mon=0) — 2026 regime: SENSEX weekly Thu +
+                                     # monthly last-Thu (verified via Breeze Jun 12 2026).
+                                     # FIXED Jul 9: was 4 (Friday) — the Jun 12 fix was made
+                                     # on EC2 but never committed (deploy-drift casualty #5).
+                                     # Friday built invalid symbols (e.g. SENSEX26717...CE,
+                                     # Jul 17 = Friday) → Fyers errmsg → LTP None → every
+                                     # SENSEX weekly-contract live order aborted (Jul 9), and
+                                     # position monitoring was blind (May 4 -52% overrun).
         'capital'       : 26000,     # Live capital — same allocation as NIFTY/BNF (May 2026)
     },
 }
@@ -340,12 +347,24 @@ CONSOLIDATED_DAILY_LOSS_CAP = 8000   # ₹8,000 combined across all instruments/
 # Jun 11 live evidence: the original gate blocked 2 BNF CALLs whose Challenger
 # shadow twins lost ₹5,988 + ₹6,222 (~₹12.2k saved on day one).
 # ₹5,000 ≈ 10% of the ₹50k book — retune upward only when capital grows.
+# v1.7: this is now the FALLBACK when the book is unreadable; the live cap is
+# capital-scaled via MAX_RISK_PCT_OF_BOOK below (capital_gate.get_risk_params).
 MAX_RISK_PER_TRADE = 5000
 
 # Hard ceiling on lots per position regardless of conviction upgrades.
 # At ₹50k capital, 2 ATM lots ≈ the entire per-instrument allocation; the
 # risk cap above is what usually converts a 2-lot request into 2×OTM+1.
+# v1.7: fallback only — the live ceiling comes from DYN_MAX_LOTS_LADDER.
 DYN_MAX_LOTS = 2
+
+# ── v1.7: capital-scaled risk (Jul 9 2026) ──────────────────────────────────
+# cap = max(MAX_RISK_FLOOR, book × MAX_RISK_PCT_OF_BOOK); recomputed daily.
+# 10% of book ≈ full-Kelly on the June live cohort (33% WR, avg win ₹3.1k vs
+# avg loss ₹1.0k → f* ≈ 0.11). Scales up with growth, down in drawdown.
+MAX_RISK_PCT_OF_BOOK = 0.10
+MAX_RISK_FLOOR       = 2500          # cap never below this (keeps 1 OTM lot tradeable in drawdown)
+# Lot ceiling unlocks with book growth: [(book ≥ threshold, max lots), ...]
+DYN_MAX_LOTS_LADDER  = [(0, 2), (75_000, 3), (100_000, 4)]
 
 # ─── Regime Detection ─────────────────────────────────────────────────────────
 # Classifies last N trading days as TRENDING/CHOPPY/MIXED via ADX at 11:00.
