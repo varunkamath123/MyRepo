@@ -25,6 +25,14 @@ MiroFish news gate:
   a strongly opposing news lean vetoes an otherwise-qualified Kronos entry.
   Missing/stale MiroFish data does not block entries (gate is skipped, logged).
 
+Morning news-exit scan (--morning-scan):
+  Closes the ~24h blind spot where an open position's only qualitative check
+  is the prior close-time run. Run mirofish_swarm.py again pre-market
+  (~08:45 IST), then paper_trader.py --morning-scan (~09:20 IST): if the
+  fresh score has flipped strongly against a held position, it exits early
+  with reason NEWS_EXIT. Thresholds are tighter than the entry veto — this
+  only fires on a clear overnight flip, not a moderate contradiction.
+
 Capital: one lot per instrument, max one open position across all instruments.
 
 Run manually:
@@ -91,6 +99,14 @@ MIROFISH_FILE            = Path(__file__).parent / "mirofish_scores.json"
 MIROFISH_MAX_AGE_HOURS   = 6      # ignore stale data (e.g. yesterday's run)
 MIROFISH_BEARISH_VETO    = 0.35   # score below this vetoes a LONG entry
 MIROFISH_BULLISH_VETO    = 0.65   # score above this vetoes a SHORT entry
+
+# Morning news-exit scan: closes the ~24h blind spot where an open position
+# gets its only qualitative check at the prior close-time run. Thresholds are
+# tighter than the entry veto — an existing position should only be cut early
+# on a clear overnight flip, not the same moderate contradiction that would
+# have merely blocked a new entry.
+MORNING_NEWS_EXIT_BEARISH = 0.25  # LONG position exits if score <= this
+MORNING_NEWS_EXIT_BULLISH = 0.75  # SHORT position exits if score >= this
 
 # ── State schema ──────────────────────────────────────────────────────────────
 
@@ -414,6 +430,71 @@ def cmd_daily_run(instruments: list[str]):
     print_status(state)
 
 
+def cmd_morning_scan():
+    """
+    Lightweight pre-market run (~09:20 IST, after a fresh MiroFish read at
+    ~08:45 IST). Does NOT touch entries or price/technical exits — those run
+    at the normal close-time cycle. Only closes a position early if fresh
+    overnight news has flipped strongly against the held direction, closing
+    the ~24h gap between one day's close-time read and the next.
+    """
+    state = _load_state()
+    if not state.positions:
+        log.info("No open positions — nothing for the morning scan to check.")
+        return
+
+    today = date.today().isoformat()
+    for inst, pos in list(state.positions.items()):
+        mf = get_mirofish(inst)
+        if mf is None:
+            log.info("[%s] No fresh MiroFish data — skipping morning scan", inst)
+            continue
+
+        score = float(mf["score"])
+        triggered = (
+            (pos.direction == "LONG"  and score <= MORNING_NEWS_EXIT_BEARISH) or
+            (pos.direction == "SHORT" and score >= MORNING_NEWS_EXIT_BULLISH)
+        )
+        if not triggered:
+            log.info("[%s] MiroFish score=%.2f (%s) does not warrant an early exit — holding %s",
+                     inst, score, mf.get("lean"), pos.direction)
+            continue
+
+        try:
+            ctx = get_context(inst, bars=60)
+            price, src = get_entry_price(inst, ctx)
+        except Exception as e:
+            log.error("[%s] Could not fetch exit price for morning scan (%s) — skipping", inst, e)
+            continue
+
+        pts = ((price - pos.entry_price) if pos.direction == "LONG"
+               else (pos.entry_price - price))
+        pnl = pts * pos.lot_size
+        state.realised_pnl += pnl
+        state.trade_count  += 1
+        log.info("[%s] NEWS_EXIT %s @ %.1f (%s)  MiroFish score=%.2f  reasons=%s  PnL INR %+.0f",
+                 inst, pos.direction, price, src, score, mf.get("reasons"), pnl)
+        _log_trade({
+            "event":            "EXIT",
+            "instrument":       inst,
+            "direction":        pos.direction,
+            "entry_date":       pos.entry_date,
+            "entry_price":      pos.entry_price,
+            "exit_date":        today,
+            "exit_price":       price,
+            "exit_reason":      "NEWS_EXIT",
+            "pnl_pts":          pts,
+            "pnl_inr":          pnl,
+            "lot_size":         pos.lot_size,
+            "mirofish_score":   score,
+            "mirofish_reasons": mf.get("reasons"),
+        })
+        del state.positions[inst]
+
+    _save_state(state)
+    print_status(state)
+
+
 def print_status(state: PaperState):
     sep = "=" * 60
     print(f"\n{sep}")
@@ -454,6 +535,8 @@ def main():
                         help="Wipe all state and start fresh")
     parser.add_argument("--sensex",     action="store_true",
                         help="Include SENSEX in active instruments")
+    parser.add_argument("--morning-scan", action="store_true",
+                        help="Pre-market news-exit scan for open positions only (~09:20 IST)")
     args = parser.parse_args()
 
     instruments = list(ACTIVE_INSTRUMENTS)
@@ -464,6 +547,8 @@ def main():
         cmd_reset()
     elif args.status:
         cmd_status()
+    elif args.morning_scan:
+        cmd_morning_scan()
     else:
         cmd_daily_run(instruments)
 

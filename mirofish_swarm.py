@@ -8,8 +8,11 @@ missed, because the drivers were real-world events, not price patterns.
 
 This script gathers real headlines across 5 angles, then asks Claude to
 synthesize a directional lean (0=bearish .. 1=bullish) per instrument.
-Runs once daily before the paper trader signal; writes mirofish_scores.json
-for paper_trader.py to read as an additional entry veto gate.
+Runs TWICE daily, writing the same mirofish_scores.json each time (most
+recent read wins):
+  ~08:45 IST — pre-market read, feeds paper_trader.py --morning-scan
+               (early exit on an overnight news flip against an open position)
+  ~14:35 IST — close-time read, feeds paper_trader.py's entry veto gate
 
 Angles researched:
   1. Global cues        — overnight Wall Street / Asian markets
