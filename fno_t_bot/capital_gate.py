@@ -43,6 +43,42 @@ def get_combined_live_capital() -> float:
         return float(config.SENSEX_LIVE_START_CAPITAL)
 
 
+def get_risk_params(logger: logging.Logger | None = None) -> tuple:
+    """
+    v1.7: capital-scaled per-trade risk sizing.
+
+    Returns (risk_cap_rs, max_lots, book_rs):
+      risk_cap = max(MAX_RISK_FLOOR, book × MAX_RISK_PCT_OF_BOOK)
+      max_lots = highest DYN_MAX_LOTS_LADDER tier whose threshold ≤ book
+
+    Rationale: the ₹5,000 static cap ≈ full-Kelly on the June live cohort at a
+    ₹50k book (10%). Scaling with the book keeps risk at the same fraction as
+    capital grows (₹75k → ₹7.5k cap / 3 lots; ₹1L → ₹10k / 4 lots) and shrinks
+    it in drawdown (anti-martingale). Falls back to the static
+    MAX_RISK_PER_TRADE / DYN_MAX_LOTS when the book is unreadable.
+
+    Known limitation: book = SENSEX_LIVE_START_CAPITAL + NF/BNF JSONL P&L —
+    SENSEX trades after Jul 8 2026 are not counted (drift is small; the
+    baseline gets recalibrated against the Fyers balance periodically).
+    """
+    log = logger or _log
+    try:
+        book  = get_combined_live_capital()
+        pct   = getattr(config, 'MAX_RISK_PCT_OF_BOOK', 0.10)
+        floor = getattr(config, 'MAX_RISK_FLOOR', 2500)
+        cap   = max(float(floor), book * pct)
+        max_lots = 2
+        for _thr, _lots in sorted(getattr(config, 'DYN_MAX_LOTS_LADDER', [(0, 2)])):
+            if book >= _thr:
+                max_lots = int(_lots)
+        return cap, max_lots, book
+    except Exception as exc:
+        log.warning(f'[RISK-SCALE] book read failed ({exc}) — using static fallback')
+        return (float(getattr(config, 'MAX_RISK_PER_TRADE', 5000)),
+                int(getattr(config, 'DYN_MAX_LOTS', 2)),
+                None)
+
+
 def resolve_live_mode(instrument: str,
                       logger: logging.Logger | None = None) -> bool:
     """
