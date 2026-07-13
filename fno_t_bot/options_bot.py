@@ -95,6 +95,22 @@ def bs_price(option_type: str, S: float, K: float,
     return float(K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1))
 
 
+def bs_delta(option_type: str, S: float, K: float,
+             T: float, sigma: float) -> float | None:
+    """Black-Scholes delta of the contract (CALL: N(d1), PUT: N(d1)-1).
+
+    Used for entry-quality logging only (v1.7.3): the risk ladder shifts
+    strikes OTM for capital reasons without recording what delta was
+    actually bought — delta determines the index move needed to profit.
+    """
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return None
+    r  = config.RISK_FREE_RATE
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    nd1 = float(norm.cdf(d1))
+    return nd1 if option_type == 'CALL' else nd1 - 1.0
+
+
 # ─── Bot ─────────────────────────────────────────────────────────────────────
 
 class TradingBot:
@@ -2716,6 +2732,28 @@ class TradingBot:
             sl_order_id   = None
             sl_trigger    = 0.0
 
+        # ── Entry-quality snapshot (v1.7.3 — option-buyer data pack) ─────────
+        # Logging only, no gating. Captures what long-premium P&L depends on
+        # beyond direction: premium richness (RV/IV), the delta actually
+        # bought after OTM shifts, whether the target needs a normal or a
+        # 2-sigma day (move coverage), and execution cost (spread/slippage).
+        # Gate on these only after the live sample says they discriminate.
+        _T_yrs   = config.DAYS_TO_EXPIRY / 365
+        _iv_pct  = signal.get('atm_iv')                    # % (e.g. 12.6) or None
+        _rv_iv   = (round(hv * 100 / _iv_pct, 3)
+                    if (_iv_pct and hv) else None)         # >1 = premium cheap vs realized vol
+        _sigma_d = (_iv_pct / 100) if _iv_pct else hv      # prefer market IV for delta
+        _delta   = bs_delta(signal['type'], underlying, strike, _T_yrs, _sigma_d)
+        _exp_move_pct = round(_iv_pct / (252 ** 0.5), 3) if _iv_pct else None
+        _req_move_pct = (round(_dyn_tgt * entry_price / (abs(_delta) * underlying) * 100, 3)
+                         if (_delta and underlying > 0) else None)
+        _move_cover   = (round(_exp_move_pct / _req_move_pct, 2)
+                         if (_exp_move_pct and _req_move_pct) else None)
+        _entry_ltp  = pos_info.get('entry_ltp')  if self.live else None
+        _spread_pct = pos_info.get('spread_pct') if self.live else None
+        _slip_pct   = (round((entry_price - _entry_ltp) / _entry_ltp * 100, 3)
+                       if (self.live and _entry_ltp) else None)
+
         position = {
             'instrument'    : self.instrument,
             'type'             : signal['type'],
@@ -2745,6 +2783,15 @@ class TradingBot:
             'unified_score'    : signal.get('unified_score'),
             'composite_score'  : signal.get('composite_score'),
             'size_reason'      : signal.get('size_reason', ''),
+            # v1.7.3: option-buyer entry-quality pack (logging only)
+            'rv_iv'            : _rv_iv,          # realized/implied vol ratio (>1 = cheap premium)
+            'entry_delta'      : round(_delta, 3) if _delta is not None else None,
+            'exp_move_pct'     : _exp_move_pct,   # IV-implied 1-day index move %
+            'req_move_pct'     : _req_move_pct,   # index move % needed to hit target
+            'move_cover'       : _move_cover,     # expected/required (≥1 = target fits a normal day)
+            'spread_pct'       : _spread_pct,     # bid-ask spread % of premium at entry (live)
+            'slippage_pct'     : _slip_pct,       # fill vs LTP % (live)
+            'vix_at_entry'     : getattr(self, '_last_vix', None),
         }
         self.positions.append(position)
         self.trades_today += 1
@@ -3083,6 +3130,15 @@ class TradingBot:
                     'unified_score'    : pos.get('unified_score'),
                     'composite_score'  : pos.get('composite_score'),
                     'size_reason'      : pos.get('size_reason', ''),
+                    # ── Option-buyer entry-quality pack (v1.7.3) ──────────
+                    'rv_iv'            : pos.get('rv_iv'),
+                    'entry_delta'      : pos.get('entry_delta'),
+                    'exp_move_pct'     : pos.get('exp_move_pct'),
+                    'req_move_pct'     : pos.get('req_move_pct'),
+                    'move_cover'       : pos.get('move_cover'),
+                    'spread_pct'       : pos.get('spread_pct'),
+                    'slippage_pct'     : pos.get('slippage_pct'),
+                    'vix_at_entry'     : pos.get('vix_at_entry'),
                 })
                 self._save_trade_log()
                 self._compute_rolling_quality()   # re-evaluate quality after each closed trade
@@ -4152,6 +4208,8 @@ class TradingBot:
                 if can_enter and config.USE_VIX_FILTER and 'VIX' in df.columns:
                     _vix_now = float(df.iloc[-1].get('VIX', float('nan')))
                     if not pd.isna(_vix_now) and _vix_now > 0:
+                        # Stash for the entry-quality pack (vix_at_entry in JSONL)
+                        self._last_vix = round(_vix_now, 2)
                         if _vix_now > config.VIX_MAX:
                             # Directional conviction override: if BOTH 15m-ST and
                             # 15m-EMA agree on direction, the trend is unambiguous.
