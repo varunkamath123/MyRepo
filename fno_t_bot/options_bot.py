@@ -2164,6 +2164,32 @@ class TradingBot:
 
         sig_type = 'CALL' if _call_break else 'PUT'
 
+        # ── Break freshness guard (Jul 13, from Path B's first live fire) ────
+        # A breakout entry belongs at the boundary. When ADX lags a drift-led
+        # break, this signal otherwise fires 30-60 min late at full extension
+        # (Jul 13 SENSEX: boundary crossed ~12:15 @ ADX 10.6, fired 12:55 at
+        # +0.39% beyond the range — the day's top tick, -25.8%). Require the
+        # last inside-range close to be within PATH_B_MAX_BREAK_AGE_BARS bars.
+        _max_age = getattr(config, 'PATH_B_MAX_BREAK_AGE_BARS', 3)
+        if _max_age > 0 and len(today_df) >= 2:
+            _thr_hi = mr_high * (1.0 + _buf)
+            _thr_lo = mr_low  * (1.0 - _buf)
+            _closes = today_df['Close'].tolist()
+            _age = None
+            for _i in range(len(_closes) - 2, -1, -1):   # skip current bar
+                _c = float(_closes[_i])
+                if (_call_break and _c <= _thr_hi) or (_put_break and _c >= _thr_lo):
+                    _age = len(_closes) - 1 - _i
+                    break
+            if _age is None or _age > _max_age:
+                _age_str = f"{_age}" if _age is not None else f">{len(_closes)}"
+                self.logger.info(
+                    f"  [PATH-B-SKIP] {self.instrument} {sig_type}: stale break — "
+                    f"boundary crossed {_age_str} bars ago (max {_max_age}); "
+                    f"edge is at the boundary, not the chase"
+                )
+                return None
+
         # ── ADX filter ──────────────────────────────────────────────────────
         if _adx < config.PATH_B_ADX_MIN:
             self.logger.info(

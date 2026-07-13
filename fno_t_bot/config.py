@@ -467,6 +467,14 @@ PATH_B_RANGE_END       = '10:55'     # morning range = 09:15–10:55 (all bars b
 PATH_B_ADX_MIN         = 25          # uniform for CALL and PUT (no 2-DTE asymmetry at 12 DTE)
 PATH_B_BUFFER          = 0.0008      # 0.08% buffer above MR_high / below MR_low
                                      # NIFTY ≈ 19–20 pts | BANKNIFTY ≈ 40 pts | SENSEX ≈ 63 pts
+PATH_B_MAX_BREAK_AGE_BARS = 3        # break freshness (Jul 13, first live fire): the ADX
+                                     # filter can lag a drift-led breakout by 30-60 min —
+                                     # SENSEX broke MR_high ~12:15 at ADX 10.6, ADX crossed
+                                     # 25 only at 12:55 with price +0.39% extended = top tick
+                                     # (-25.8%). Entry must be within 3 bars (15 min) of the
+                                     # boundary cross; momentum-led breaks (ADX already high,
+                                     # e.g. Jul 8 waterfall) pass, drift-then-ADX-lag chases
+                                     # are skipped. 0 disables.
 PATH_B_OI_SNAP_DIST    = 0.003       # snap range edge to OI MAJOR/WALL if within 0.3%
 PATH_B_PCR_BULL_GATE   = 1.3         # PCR > 1.3 → heavy put writing → suppress PUT breakout
 PATH_B_PCR_BEAR_GATE   = 0.75        # PCR < 0.75 → heavy call writing → suppress CALL breakout

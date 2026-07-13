@@ -107,21 +107,42 @@ def atm_strike(instrument: str, underlying_price: float) -> int:
 
 # ─── Market Data ─────────────────────────────────────────────────────────────
 
-def get_ltp(fyers, symbol: str) -> float | None:
-    """Fetch Last Traded Price for a symbol."""
-    try:
-        resp = fyers.quotes({"symbols": symbol})
-        if resp.get('s') == 'ok':
-            v = resp['d'][0]['v']
-            # BSE options use 'ltp' instead of 'lp' (NSE/NFO standard)
-            for key in ('lp', 'ltp', 'last_price'):
-                if v.get(key) is not None:
-                    return float(v[key])
-            logger.warning(f"No LTP key in {symbol} quote. Available: {list(v.keys())}")
-        else:
+def get_ltp(fyers, symbol: str, retries: int = 2) -> float | None:
+    """Fetch Last Traded Price for a symbol.
+
+    Retries transient rate-limit errors (Fyers 429 'request limit reached'):
+    all three bots share one API key, and simultaneous evaluations at window
+    boundaries (09:40) can burst past the per-second quota. A one-shot failure
+    killed the Jul 13 BNF entry. 0.4s backoff clears a per-second window.
+    Per-symbol errors (invalid symbol → errmsg in quote body) are NOT retried.
+    """
+    import time as _time
+    for attempt in range(retries + 1):
+        try:
+            resp = fyers.quotes({"symbols": symbol})
+            if resp.get('s') == 'ok':
+                v = resp['d'][0]['v']
+                # BSE options use 'ltp' instead of 'lp' (NSE/NFO standard)
+                for key in ('lp', 'ltp', 'last_price'):
+                    if v.get(key) is not None:
+                        return float(v[key])
+                # Valid transport, no price key → per-symbol error (e.g. bad
+                # contract). Retrying cannot help.
+                logger.warning(f"No LTP key in {symbol} quote. Available: {list(v.keys())}")
+                return None
+            # Transport-level error: retry only rate-limit style failures
+            _msg = str(resp.get('message', '')).lower()
+            if attempt < retries and (resp.get('code') == 429 or 'limit' in _msg):
+                _time.sleep(0.4)
+                continue
             logger.warning(f"LTP fetch failed for {symbol}: {resp}")
-    except Exception as e:
-        logger.error(f"get_ltp({symbol}): {e}")
+            return None
+        except Exception as e:
+            if attempt < retries:
+                _time.sleep(0.4)
+                continue
+            logger.error(f"get_ltp({symbol}): {e}")
+            return None
     return None
 
 
