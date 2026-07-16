@@ -2739,16 +2739,33 @@ class TradingBot:
         # 2-sigma day (move coverage), and execution cost (spread/slippage).
         # Gate on these only after the live sample says they discriminate.
         _T_yrs   = config.DAYS_TO_EXPIRY / 365
-        _iv_pct  = signal.get('atm_iv')                    # % (e.g. 12.6) or None
-        _rv_iv   = (round(hv * 100 / _iv_pct, 3)
-                    if (_iv_pct and hv) else None)         # >1 = premium cheap vs realized vol
-        _sigma_d = (_iv_pct / 100) if _iv_pct else hv      # prefer market IV for delta
+        _iv_chain = signal.get('atm_iv')                   # % (e.g. 12.6) or None
+        _rv_iv   = (round(hv * 100 / _iv_chain, 3)
+                    if (_iv_chain and hv) else None)       # >1 = premium cheap vs realized vol
+        # SENSEX chain often lacks ATM-IV (BSE OI gap) — India VIX is a usable
+        # vol proxy for the expected-move math (correlated index vol).
+        _iv_move = _iv_chain or getattr(self, '_last_vix', None)
+        _sigma_d = (_iv_move / 100) if _iv_move else hv    # prefer market IV for delta
         _delta   = bs_delta(signal['type'], underlying, strike, _T_yrs, _sigma_d)
-        _exp_move_pct = round(_iv_pct / (252 ** 0.5), 3) if _iv_pct else None
+        _exp_move_pct = round(_iv_move / (252 ** 0.5), 3) if _iv_move else None
         _req_move_pct = (round(_dyn_tgt * entry_price / (abs(_delta) * underlying) * 100, 3)
                          if (_delta and underlying > 0) else None)
-        _move_cover   = (round(_exp_move_pct / _req_move_pct, 2)
-                         if (_exp_move_pct and _req_move_pct) else None)
+        # Time-adjusted coverage (fixed Jul 16): compare the target's required
+        # move to the expected move over the REMAINING runway to force-close,
+        # √t-scaled — not the full day. A 13:40 entry has ~50min of runway:
+        # both Jul 16 losers showed full-day cover ~1.1 but true window cover
+        # ~0.4 (needed a >2σ residual-day move; theta rent with no runway).
+        try:
+            _fc_h, _fc_m = map(int, str(getattr(config, 'FORCE_CLOSE_TIME', '14:30')).split(':'))
+            _now_dt  = datetime.now(IST)
+            _fc_dt   = _now_dt.replace(hour=_fc_h, minute=_fc_m, second=0, microsecond=0)
+            _runway  = max((_fc_dt - _now_dt).total_seconds() / 60.0, 1.0)
+        except Exception:
+            _runway  = 375.0
+        _exp_move_window = (round(_exp_move_pct * (_runway / 375.0) ** 0.5, 3)
+                            if _exp_move_pct else None)
+        _move_cover   = (round(_exp_move_window / _req_move_pct, 2)
+                         if (_exp_move_window and _req_move_pct) else None)
         _entry_ltp  = pos_info.get('entry_ltp')  if self.live else None
         _spread_pct = pos_info.get('spread_pct') if self.live else None
         _slip_pct   = (round((entry_price - _entry_ltp) / _entry_ltp * 100, 3)
@@ -2788,7 +2805,8 @@ class TradingBot:
             'entry_delta'      : round(_delta, 3) if _delta is not None else None,
             'exp_move_pct'     : _exp_move_pct,   # IV-implied 1-day index move %
             'req_move_pct'     : _req_move_pct,   # index move % needed to hit target
-            'move_cover'       : _move_cover,     # expected/required (≥1 = target fits a normal day)
+            'move_cover'       : _move_cover,     # expected-move-in-runway / required (≥1 = achievable)
+            'runway_min'       : round(_runway),  # minutes to force-close at entry
             'spread_pct'       : _spread_pct,     # bid-ask spread % of premium at entry (live)
             'slippage_pct'     : _slip_pct,       # fill vs LTP % (live)
             'vix_at_entry'     : getattr(self, '_last_vix', None),
@@ -3136,6 +3154,7 @@ class TradingBot:
                     'exp_move_pct'     : pos.get('exp_move_pct'),
                     'req_move_pct'     : pos.get('req_move_pct'),
                     'move_cover'       : pos.get('move_cover'),
+                    'runway_min'       : pos.get('runway_min'),
                     'spread_pct'       : pos.get('spread_pct'),
                     'slippage_pct'     : pos.get('slippage_pct'),
                     'vix_at_entry'     : pos.get('vix_at_entry'),
