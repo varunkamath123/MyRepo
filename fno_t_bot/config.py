@@ -1186,6 +1186,26 @@ PATH_A_SMA_PROX_PCT     = 0.003   # within 0.3% of SMA_slow = potential headwind
 PATH_A_PDH_PDL_ENABLED  = True    # track prev-day high/low as S/R reference
 PATH_A_PDH_PDL_PROX     = 0.002   # within 0.2% of PDH (CALL) or PDL (PUT) = log wall proximity
 
+# ─── Chase gate (Jul 16 2026) ────────────────────────────────────────────────
+# chase_pos = direction-normalized entry location in today's range (0=pullback
+# entry, 1=bought the extreme). Backfill: chase_pos>0.7 = 39t -₹15,872.
+# BUT the top-10 analysis showed chase ALONE does not separate the biggest
+# wins (mean chase 0.80 wins vs 0.87 losses) — REV noon fades and morning
+# trend breakouts are high-chase AND win. So the gate is narrowed to the
+# afternoon non-REV exhaustion chase (07-13 SEN B -2,370, 04-24 -4,444) and
+# REV is exempt (backbone; anti-chase by design).
+# MODE:
+#   'off'    — disabled
+#   'shadow' — log '[CHASE-GATE] SHADOW would-block' but TAKE the trade
+#              (gathers forward out-of-sample evidence; no P&L impact)
+#   'active' — actually skip the entry
+# Ships in SHADOW: the rule is in-sample only (n=39 historical, 0 forward).
+# Flip to 'active' after the shadow log confirms it fires on losers forward.
+CHASE_GATE_MODE         = 'shadow'
+CHASE_GATE_MAX          = 0.75     # chase_pos above this = bought the extreme
+CHASE_GATE_AFTER        = '12:00'  # morning breakouts have runway → exempt
+CHASE_GATE_EXEMPT_PATHS = ('REV',) # REV fades are anti-chase — never gate them
+
 # ─── PATH_REV: MaxPain Snap Reversal ─────────────────────────────────────────
 # Fires after the ORB window closes when the morning trend exhausts and price
 # snaps toward MaxPain.  Strongest on DTE≤2 (options-pinning effect is sharpest).

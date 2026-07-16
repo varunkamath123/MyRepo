@@ -5198,6 +5198,45 @@ class TradingBot:
                                     )
 
                             if signal:
+                                # ── Chase gate (Jul 16) — shadow/active ───────
+                                # Vetoes afternoon entries that bought the day's
+                                # own extreme (chase_pos > MAX), except REV.
+                                # Placed last: the signal here is one every other
+                                # gate would have entered, so the shadow log is a
+                                # clean forward test of the rule in isolation.
+                                _cg_mode = getattr(config, 'CHASE_GATE_MODE', 'off')
+                                if _cg_mode != 'off':
+                                    _cp   = signal.get('chase_pos')
+                                    _cgp  = signal.get('path', '')
+                                    _cg_after = getattr(config, 'CHASE_GATE_AFTER', '12:00')
+                                    _cg_exempt = getattr(config, 'CHASE_GATE_EXEMPT_PATHS', ('REV',))
+                                    _cg_hit = (
+                                        _cp is not None
+                                        and _cp > getattr(config, 'CHASE_GATE_MAX', 0.75)
+                                        and now.strftime('%H:%M') >= _cg_after
+                                        and _cgp not in _cg_exempt
+                                    )
+                                    if _cg_hit:
+                                        if _cg_mode == 'active':
+                                            self.logger.info(
+                                                f"  [CHASE-GATE] {self.instrument} "
+                                                f"{signal['type']} path={_cgp}: BLOCK — "
+                                                f"chase_pos={_cp} > "
+                                                f"{getattr(config, 'CHASE_GATE_MAX', 0.75)} "
+                                                f"after {_cg_after} (bought the extreme)"
+                                            )
+                                            signal = None
+                                        else:  # shadow
+                                            self.logger.info(
+                                                f"  [CHASE-GATE] {self.instrument} "
+                                                f"{signal['type']} path={_cgp}: SHADOW "
+                                                f"would-block chase_pos={_cp} > "
+                                                f"{getattr(config, 'CHASE_GATE_MAX', 0.75)} "
+                                                f"after {_cg_after} — taking trade anyway "
+                                                f"(forward test)"
+                                            )
+
+                            if signal:
                                 # ── Final sizing clamp (v1.6) ─────────────────
                                 # The composite-scorer (≥65 → 2 lots) and post-11
                                 # STRONG upgrades run AFTER the regime/quality
