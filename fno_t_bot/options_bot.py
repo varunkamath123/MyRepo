@@ -2807,6 +2807,8 @@ class TradingBot:
             'req_move_pct'     : _req_move_pct,   # index move % needed to hit target
             'move_cover'       : _move_cover,     # expected-move-in-runway / required (≥1 = achievable)
             'runway_min'       : round(_runway),  # minutes to force-close at entry
+            'range_pos'        : signal.get('range_pos'),  # entry loc in day range (0=low,1=high)
+            'chase_pos'        : signal.get('chase_pos'),  # 0=pullback entry, 1=chasing the extreme
             'spread_pct'       : _spread_pct,     # bid-ask spread % of premium at entry (live)
             'slippage_pct'     : _slip_pct,       # fill vs LTP % (live)
             'vix_at_entry'     : getattr(self, '_last_vix', None),
@@ -3155,6 +3157,8 @@ class TradingBot:
                     'req_move_pct'     : pos.get('req_move_pct'),
                     'move_cover'       : pos.get('move_cover'),
                     'runway_min'       : pos.get('runway_min'),
+                    'range_pos'        : pos.get('range_pos'),
+                    'chase_pos'        : pos.get('chase_pos'),
                     'spread_pct'       : pos.get('spread_pct'),
                     'slippage_pct'     : pos.get('slippage_pct'),
                     'vix_at_entry'     : pos.get('vix_at_entry'),
@@ -5037,6 +5041,34 @@ class TradingBot:
                                 )
 
                         if signal:
+                            # ── Entry location within today's range (Jul 16) ────
+                            # The real fault in the Jul 16 grind losers was not
+                            # theta — it was buying PUTs at the day's LOW (and,
+                            # Jul 13/9, CALLs at the day's HIGH): chasing an
+                            # exhausted move right before mean reversion. Freshness
+                            # checks staleness vs the OR boundary; on a grind the
+                            # boundary itself sits at the extreme. range_pos =
+                            # where entry sits in [today_low, today_high]:
+                            #   PUT bought near 0.0  = at the low  = chase
+                            #   CALL bought near 1.0 = at the high = chase
+                            # Logged as chase_pos (0=ideal pullback entry, 1=full
+                            # chase) so it is comparable across CALL/PUT.
+                            try:
+                                _td   = df[df.index.date == datetime.now(IST).date()]
+                                _d_hi = float(_td['High'].max())
+                                _d_lo = float(_td['Low'].min())
+                                _pxn  = float(signal['price'])
+                                if _d_hi > _d_lo:
+                                    _rpos = (_pxn - _d_lo) / (_d_hi - _d_lo)
+                                    signal['range_pos'] = round(_rpos, 3)
+                                    # chase_pos: how far INTO the trade's own
+                                    # direction the entry already is
+                                    signal['chase_pos'] = round(
+                                        _rpos if signal['type'] == 'CALL'
+                                        else 1.0 - _rpos, 3)
+                            except Exception:
+                                pass
+
                             # ── Composite Signal Scorer (Phase 2: gate active) ────
                             # Logs a weighted 0-100 breakdown of signal quality
                             # across 6 components.
