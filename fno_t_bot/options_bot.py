@@ -2740,11 +2740,15 @@ class TradingBot:
         # Gate on these only after the live sample says they discriminate.
         _T_yrs   = config.DAYS_TO_EXPIRY / 365
         _iv_chain = signal.get('atm_iv')                   # % (e.g. 12.6) or None
-        _rv_iv   = (round(hv * 100 / _iv_chain, 3)
-                    if (_iv_chain and hv) else None)       # >1 = premium cheap vs realized vol
         # SENSEX chain often lacks ATM-IV (BSE OI gap) — India VIX is a usable
-        # vol proxy for the expected-move math (correlated index vol).
+        # vol proxy for both the rv/iv ratio and the expected-move math.
         _iv_move = _iv_chain or getattr(self, '_last_vix', None)
+        # rv_iv = realized vol / implied vol (>1 = premium cheap vs realized).
+        # Uses chain ATM-IV when present, else VIX (Jul 21 fix — previously null
+        # on every SENSEX trade, blinding premium-richness on 1/3 of the book).
+        _rv_iv   = (round(hv * 100 / _iv_move, 3)
+                    if (_iv_move and hv) else None)
+        _rv_iv_src = ('chain' if _iv_chain else 'vix' if _iv_move else None)
         _sigma_d = (_iv_move / 100) if _iv_move else hv    # prefer market IV for delta
         _delta   = bs_delta(signal['type'], underlying, strike, _T_yrs, _sigma_d)
         _exp_move_pct = round(_iv_move / (252 ** 0.5), 3) if _iv_move else None
@@ -2802,6 +2806,7 @@ class TradingBot:
             'size_reason'      : signal.get('size_reason', ''),
             # v1.7.3: option-buyer entry-quality pack (logging only)
             'rv_iv'            : _rv_iv,          # realized/implied vol ratio (>1 = cheap premium)
+            'rv_iv_src'        : _rv_iv_src,      # 'chain' (real ATM-IV) or 'vix' (SENSEX proxy)
             'entry_delta'      : round(_delta, 3) if _delta is not None else None,
             'exp_move_pct'     : _exp_move_pct,   # IV-implied 1-day index move %
             'req_move_pct'     : _req_move_pct,   # index move % needed to hit target
@@ -3152,6 +3157,7 @@ class TradingBot:
                     'size_reason'      : pos.get('size_reason', ''),
                     # ── Option-buyer entry-quality pack (v1.7.3) ──────────
                     'rv_iv'            : pos.get('rv_iv'),
+                    'rv_iv_src'        : pos.get('rv_iv_src'),
                     'entry_delta'      : pos.get('entry_delta'),
                     'exp_move_pct'     : pos.get('exp_move_pct'),
                     'req_move_pct'     : pos.get('req_move_pct'),

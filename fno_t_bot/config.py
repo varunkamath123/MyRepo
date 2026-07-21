@@ -231,7 +231,15 @@ TRAILING_DISTANCE    = 0.10        # Trail distance 10% from peak (was 20%)
 # (REV at 12:00, late PATH-A) previously had no progress-based exit at all
 # (e.g. Jun 9 BNF REV -₹4,180 bled the full 150min to force-close).
 NEVER_PROGRESS_ENABLED   = True
-NEVER_PROGRESS_MINUTES   = 90      # minimum age before the check applies
+NEVER_PROGRESS_MINUTES   = 45      # min age before the check applies. LOWERED 90→45
+                                   # (Jul 21 diag): at 90 the exit was DEAD CODE — 0
+                                   # fires ever. It was pincered: morning entries hit the
+                                   # 12:00 checkpoint first, afternoon Path B entries hit
+                                   # the 14:30 force-close first (they enter 13:40+ with
+                                   # <50min runway). 45min fits inside the afternoon runway
+                                   # so a never-progressed Path B bleeder gets cut ~14:25
+                                   # instead of riding to force-close (Jul 16 losers peaked
+                                   # +1.9%/+3.0%, force-closed -5.7%/-11.6%).
 NEVER_PROGRESS_MIN_PEAK  = 0.03    # peaked ≥ +3% at any point = exempt (has shown life)
 
 # Dynamic profit target — scale BASE_TARGET with ATM-IV at entry (May 2026)
