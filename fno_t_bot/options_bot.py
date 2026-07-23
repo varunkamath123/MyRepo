@@ -35,6 +35,7 @@ import post11_scorer
 import unified_scorer
 import reversal_scout
 import breakout_scout
+import anticipation_scout
 import max_pain_trap
 import near_miss_tracker
 import trade_probability
@@ -3615,6 +3616,8 @@ class TradingBot:
             reversal_scout.daily_reset(self.instrument, self.logger)
             # MaxPain Trap: reset daily P&L and fired_today flag
             max_pain_trap.daily_reset(self.instrument, self.logger)
+            # Anticipation scout (shadow): reset daily setup count + P&L tally
+            anticipation_scout.daily_reset(self.instrument, self.logger)
 
     @staticmethod
     def _trade_log_dir() -> str:
@@ -4330,6 +4333,28 @@ class TradingBot:
                     self.logger.warning(
                         f"  [PATH-G] Breakout scout error: {_pe_exc}"
                     )
+
+                # ── Anticipation Scout (SHADOW) — enter-at-level, before the move
+                # The philosophy-shift engine: logs would-be anticipatory entries
+                # and tracks the underlying to resolution. NO orders. Runs every
+                # bar to gather forward evidence vs the confirmation breakouts.
+                if getattr(config, 'ANTICIPATION_SHADOW_ENABLED', False):
+                    try:
+                        anticipation_scout.evaluate_bar(
+                            instrument = self.instrument,
+                            df         = df,
+                            oc         = oc,
+                            oi_zones   = self._oi_zones,
+                            inst_cfg   = self.inst_cfg,
+                            logger     = self.logger,
+                            now        = now,
+                            or_high    = self._or_high,
+                            or_low     = self._or_low,
+                        )
+                    except Exception as _as_exc:
+                        self.logger.warning(
+                            f"  [ANTICIP] Scout error: {_as_exc}"
+                        )
 
                 # ── MaxPain Trap (Variant A) — independent paper strategy ─────────
                 # Fires 09:15–10:00 on expiry days when spot is displaced ≥0.5%

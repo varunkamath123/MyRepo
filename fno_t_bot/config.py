@@ -1194,6 +1194,14 @@ PATH_A_SMA_PROX_PCT     = 0.003   # within 0.3% of SMA_slow = potential headwind
 PATH_A_PDH_PDL_ENABLED  = True    # track prev-day high/low as S/R reference
 PATH_A_PDH_PDL_PROX     = 0.002   # within 0.2% of PDH (CALL) or PDL (PUT) = log wall proximity
 
+# ─── Anticipation-first entry engine (Jul 22 2026) ───────────────────────────
+# Shadow module (anticipation_scout.py): enter at a LEVEL price is holding,
+# BEFORE the breakout — the "capture before it happens" thesis. Logs would-be
+# entries + tracks the underlying to resolution; places NO orders. Runs live to
+# gather forward evidence vs the confirmation-breakout paths on the same tape.
+# Promote to a live-order path only if it beats breakouts forward.
+ANTICIPATION_SHADOW_ENABLED = True
+
 # ─── Chase gate (Jul 16 2026) ────────────────────────────────────────────────
 # chase_pos = direction-normalized entry location in today's range (0=pullback
 # entry, 1=bought the extreme). Backfill: chase_pos>0.7 = 39t -₹15,872.
