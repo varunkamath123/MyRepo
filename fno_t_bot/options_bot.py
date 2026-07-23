@@ -4052,18 +4052,34 @@ class TradingBot:
                             continue   # skip hold evaluation — already closed
 
                         # ── 12PM hard loss stop ───────────────────────────────
-                        # If the position is at a loss at the checkpoint → close
-                        # immediately, unconditionally, regardless of ADX / EMA.
+                        # If the position is at a loss at the checkpoint AND
+                        # never showed real strength → close immediately.
+                        # EXEMPTION (v1.9, Jul 23): a position that peaked past
+                        # CHECKPOINT_LOSS_STOP_MIN_PEAK is red-but-strong, not
+                        # red-and-dead — falls through to the exit-score check
+                        # below instead of an automatic kill on P&L sign alone.
                         # Configured by PATH_A_LOSS_STOP_AT_CHECKPOINT (default True).
+                        _peak_pct      = pos.get('highest_pnl_pct', 0.0)
+                        _ckpt_min_peak = getattr(config, 'CHECKPOINT_LOSS_STOP_MIN_PEAK', 0.05)
                         if (getattr(config, 'PATH_A_LOSS_STOP_AT_CHECKPOINT', True)
-                                and _pnl_pct < 0):
+                                and _pnl_pct < 0
+                                and _peak_pct < _ckpt_min_peak):
                             self.logger.info(
                                 f"[PATH-A{_otm_lbl}] CHECKPOINT LOSS-STOP ✂️ | "
                                 f"{pos['type']} P&L={_pnl_pct*100:+.1f}% "
-                                f"→ hard close at {_path_a_fc_time} (position at a loss)"
+                                f"peak={_peak_pct*100:+.1f}% "
+                                f"→ hard close at {_path_a_fc_time} (never showed strength)"
                             )
                             self.check_exits(_fc_px, _fc_hv, force_close=True)
                             continue   # skip conditional hold evaluation
+                        elif _pnl_pct < 0:
+                            self.logger.info(
+                                f"[PATH-A{_otm_lbl}] CHECKPOINT RED-BUT-STRONG ⚠️ | "
+                                f"{pos['type']} P&L={_pnl_pct*100:+.1f}% "
+                                f"peak={_peak_pct*100:+.1f}% >= {_ckpt_min_peak*100:.0f}% "
+                                f"— evaluating via exit-score instead of hard kill"
+                            )
+                            # falls through to the exit-score evaluation below
 
                         # ── Exit score checkpoint (replaces fixed profit/ADX/EMA check) ──
                         # Score 0-85 across 6 components: directional integrity,

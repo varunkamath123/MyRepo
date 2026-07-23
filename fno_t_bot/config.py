@@ -242,6 +242,21 @@ NEVER_PROGRESS_MINUTES   = 45      # min age before the check applies. LOWERED 9
                                    # +1.9%/+3.0%, force-closed -5.7%/-11.6%).
 NEVER_PROGRESS_MIN_PEAK  = 0.03    # peaked ≥ +3% at any point = exempt (has shown life)
 
+# Checkpoint loss-stop exemption (Jul 23 2026 — v1.9). The 12PM hard loss-stop
+# was killing red-at-that-instant positions unconditionally, regardless of how
+# strong the thesis had been intraday — using P&L SIGN as the only signal.
+# Two documented casualties: Jul 17 SENSEX peaked +8.3% -> killed -1.3%;
+# Jul 22 NIFTY peaked +15.4% -> killed -1.7%. Meanwhile Jul 22 SENSEX at only
+# +0.2% at checkpoint got the exit-score evaluation (score 65 HOLD) and ran to
+# +1,095 — the SAME mechanism exists, it just never got applied to red trades.
+# Fix: a position that peaked >= this threshold is red-but-strong, not
+# red-and-dead — route it to the SAME exit-score evaluation used for green
+# positions instead of an automatic kill. Set above NEVER_PROGRESS_MIN_PEAK
+# (3%) since converting to A_HELD has a bigger consequence (runs for hours)
+# than the never-progress cut — a barely-positive peak (e.g. 2.9%, still
+# correctly killed live on Jul 22 BANKNIFTY) shouldn't earn a second look.
+CHECKPOINT_LOSS_STOP_MIN_PEAK = 0.05
+
 # Dynamic profit target — scale BASE_TARGET with ATM-IV at entry (May 2026)
 # High IV = bigger daily swings → option can reach 50% gain on same move
 # that only earns 20% on a quiet low-IV day. Formula: BASE_TARGET * (atm_iv / REF).
