@@ -1,0 +1,14 @@
+[Unit]
+Description=FnO_T_Bot 5-min Data Collection (15:33 IST)
+After=network.target
+
+[Service]
+Type=oneshot
+User=tradingbot
+WorkingDirectory=/opt/trading_bot/live_bot
+ExecStart=/bin/bash -c "cd /opt/trading_bot/live_bot && \
+  /opt/trading_bot/venv/bin/python3 data_collector.py backfill NIFTY 3 && \
+  /opt/trading_bot/venv/bin/python3 data_collector.py backfill BANKNIFTY 3 && \
+  /opt/trading_bot/venv/bin/python3 data_collector.py backfill SENSEX 3"
+StandardOutput=journal
+StandardError=journal
