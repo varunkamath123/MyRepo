@@ -47,6 +47,12 @@ RR             = 2.0             # target = RR x stop distance (2:1)
 DI_MARGIN      = 6.0             # don't fight a strong opposing DI (falling-knife guard)
 MAX_PER_DAY    = 2               # shadow trades per instrument per day
 TOUCH_BARS     = 3               # look back this many bars for the level test
+MAX_CHASE      = 0.55            # HARD anticipation guard (Jul 22 replay fix): the
+                                 # entry must sit in the lower-mid of the day range
+                                 # in its own direction. Without this, VWAP-reject on
+                                 # a trending day fires near the day extreme (chase
+                                 # 0.85-0.92) — re-creating the chase problem. A true
+                                 # anticipation entry is low-chase by definition.
 FORCE_CLOSE    = dtime(14, 30)
 
 # ── Per-instrument shadow state (each bot = its own process) ─────────────────
@@ -196,6 +202,16 @@ def evaluate_bar(instrument, df, oc, oi_zones, inst_cfg, logger, now,
     d_hi, d_lo = float(day['High'].max()), float(day['Low'].min())
     rpos  = (price - d_lo) / (d_hi - d_lo) if d_hi > d_lo else 0.5
     chase = rpos if setup['dir'] == 'CALL' else 1.0 - rpos
+
+    # Anticipation guard: reject setups that are already at the extreme — those
+    # aren't anticipatory, they're chases wearing a level's name.
+    if chase > MAX_CHASE:
+        logger.info(
+            f"  [ANTICIP-SHADOW] skip {setup['dir']} {instrument} "
+            f"{setup['level_name']}@{setup['level']:.0f}: chase_pos={chase:.2f} "
+            f"> {MAX_CHASE} — not anticipatory (already at the extreme)"
+        )
+        return
 
     setup.update(entry=price, t0=now)
     _open[instrument]  = setup
