@@ -1233,24 +1233,27 @@ PATH_A_PDH_PDL_PROX     = 0.002   # within 0.2% of PDH (CALL) or PDL (PUT) = log
 # Promote to a live-order path only if it beats breakouts forward.
 ANTICIPATION_SHADOW_ENABLED = True
 
-# ─── Chase gate (Jul 16 2026) ────────────────────────────────────────────────
+# ─── Chase gate (Jul 16, ACTIVATED Jul 24 2026 — user directive) ─────────────
 # chase_pos = direction-normalized entry location in today's range (0=pullback
-# entry, 1=bought the extreme). Backfill: chase_pos>0.7 = 39t -₹15,872.
-# BUT the top-10 analysis showed chase ALONE does not separate the biggest
-# wins (mean chase 0.80 wins vs 0.87 losses) — REV noon fades and morning
-# trend breakouts are high-chase AND win. So the gate is narrowed to the
-# afternoon non-REV exhaustion chase (07-13 SEN B -2,370, 04-24 -4,444) and
-# REV is exempt (backbone; anti-chase by design).
-# MODE:
-#   'off'    — disabled
-#   'shadow' — log '[CHASE-GATE] SHADOW would-block' but TAKE the trade
-#              (gathers forward out-of-sample evidence; no P&L impact)
-#   'active' — actually skip the entry
-# Ships in SHADOW: the rule is in-sample only (n=39 historical, 0 forward).
-# Flip to 'active' after the shadow log confirms it fires on losers forward.
-CHASE_GATE_MODE         = 'shadow'
-CHASE_GATE_MAX          = 0.75     # chase_pos above this = bought the extreme
-CHASE_GATE_AFTER        = '12:00'  # morning breakouts have runway → exempt
+# entry, 1=bought the extreme). NEVER buy a PUT at the day's low or a CALL at
+# the day's high — that is buying an option at the point of maximum extension.
+# FULL 64-TRADE LIVE EVIDENCE (Jul 24): the book's entire lifetime loss lives
+# in extreme-chase entries. Extreme (chase>0.90) = 42 trades, -₹8,552; blocking
+# chase>0.95 removes 39 trades netting -₹15,692 and takes the book from
+# -₹16,788 to -₹1,096. Pullback entries (chase<0.30) are the only +EV bucket
+# (3t, +₹327). This is the single strongest signal in the whole live dataset.
+# ACTIVE, ALL-DAY (was shadow, afternoon-only). Accepted cost: forgoes ~13
+# winners incl. the occasional held-runner — the user's stated risk preference
+# is to never chase the extreme even at that cost. REV stays exempt (anti-chase
+# by design, +EV, structurally low-chase anyway). Threshold 0.93 = "at the
+# genuine extreme"; in-sample-noisy between 0.92-0.95 so NOT curve-fit to the
+# optimum — logged on every block so it can be tuned forward.
+# The reversal-positioning half of the directive is anticipation_scout (shadow,
+# regime-dependent — goes live once it proves it doesn't catch knives).
+# MODE: 'off' | 'shadow' (log only) | 'active' (skip the entry)
+CHASE_GATE_MODE         = 'active'
+CHASE_GATE_MAX          = 0.93     # chase_pos above this = bought the extreme → block
+CHASE_GATE_AFTER        = '09:15'  # ALL-DAY (mornings chase too — today's -₹2,491 proof)
 CHASE_GATE_EXEMPT_PATHS = ('REV',) # REV fades are anti-chase — never gate them
 
 # ─── PATH_REV: MaxPain Snap Reversal ─────────────────────────────────────────
