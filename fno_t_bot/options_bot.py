@@ -2792,6 +2792,19 @@ class TradingBot:
             'otm_strikes'      : _otm,           # 0=ATM, 1/2=OTM degree (check_exits uses this)
             'otm_reason'       : signal.get('otm_reason', ''),  # S/R rationale for analysis
             'gap_type'         : signal.get('gap_type', self._gap_type or ''),  # for JSONL
+            # Logging only (Jul 24) — is this signal fighting an already-observed
+            # fade? GAP_FADE_DN/UP means price recovered within the OR window;
+            # a fresh signal continuing the ORIGINAL gap direction (not the
+            # fade direction) is a renewed-breakdown/breakout bet on a day that
+            # already showed it can reverse. Today's clean example: NIFTY
+            # GAP_FADE_DN at 09:40, then a PUT (continuing down) at 10:10 that
+            # hit a full 25% stop having peaked only +5.7%. ADX was 45.8 at
+            # entry — high ADX did not discriminate this pattern, so no gate
+            # yet; tag it and build the cohort before acting on it.
+            'gap_fade_continuation': (
+                (self._gap_type == 'GAP_FADE_DN' and signal['type'] == 'PUT') or
+                (self._gap_type == 'GAP_FADE_UP' and signal['type'] == 'CALL')
+            ),
             'dynamic_or'       : signal.get('dynamic_or', False),  # True = DYN-OR fallback
             'sl_order_id'      : sl_order_id,    # Fyers SL-M order id (None if paper/failed)
             'sl_trigger'       : sl_trigger,     # for audit logging
@@ -3146,6 +3159,7 @@ class TradingBot:
                     'regime_at_open'   : pos.get('regime', 'UNKNOWN'),
                     'posture'          : pos.get('posture', 'NORMAL'),
                     'gap_type'         : pos.get('gap_type', ''),     # GAP_AND_GO_*/FADE/INSIDE
+                    'gap_fade_continuation': pos.get('gap_fade_continuation', False),
                     'otm_strikes'      : pos.get('otm_strikes', 0),  # 0=ATM, 1/2=OTM degree
                     'otm_reason'       : pos.get('otm_reason', ''),  # S/R logic rationale
                     'dynamic_or'       : pos.get('dynamic_or', False), # True = DYN-OR fallback

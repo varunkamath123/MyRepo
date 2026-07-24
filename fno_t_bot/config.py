@@ -240,7 +240,23 @@ NEVER_PROGRESS_MINUTES   = 45      # min age before the check applies. LOWERED 9
                                    # so a never-progressed Path B bleeder gets cut ~14:25
                                    # instead of riding to force-close (Jul 16 losers peaked
                                    # +1.9%/+3.0%, force-closed -5.7%/-11.6%).
-NEVER_PROGRESS_MIN_PEAK  = 0.03    # peaked ≥ +3% at any point = exempt (has shown life)
+NEVER_PROGRESS_MIN_PEAK  = 0.05    # RAISED 3%->5% (Jul 24 v1.9.1 — "peak giveback" gap).
+                                   # exempt-if-ever-shown-life is a ONE-TIME check: once a
+                                   # position peaks past the floor it is exempt for the
+                                   # REST OF THE DAY, even if it fully gives the gain back
+                                   # and keeps decaying. A peak just above the old 3% floor
+                                   # is also below trail-activation (12-18%), so the
+                                   # trailing stop never arms either — a true dead zone with
+                                   # no active protection. Two same-shape casualties: Jul 16
+                                   # SENSEX B peaked 3.0% -> -11.6% at EOD; Jul 24 SENSEX B
+                                   # peaked 3.75% (exempt under the old 3% floor) -> -8.97%
+                                   # at EOD, unmonitored for ~2h after its peak. Raising to
+                                   # 5% (matching CHECKPOINT_LOSS_STOP_MIN_PEAK below — same
+                                   # underlying question: did this show ENOUGH real strength
+                                   # to deserve protection) catches both retroactively.
+                                   # Still requires pnl_pct<0 to fire — can NEVER cut a
+                                   # position that is currently green, only accelerates
+                                   # cutting a red one that peaked modestly and decayed.
 
 # Checkpoint loss-stop exemption (Jul 23 2026 — v1.9). The 12PM hard loss-stop
 # was killing red-at-that-instant positions unconditionally, regardless of how
