@@ -42,13 +42,13 @@ from reversal_guard import compute_reversal_risk
 IST = pytz.timezone('Asia/Kolkata')
 
 # ── MiroFish (news/sentiment) — context only, never a gate ──────────────────
-# NIFTY/BANKNIFTY only (no SENSEX read exists). mirofish_swarm.py writes to its
-# own directory (repo root) with WorkingDirectory=/opt/trading_bot/repo on EC2;
-# fall back to a repo-relative guess for local/dev so this never hard-codes an
-# environment-specific absolute path as the ONLY option.
+# NIFTY/BANKNIFTY only (no SENSEX read exists). mirofish_swarm.py writes to
+# MIROFISH_OUT_FILE = /opt/trading_bot/live_bot/mirofish_scores.json on EC2
+# (repo/ is root/ec2-user-owned, tradingbot can't write there — live_bot/ is).
+# Repo-relative guess kept as a fallback for local/dev runs.
 _MIRO_PATHS = [
-    '/opt/trading_bot/repo/mirofish_scores.json',
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'mirofish_scores.json'),
+    '/opt/trading_bot/live_bot/mirofish_scores.json',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mirofish_scores.json'),
 ]
 MIRO_MAX_AGE_HOURS = 8   # stale data is treated as absent, never blocks/ages badly
 

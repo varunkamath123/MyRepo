@@ -10,6 +10,9 @@ WorkingDirectory=/opt/trading_bot/repo
 # Optional (-) prefix: unit still starts if the file is missing; the script's
 # own check (ANTHROPIC_API_KEY not in os.environ) then fails clearly instead.
 EnvironmentFile=-/opt/trading_bot/.env
+# repo/ is root/ec2-user-owned (git deploy target) -- tradingbot can't write
+# there. live_bot/ is already fully tradingbot-owned (see fno_t_bot_* units).
+Environment=MIROFISH_OUT_FILE=/opt/trading_bot/live_bot/mirofish_scores.json
 ExecStart=/opt/trading_bot/venv/bin/python3 mirofish_swarm.py
 StandardOutput=journal
 StandardError=journal
