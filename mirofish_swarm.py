@@ -163,7 +163,7 @@ def synthesize(headlines_by_angle: dict[str, list[dict]]) -> dict:
 
     prompt = _SYNTHESIS_PROMPT.replace("__HEADLINES_BLOCK__", headlines_block)
     resp = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         max_tokens=600,
         temperature=0.0,
         messages=[{"role": "user", "content": prompt}],
