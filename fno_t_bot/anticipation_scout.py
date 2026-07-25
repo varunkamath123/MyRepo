@@ -28,14 +28,58 @@ config.ANTICIPATION_SHADOW_ENABLED), same pattern as reversal_scout.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from datetime import datetime, time as dtime
 from typing import Optional
 
 import pandas as pd
 import pytz
 
+from reversal_guard import compute_reversal_risk
+
 IST = pytz.timezone('Asia/Kolkata')
+
+# ── MiroFish (news/sentiment) — context only, never a gate ──────────────────
+# NIFTY/BANKNIFTY only (no SENSEX read exists). mirofish_swarm.py writes to its
+# own directory (repo root) with WorkingDirectory=/opt/trading_bot/repo on EC2;
+# fall back to a repo-relative guess for local/dev so this never hard-codes an
+# environment-specific absolute path as the ONLY option.
+_MIRO_PATHS = [
+    '/opt/trading_bot/repo/mirofish_scores.json',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'mirofish_scores.json'),
+]
+MIRO_MAX_AGE_HOURS = 8   # stale data is treated as absent, never blocks/ages badly
+
+
+def _read_mirofish(instrument: str) -> Optional[dict]:
+    """Return {'lean':.., 'score':.., 'age_h':..} for NIFTY/BANKNIFTY, or None.
+
+    Graceful on every failure mode (missing file, stale, wrong instrument,
+    malformed JSON) — mirrors paper_trader.py's precedent: missing/stale
+    MiroFish data never blocks anything, it's just absent context.
+    """
+    if instrument not in ('NIFTY', 'BANKNIFTY'):
+        return None
+    for path in _MIRO_PATHS:
+        if os.path.exists(path):
+            break
+    else:
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        if instrument not in data or 'score' not in data[instrument]:
+            return None
+        gen = datetime.fromisoformat(data['generated_at'])
+        age_h = (datetime.now(IST) - gen).total_seconds() / 3600
+        if age_h > MIRO_MAX_AGE_HOURS:
+            return None
+        return {'lean': data[instrument].get('lean', 'neutral'),
+                'score': float(data[instrument]['score']), 'age_h': round(age_h, 1)}
+    except Exception:
+        return None
 
 # ── Tunables (shadow — safe to iterate) ──────────────────────────────────────
 WINDOW_START   = dtime(9, 45)    # after OR forms, before lunch drift
@@ -54,6 +98,32 @@ MAX_CHASE      = 0.55            # HARD anticipation guard (Jul 22 replay fix): 
                                  # 0.85-0.92) — re-creating the chase problem. A true
                                  # anticipation entry is low-chase by definition.
 FORCE_CLOSE    = dtime(14, 30)
+
+# ── Exhaustion gate (Jul 25 2026) ────────────────────────────────────────────
+# "Is today a trend day?" was tested empirically (day_classifier's eff/range
+# framework, time-scaled multiple ways) and DOES NOT predict the full-day
+# TREND label reliably by 11:00-12:00 — recall and false-positive rate track
+# each other 1:1 across a full grid search (11-34% recall). Not a tuning
+# problem: the day-level forecast just isn't callable this early. Discarded.
+#
+# The tractable question is narrower: is THIS SPECIFIC move — the one
+# anticipation is about to fade — actually exhausted right now, or still
+# accelerating? reversal_guard.compute_reversal_risk() already answers this,
+# and is ALREADY LIVE on the confirmatory side (options_bot.py ~line 4918):
+# a CONFIRMATORY entry gets capped/skipped when exhaustion risk in its OWN
+# direction is high (>=30 caps lots, >=50 skips — proven thresholds, real
+# money). Anticipation needs the SAME check with INVERTED polarity: a CALL
+# here is a bet that a DOWN-move is exhausted, so it must show HIGH
+# exhaustion risk if scored as a hypothetical PUT (and vice versa). This is
+# the Jul22-replay fix: that day's anticipation CALLs lost because they faded
+# a still-accelerating downtrend — compute_reversal_risk(df, i, 'PUT') would
+# have read LOW (fresh move, not exhausted) and blocked exactly those trades.
+#
+# Threshold uses the existing 'skip' (HIGH, score>=50) tier, not the looser
+# 'reduce_lots' (MODERATE, >=30) tier — anticipation is a bet against the
+# prevailing move, so it should demand the same bar REV holds itself to
+# (min morning ADX 30 + min DI spread 12 + waning check), not a lighter one.
+EXHAUSTION_MIN_SCORE = 50
 
 # ── Per-instrument shadow state (each bot = its own process) ─────────────────
 _open:    dict[str, Optional[dict]] = {}
@@ -148,7 +218,9 @@ def evaluate_bar(instrument, df, oc, oi_zones, inst_cfg, logger, now,
                 f"  [ANTICIP-SHADOW] {icon} EXIT {pos['dir']} {instrument} | "
                 f"{pos['level_name']}@{pos['level']:.0f} | {reason} | "
                 f"idx {pos['entry']:.0f}->{exit_px:.0f} ({move:+.0f}pt) | "
-                f"~Rs{pnl:+,.0f} | held {int((now - pos['t0']).total_seconds()/60)}m"
+                f"~Rs{pnl:+,.0f} | held {int((now - pos['t0']).total_seconds()/60)}m | "
+                f"[entry: chase={pos.get('chase_pos','?')} "
+                f"exhaustion={pos.get('exhaustion_score','?')}/100 miro={pos.get('miro','?')}]"
             )
             _open[instrument] = None
         return
@@ -213,12 +285,48 @@ def evaluate_bar(instrument, df, oc, oi_zones, inst_cfg, logger, now,
         )
         return
 
-    setup.update(entry=price, t0=now)
+    # ── Exhaustion gate — is the move we're fading ACTUALLY exhausted? ───────
+    # Inverted-polarity reuse of the already-live confirmatory guard (see
+    # config comment above). CALL fades a down-move -> check as if PUT;
+    # PUT fades an up-move -> check as if CALL.
+    _opp = 'PUT' if setup['dir'] == 'CALL' else 'CALL'
+    try:
+        _rev = compute_reversal_risk(df, len(df) - 1, _opp)
+        _rev_score = _rev['score']
+    except Exception as _rev_exc:
+        logger.warning(f"  [ANTICIP-SHADOW] exhaustion check error: {_rev_exc} — skipping setup (fail-safe)")
+        return
+    if _rev_score < EXHAUSTION_MIN_SCORE:
+        logger.info(
+            f"  [ANTICIP-SHADOW] skip {setup['dir']} {instrument} "
+            f"{setup['level_name']}@{setup['level']:.0f}: exhaustion score "
+            f"{_rev_score}/100 (as {_opp}) < {EXHAUSTION_MIN_SCORE} "
+            f"— the move isn't exhausted yet, this would be a knife-catch"
+        )
+        return
+
+    # ── MiroFish — directional CONTEXT only, never a gate (user directive) ──
+    _miro = _read_mirofish(instrument)
+    _miro_note = 'n/a'
+    if _miro:
+        _dir_bullish = (setup['dir'] == 'CALL')
+        _lean_bullish = _miro['lean'] == 'bullish'
+        _lean_bearish = _miro['lean'] == 'bearish'
+        if (_dir_bullish and _lean_bullish) or (not _dir_bullish and _lean_bearish):
+            _miro_note = f"AGREES (lean={_miro['lean']} score={_miro['score']:.2f}, {_miro['age_h']}h old)"
+        elif (_dir_bullish and _lean_bearish) or (not _dir_bullish and _lean_bullish):
+            _miro_note = f"CONFLICTS (lean={_miro['lean']} score={_miro['score']:.2f}, {_miro['age_h']}h old)"
+        else:
+            _miro_note = f"neutral (score={_miro['score']:.2f}, {_miro['age_h']}h old)"
+
+    setup.update(entry=price, t0=now, chase_pos=round(chase, 2),
+                 exhaustion_score=_rev_score, miro=_miro_note)
     _open[instrument]  = setup
     _count[instrument] = _count.get(instrument, 0) + 1
     logger.info(
         f"  [ANTICIP-SHADOW] ⚡ ENTRY {setup['dir']} {instrument} | "
         f"hold {setup['level_name']}@{setup['level']:.0f} | idx {price:.0f} | "
         f"stop {setup['stop']:.0f} target {setup['target']:.0f} | "
-        f"ADX={adx:.0f} chase_pos={chase:.2f} | anticipatory entry (before breakout)"
+        f"ADX={adx:.0f} chase_pos={chase:.2f} exhaustion={_rev_score}/100 "
+        f"miro={_miro_note} | anticipatory entry (before breakout)"
     )
