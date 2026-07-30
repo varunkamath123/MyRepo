@@ -119,11 +119,29 @@ FORCE_CLOSE    = dtime(14, 30)
 # a still-accelerating downtrend — compute_reversal_risk(df, i, 'PUT') would
 # have read LOW (fresh move, not exhausted) and blocked exactly those trades.
 #
-# Threshold uses the existing 'skip' (HIGH, score>=50) tier, not the looser
-# 'reduce_lots' (MODERATE, >=30) tier — anticipation is a bet against the
-# prevailing move, so it should demand the same bar REV holds itself to
-# (min morning ADX 30 + min DI spread 12 + waning check), not a lighter one.
-EXHAUSTION_MIN_SCORE = 50
+# THRESHOLD CALIBRATED ON REAL DATA (Jul 30 2026) — was 50, now 35.
+# 50 was borrowed from reversal_guard's 'skip' tier, which exists to BLOCK
+# breakout entries. That was a guess, and it was wrong for ENTERING reversals.
+# Measured against 257 genuine intraday reversals (a turn followed by a >=0.25%
+# sustained move) across ~40 days x 3 instruments, scored at the turn bar in
+# the direction anticipation would fade, with 339 non-turn bars as a control:
+#
+#   thresh | catches real reversals | fires on non-turns (false pos)
+#      50  |        19.5%           |   8.3%     <- old: blocked 4 of 5 real turns
+#      40  |        36.6%           |  13.9%
+#      35  |        46.7%           |  18.9%     <- CHOSEN
+#      30  |        61.1%           |  26.8%
+#      20  |        82.9%           |  49.0%     <- no longer a signal, ~coin flip
+#
+# 35 more than doubles real-reversal capture vs 50 while holding false
+# positives under 19% and preserving ~2.5:1 discrimination (turn mean 35.0 /
+# non-turn mean 22.3). Below 30 the ratio collapses toward noise. Evidence for
+# 50 being too strict was also live: Jul 27-30 produced 4 straight zero-trade
+# days with every candidate scoring 0-21.
+# NOTE: this loosens an ENTRY filter, but anticipation_scout remains SHADOW —
+# no real orders. It buys us a real fill rate so the shadow can finally produce
+# the evidence needed to judge the engine at all.
+EXHAUSTION_MIN_SCORE = 35
 
 # ── Per-instrument shadow state (each bot = its own process) ─────────────────
 _open:    dict[str, Optional[dict]] = {}
