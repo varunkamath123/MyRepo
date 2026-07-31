@@ -1248,7 +1248,17 @@ ANTICIPATION_SHADOW_ENABLED = True
 # preempt PATH-A/B/REV; inherits the full downstream gate stack (risk cap,
 # funds check, regime/quality caps, chase gate, SL-M, exit management).
 # Revert: set False.
-ANTICIPATION_LIVE = True
+# REVERTED TO FALSE (Jul 31 2026, same day it was enabled).
+# It was enabled on a 4-day replay (Jul 27-30: 21 trades 10W/11L ~+Rs5,078).
+# The full-month test then contradicted it: across ALL of July the engine is
+# 105 trades 38W/67L ~-Rs4,976. Removing PDH/PDL (stale prev-day levels, 1 win
+# in 14, -Rs15,788) improved it to 96 trades 37W/59L ~-Rs1,025 -- better, but
+# still NEGATIVE. There is no demonstrated positive expectancy, so it should
+# not be risking capital.
+# The 4-day window was simply a favourable slice; treating it as sufficient
+# evidence was the error. Set back to True only after a genuinely
+# out-of-sample period shows positive expectancy.
+ANTICIPATION_LIVE = False
 
 # ─── Chase gate (Jul 16, ACTIVATED Jul 24 2026 — user directive) ─────────────
 # chase_pos = direction-normalized entry location in today's range (0=pullback

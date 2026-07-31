@@ -195,8 +195,19 @@ def _levels(instrument, price, or_high, or_low, oi_zones, pdh, pdl):
     # it is only unfit as an anticipation ENTRY level.
     if or_low and price > or_low:   add(sup, or_low,  'OR_low')
     if or_high and price < or_high: add(res, or_high, 'OR_high')
-    if pdl and price > pdl:          add(sup, pdl, 'PDL')
-    if pdh and price < pdh:          add(res, pdh, 'PDH')
+    # PDH/PDL REMOVED (Jul 31 2026) — full-July test, 105 trades:
+    #   OR_low  48t 43.8% win  +Rs5,476
+    #   OR_high 43t 37.2% win  +Rs5,337
+    #   PDH     10t 10.0% win -Rs13,969   <- 1 win in 10
+    #   PDL      4t  0.0% win -Rs1,819    <- 0 wins
+    # Previous-day levels alone turned the engine from +Rs10,813 to -Rs4,976.
+    # Mechanism: an OR boundary forms TODAY from today's order flow; PDH/PDL
+    # are yesterday's levels and are stale by mid-session. Unlike the earlier
+    # VWAP removal (which was rarely the nearest level and changed almost
+    # nothing), these fired 14 times with severe losses -- removing them is
+    # material, not cosmetic.
+    # NOTE: n=14 is a small sample; the sign and magnitude are consistent but
+    # this remains IN-SAMPLE. Re-check once forward data exists.
     # OI walls (NIFTY/BANKNIFTY; SENSEX has none)
     if oi_zones:
         for s in oi_zones.get('support', []):
