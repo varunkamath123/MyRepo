@@ -1,0 +1,18 @@
+[Unit]
+Description=FnO T-Bot — EOD OI Zones Fetcher (runs once after market close)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# User=tradingbot, NOT ec2-user. The data dirs are tradingbot-owned (0755), so
+# running as ec2-user made every write fail with PermissionError -- OI zones
+# silently stopped updating on Jul 7 2026 and were dead for 24 days while the
+# timer kept reporting success. Same bug class as the morning-brief and
+# datacollect units. If this unit is ever edited, keep the user aligned with
+# the data directory owner.
+User=tradingbot
+WorkingDirectory=/opt/trading_bot/live_bot
+ExecStart=/opt/trading_bot/venv/bin/python3 oi_zones_eod.py
+StandardOutput=journal
+StandardError=journal
