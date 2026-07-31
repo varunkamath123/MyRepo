@@ -119,7 +119,15 @@ FORCE_CLOSE    = dtime(14, 30)
 # a still-accelerating downtrend — compute_reversal_risk(df, i, 'PUT') would
 # have read LOW (fresh move, not exhausted) and blocked exactly those trades.
 #
-# THRESHOLD CALIBRATED ON REAL DATA (Jul 30 2026) — was 50, now 35.
+# RETIRED AS A GATE (Jul 30 2026) — kept only as a logged diagnostic field.
+# See the "Exhaustion score — LOGGED ONLY" block in evaluate_bar() for the
+# ablation that retired it. History of the mistake, kept deliberately:
+# it was set to 50 by borrowing a constant from a filter with a different
+# job, recalibrated to 35 against 257 reversals, and only a proper ablation
+# on the FULL 1,517-signal pool revealed it adds ~nothing either way. The
+# earlier calibration was measuring the wrong thing: how many real reversals
+# it caught, never whether catching them that way made money.
+# THRESHOLD (historical, no longer enforced) — was 50, then 35.
 # 50 was borrowed from reversal_guard's 'skip' tier, which exists to BLOCK
 # breakout entries. That was a guess, and it was wrong for ENTERING reversals.
 # Measured against 257 genuine intraday reversals (a turn followed by a >=0.25%
@@ -161,7 +169,7 @@ def daily_reset(instrument: str, logger: logging.Logger | None = None) -> None:
     _pnl[instrument]   = 0.0
 
 
-def _levels(instrument, price, or_high, or_low, vwap, oi_zones, pdh, pdl):
+def _levels(instrument, price, or_high, or_low, oi_zones, pdh, pdl):
     """Return (supports_below, resistances_above) — sorted by proximity to price."""
     sup, res = [], []
     def add(container, val, name):
@@ -171,11 +179,18 @@ def _levels(instrument, price, or_high, or_low, vwap, oi_zones, pdh, pdl):
                 container.append((v, name))
         except (TypeError, ValueError):
             pass
-    # structural levels
+    # structural levels.
+    # VWAP REMOVED as an entry level (Jul 30 2026) — measured on 92 signals
+    # over 60 days: VWAP entries won 37.5% and lost money on BOTH sides
+    # (CALL 33.3% / -0.008%, PUT 40.0% / -0.066%), while OR boundaries won
+    # 63.5% (+0.107%). Mechanism: an OR boundary is FIXED at 09:40 and
+    # accumulates real order-flow memory all day; VWAP is a MOVING line that
+    # drifts toward price, so "price holding VWAP" is frequently just price
+    # and VWAP converging — a coincidence read as support. VWAP stays in use
+    # elsewhere (exit scoring, reversal_guard stretch, confirmatory filters);
+    # it is only unfit as an anticipation ENTRY level.
     if or_low and price > or_low:   add(sup, or_low,  'OR_low')
     if or_high and price < or_high: add(res, or_high, 'OR_high')
-    if vwap and price > vwap:        add(sup, vwap, 'VWAP')
-    if vwap and price < vwap:        add(res, vwap, 'VWAP')
     if pdl and price > pdl:          add(sup, pdl, 'PDL')
     if pdh and price < pdh:          add(res, pdh, 'PDH')
     # OI walls (NIFTY/BANKNIFTY; SENSEX has none)
@@ -249,7 +264,6 @@ def evaluate_bar(instrument, df, oc, oi_zones, inst_cfg, logger, now,
     if _count.get(instrument, 0) >= MAX_PER_DAY:
         return
 
-    vwap = float(row.get('VWAP', 0) or 0)
     dip  = float(row.get('DI_plus', 0) or 0)
     dim  = float(row.get('DI_minus', 0) or 0)
     adx  = float(row.get('ADX', 0) or 0)
@@ -257,7 +271,7 @@ def evaluate_bar(instrument, df, oc, oi_zones, inst_cfg, logger, now,
     win_lo = float(df['Low'].iloc[-TOUCH_BARS:].min())
     win_hi = float(df['High'].iloc[-TOUCH_BARS:].max())
 
-    sup, res = _levels(instrument, price, or_high, or_low, vwap, oi_zones, pdh, pdl)
+    sup, res = _levels(instrument, price, or_high, or_low, oi_zones, pdh, pdl)
 
     setup = None
     # Support hold -> CALL: near a support, recently tested it, now turning up,
@@ -303,25 +317,22 @@ def evaluate_bar(instrument, df, oc, oi_zones, inst_cfg, logger, now,
         )
         return
 
-    # ── Exhaustion gate — is the move we're fading ACTUALLY exhausted? ───────
-    # Inverted-polarity reuse of the already-live confirmatory guard (see
-    # config comment above). CALL fades a down-move -> check as if PUT;
-    # PUT fades an up-move -> check as if CALL.
+    # ── Exhaustion score — LOGGED ONLY, no longer a gate (Jul 30 2026) ──────
+    # It was a gate (>=50, then >=35). Ablation on 1,517 unfiltered signals
+    # showed it contributes ~nothing as a filter (+Rs3/trade vs baseline,
+    # 51.6% win vs 53.6% baseline) while destroying volume: stacked with
+    # chase+DI it cut trades 419 -> 46 and TOTAL P&L from ~Rs322k to ~Rs55k.
+    #
+    # Root cause of the design error: compute_reversal_risk() awards points
+    # for DECLINING ADX, and ADX can only decline from a high level -- so the
+    # gate systematically selected strong-trend conditions, the worst regime
+    # in which to fade a move. Median ADX at our entries was 42 (55% above 40).
+    # Kept as a logged field because it is still useful post-hoc evidence.
     _opp = 'PUT' if setup['dir'] == 'CALL' else 'CALL'
     try:
-        _rev = compute_reversal_risk(df, len(df) - 1, _opp)
-        _rev_score = _rev['score']
-    except Exception as _rev_exc:
-        logger.warning(f"  [ANTICIP-SHADOW] exhaustion check error: {_rev_exc} — skipping setup (fail-safe)")
-        return
-    if _rev_score < EXHAUSTION_MIN_SCORE:
-        logger.info(
-            f"  [ANTICIP-SHADOW] skip {setup['dir']} {instrument} "
-            f"{setup['level_name']}@{setup['level']:.0f}: exhaustion score "
-            f"{_rev_score}/100 (as {_opp}) < {EXHAUSTION_MIN_SCORE} "
-            f"— the move isn't exhausted yet, this would be a knife-catch"
-        )
-        return
+        _rev_score = compute_reversal_risk(df, len(df) - 1, _opp)['score']
+    except Exception:
+        _rev_score = None   # non-fatal: it no longer gates anything
 
     # ── MiroFish — directional CONTEXT only, never a gate (user directive) ──
     _miro = _read_mirofish(instrument)
