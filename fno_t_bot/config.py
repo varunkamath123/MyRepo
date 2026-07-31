@@ -1233,6 +1233,23 @@ PATH_A_PDH_PDL_PROX     = 0.002   # within 0.2% of PDH (CALL) or PDL (PUT) = log
 # Promote to a live-order path only if it beats breakouts forward.
 ANTICIPATION_SHADOW_ENABLED = True
 
+# LIVE anticipation entries (Jul 31 2026) — places REAL orders.
+# Enabled at user's explicit direction after the exhaustion gate was retired.
+# Evidence: replaying Jul 27-30 through the current entry stack gives 21 trades
+# 10W/11L ~+Rs5,078, vs the old (exhaustion-gated) config's 9 trades 0W/9L
+# ~-Rs12,102 on identical data.
+# Honest limits of that evidence, recorded deliberately:
+#   - 4 days only, and those days are INSIDE the 60-day window the entry
+#     parameters were calibrated on -> partially in-sample, not a clean test
+#   - 10W/11L is a LOSING win rate; profitable only because winners ran larger
+#   - P&L approximated at delta 0.5 on index moves, not real option fills
+#   - the engine had never placed a real order before this flag
+# Safety: signal always requests 1 lot; runs LAST in the cascade so it cannot
+# preempt PATH-A/B/REV; inherits the full downstream gate stack (risk cap,
+# funds check, regime/quality caps, chase gate, SL-M, exit management).
+# Revert: set False.
+ANTICIPATION_LIVE = True
+
 # ─── Chase gate (Jul 16, ACTIVATED Jul 24 2026 — user directive) ─────────────
 # chase_pos = direction-normalized entry location in today's range (0=pullback
 # entry, 1=bought the extreme). NEVER buy a PUT at the day's low or a CALL at

@@ -4783,6 +4783,32 @@ class TradingBot:
                                 )
                                 self._path_rev_fired = True   # log once per day
 
+                    # ── Anticipation engine (LIVE) — enter-at-level ──────────────
+                    # Placed LAST in the cascade on purpose: it only fires when no
+                    # proven path (A / B / C / D / E / REV) produced a signal, so it
+                    # can ADD trades without ever preempting the engines that carry
+                    # the book. Flows into the same downstream pipeline as every
+                    # other path — risk cap, funds check, regime & quality lot caps,
+                    # chase gate, SL-M, exit stack, JSONL. No parallel order path.
+                    # Revert: set ANTICIPATION_LIVE=False (one line).
+                    if (signal is None
+                            and getattr(config, 'ANTICIPATION_LIVE', False)):
+                        try:
+                            signal = anticipation_scout.get_live_signal(
+                                instrument = self.instrument,
+                                df         = df,
+                                oi_zones   = self._oi_zones,
+                                logger     = self.logger,
+                                now        = now,
+                                or_high    = self._or_high,
+                                or_low     = self._or_low,
+                            )
+                        except Exception as _al_exc:
+                            self.logger.warning(
+                                f"  [ANTICIP-LIVE] signal error: {_al_exc} — skipping"
+                            )
+                            signal = None
+
                     # ── Tuesday CALL filter: elevated ADX + DI-spread gate ───────
                     # Backtest: overall Tue CALL WR = 31.2% (danger zone) — but this is
                     # the aggregate including weak setups. A strong unambiguous bull trend

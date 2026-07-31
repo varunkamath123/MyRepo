@@ -156,6 +156,9 @@ _open:    dict[str, Optional[dict]] = {}
 _count:   dict[str, int]            = {}
 _pnl:     dict[str, float]          = {}
 _last_ts: dict[str, object]         = {}
+# Separate counter for LIVE signals — the shadow tracker and the live path
+# must not share a per-day budget, or one would starve the other.
+_live_count: dict[str, int]         = {}
 
 
 def daily_reset(instrument: str, logger: logging.Logger | None = None) -> None:
@@ -167,6 +170,7 @@ def daily_reset(instrument: str, logger: logging.Logger | None = None) -> None:
     _open[instrument]  = None
     _count[instrument] = 0
     _pnl[instrument]   = 0.0
+    _live_count[instrument] = 0
 
 
 def _levels(instrument, price, or_high, or_low, oi_zones, pdh, pdl):
@@ -206,6 +210,133 @@ def _levels(instrument, price, or_high, or_low, oi_zones, pdh, pdl):
     sup.sort(key=lambda x: price - x[0])   # nearest below first
     res.sort(key=lambda x: x[0] - price)   # nearest above first
     return sup, res
+
+
+def _detect_setup(instrument, df, oi_zones, now, or_high=None, or_low=None):
+    """Shared setup detection for BOTH the shadow tracker and the live signal.
+
+    Single source of truth on purpose: this codebase has been bitten before by
+    duplicated logic drifting apart. Returns (setup | None, meta) where meta
+    carries chase / adx / exhaustion / price for the caller to log or gate on.
+    """
+    if df is None or len(df) < TOUCH_BARS + 1:
+        return None, {}
+    row   = df.iloc[-1]
+    price = float(row['Close'])
+    pdh   = float(row.get('PDH', 0) or 0)
+    pdl   = float(row.get('PDL', 0) or 0)
+    dip   = float(row.get('DI_plus', 0) or 0)
+    dim   = float(row.get('DI_minus', 0) or 0)
+    adx   = float(row.get('ADX', 0) or 0)
+    prev_close = float(df['Close'].iloc[-2])
+    win_lo = float(df['Low'].iloc[-TOUCH_BARS:].min())
+    win_hi = float(df['High'].iloc[-TOUCH_BARS:].max())
+
+    sup, res = _levels(instrument, price, or_high, or_low, oi_zones, pdh, pdl)
+
+    setup = None
+    if sup:
+        lvl, name = sup[0]
+        if ((price - lvl) / price <= PROX_PCT
+                and (win_lo - lvl) / lvl <= TOUCH_PCT
+                and win_lo >= lvl * (1 - STOP_BEYOND)
+                and price > lvl and price >= prev_close
+                and dip >= dim - DI_MARGIN):
+            stop  = lvl * (1 - STOP_BEYOND)
+            setup = dict(dir='CALL', level=lvl, level_name=name, stop=stop,
+                         target=price + RR * (price - stop))
+    if setup is None and res:
+        lvl, name = res[0]
+        if ((lvl - price) / price <= PROX_PCT
+                and (lvl - win_hi) / lvl <= TOUCH_PCT
+                and win_hi <= lvl * (1 + STOP_BEYOND)
+                and price < lvl and price <= prev_close
+                and dim >= dip - DI_MARGIN):
+            stop  = lvl * (1 + STOP_BEYOND)
+            setup = dict(dir='PUT', level=lvl, level_name=name, stop=stop,
+                         target=price - RR * (stop - price))
+    if setup is None:
+        return None, {}
+
+    day = df[df.index.date == now.date()]
+    d_hi, d_lo = float(day['High'].max()), float(day['Low'].min())
+    rpos  = (price - d_lo) / (d_hi - d_lo) if d_hi > d_lo else 0.5
+    chase = rpos if setup['dir'] == 'CALL' else 1.0 - rpos
+    opp   = 'PUT' if setup['dir'] == 'CALL' else 'CALL'
+    try:
+        exh = compute_reversal_risk(df, len(df) - 1, opp)['score']
+    except Exception:
+        exh = None
+    return setup, dict(chase=chase, adx=adx, exhaustion=exh, price=price)
+
+
+def get_live_signal(instrument, df, oi_zones, logger, now,
+                    or_high=None, or_low=None):
+    """LIVE entry signal for options_bot's pipeline — returns a signal dict or None.
+
+    Applies ONLY this engine's own entry conditions (time window, per-day cap,
+    chase guard). Everything downstream is deliberately left to options_bot's
+    existing, proven machinery: risk-cap sizing ladder, pre-order funds check,
+    regime/quality lot caps, the live chase gate, exchange SL-M placement,
+    trailing stop, never-progressed exit, checkpoint logic and JSONL logging.
+    No parallel order path is created.
+
+    NOTE ON EXITS: the shadow tracker simulates a level-based stop and a 2:1
+    target on the UNDERLYING. A live trade instead inherits the standard option
+    exit stack (25% premium stop, IV-scaled target, trailing, never-progressed).
+    Those are not equivalent -- the option stop is generally the wider of the
+    two -- so live results will diverge from the shadow P&L. Compare with that
+    in mind; do not expect the shadow numbers to reproduce.
+    """
+    if not (WINDOW_START <= now.time() <= WINDOW_END):
+        return None
+    if _live_count.get(instrument, 0) >= MAX_PER_DAY:
+        return None
+
+    setup, meta = _detect_setup(instrument, df, oi_zones, now, or_high, or_low)
+    if setup is None:
+        return None
+
+    if meta['chase'] > MAX_CHASE:
+        logger.info(
+            f"  [ANTICIP-LIVE] skip {setup['dir']} {instrument} "
+            f"{setup['level_name']}@{setup['level']:.0f}: chase_pos="
+            f"{meta['chase']:.2f} > {MAX_CHASE} — not anticipatory"
+        )
+        return None
+
+    _miro = _read_mirofish(instrument)
+    _mnote = 'n/a'
+    if _miro:
+        bull = setup['dir'] == 'CALL'
+        if (bull and _miro['lean'] == 'bullish') or (not bull and _miro['lean'] == 'bearish'):
+            _mnote = f"AGREES({_miro['lean']} {_miro['score']:.2f})"
+        elif (bull and _miro['lean'] == 'bearish') or (not bull and _miro['lean'] == 'bullish'):
+            _mnote = f"CONFLICTS({_miro['lean']} {_miro['score']:.2f})"
+        else:
+            _mnote = f"neutral({_miro['score']:.2f})"
+
+    _live_count[instrument] = _live_count.get(instrument, 0) + 1
+    logger.info(
+        f"  [ANTICIP-LIVE] ⚡ SIGNAL {setup['dir']} {instrument} | "
+        f"hold {setup['level_name']}@{setup['level']:.0f} | idx {meta['price']:.0f} | "
+        f"ADX={meta['adx']:.0f} chase={meta['chase']:.2f} "
+        f"exh={meta['exhaustion']} miro={_mnote} | "
+        f"level-stop {setup['stop']:.0f} (reference only — live uses option stop)"
+    )
+    return {
+        'type'      : setup['dir'],
+        'price'     : meta['price'],
+        'adx'       : meta['adx'],
+        'strength'  : 1,
+        'lots'      : 1,          # conservative: never request >1 on a new engine
+        'path'      : 'ANTICIP',
+        'chase_pos' : round(meta['chase'], 3),
+        'anticip_level'      : setup['level'],
+        'anticip_level_name' : setup['level_name'],
+        'anticip_exhaustion' : meta['exhaustion'],
+        'anticip_miro'       : _mnote,
+    }
 
 
 def evaluate_bar(instrument, df, oc, oi_zones, inst_cfg, logger, now,
