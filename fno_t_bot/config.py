@@ -26,7 +26,15 @@ BOT_NAME = "FnO_T_Bot"     # Futures & Options Trading Bot
 # ─── Trading Mode ─────────────────────────────────────────────────────────────
 # Global fallback. Per-instrument 'live_mode' in INSTRUMENT_STRATEGY overrides this.
 # Set True to paper-trade all; set False to use per-instrument live_mode flags.
-PAPER_TRADE_MODE = False   # Global flag — overridden per-instrument via live_mode below
+# PAPER MODE (Jul 31 2026) — user is withdrawing capital from the account.
+# True here is a GLOBAL kill-switch for real orders: options_bot sets
+#   self.live = (not config.PAPER_TRADE_MODE) and _inst_live
+# so this overrides every per-instrument live_mode AND the FORCE_*_LIVE
+# overrides below. No Fyers order can be placed while this is True; entries
+# and exits are simulated via Black-Scholes and still written to the trade
+# JSONL, so paper results keep accumulating normally.
+# Set back to False only when capital is restored and you intend to trade live.
+PAPER_TRADE_MODE = True    # <-- PAPER: no real orders
 
 # ─── Multi-Instrument Configuration ──────────────────────────────────────────
 # Lot sizes (confirmed Mar 2026):
