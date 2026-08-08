@@ -1226,7 +1226,16 @@ class TradingBot:
         Fires when price breaks above OR_high or below OR_low with:
           ADX ≥ per-day minimum | VWAP aligned | no CALL on Thu | gap context gate
         Once per day (_path_a_fired set by caller).
+
+        DISABLED Aug 7 2026 via PATH_A_ENABLED=False — stripped, not repaired.
+        Live record: 29 entries (incl. its A_HELD / ORB_HELD conversions),
+        -Rs3,907 net. Breakdown: only 17% (5/29) survived the 12:00 checkpoint
+        to become held runners (+Rs2,113/trade), while the other 83% bled
+        -Rs603/trade. That is a lottery with negative expectancy, and it was
+        the book's single largest source of loss.
         """
+        if not getattr(config, 'PATH_A_ENABLED', True):
+            return None
         if not self._or_ready or self._path_a_fired:
             return None
 

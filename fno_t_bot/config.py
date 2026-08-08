@@ -422,9 +422,36 @@ REGIME_CHOPPY_ADX_MAX       = 25.0   # ADX@11:00 below this = choppy day
 REGIME_TRENDING_ADX_MIN     = 28.0   # ADX@11:00 at/above this = trending day
 REGIME_CHOPPY_DAYS_NEEDED   = 2      # N choppy days in window → CHOPPY mode
 REGIME_CHOPPY_LOTS_CAP      = 1      # max lots in CHOPPY mode
-REGIME_CHOPPY_REV_SKIP      = True   # suppress REV entirely in CHOPPY mode
+# ── REV REGIME BLOCKS REMOVED (Aug 7 2026) ──────────────────────────────────
+# These two flags were switched off after they were shown to suppress the only
+# profitable engine in the book, in 98% of all observed sessions.
+#   Regime observed over 96 instrument-days: CHOPPY 94 (97.9%), MIXED 2 (2.1%).
+#   Last 20 trading days: 60/60 CHOPPY.
+#   With both skips True, REV could only fire in MIXED -> it has not fired
+#   since 2026-06-17, i.e. it was effectively deleted.
+# REV's own record, split by the very regimes these gates blocked:
+#   TRENDING_BULL  7 trades 4W/3L  +Rs5,516
+#   CHOPPY         6 trades 3W/3L    +Rs879
+# Both cohorts positive. Neither block is supported by REV's own data; they
+# were added in v1.3/v1.4 from a loss study that attributed losses to REV in
+# those regimes, but the full-book split contradicts it.
+# REV overall: 13 trades, 54% WR, +Rs6,395 (+Rs492/trade) -- the ONLY engine
+# with positive expectancy in 64 live trades.
+REGIME_CHOPPY_REV_SKIP      = False  # was True -- see above
 REGIME_CHOPPY_LATE_ORB_SKIP = True   # block late-window ORB in CHOPPY (theta trap on INSIDE days)
-REGIME_TRENDING_REV_SKIP    = True   # block REV in TRENDING regime (waning-ADX ≠ reversal in trend)
+REGIME_TRENDING_REV_SKIP    = False  # was True -- see above
+
+# ─── PATH-A (Opening Range Breakout) master switch ───────────────────────────
+# DISABLED Aug 7 2026 — stripped rather than repaired, per the full-book audit.
+# PATH-A incl. its A_HELD / ORB_HELD conversions: 29 entries, -Rs3,907 net.
+#   converted to held runner :  5 (17%)  3W/2L  +Rs10,564  (+Rs2,113/trade)
+#   did not convert          : 24 (83%)  5W/19L -Rs14,471  (-Rs603/trade)
+# The held runners produce the biggest single wins (incl. the book's best,
+# +Rs8,010) but at a 17% conversion rate they do not pay for the 83% that
+# bleed. It was simultaneously the primary engine and the largest loss source.
+# Re-enable only with evidence that the conversion rate or the non-converting
+# loss has structurally changed.
+PATH_A_ENABLED = False
 
 # ─── Rolling Signal Quality Gate ──────────────────────────────────────────────
 # Tracks last N live trades. WR + combined loss both must breach thresholds
@@ -500,7 +527,11 @@ MP_TRAP_TARGET_SPEND    = 3_000   # target ₹3k deployment per trade
 #
 # Set PATH_B_ENABLED = False to revert to EMA 9/21 fresh crossover.
 PATH_B_ENABLED         = True        # True = EMA crossover archived (don't revert)
-PATH_B_LIVE            = True        # ENABLED Jul 8 2026 (v1.6). Was False on a 37.5% WR /
+# DISABLED Aug 7 2026 — stripped, not repaired. Live record since it was
+# enabled Jul 8: 9 trades, 4W/5L, -Rs3,768 (-Rs419/trade). It never showed
+# positive expectancy in real trading. Set True only with new evidence.
+PATH_B_LIVE            = False
+_PATH_B_LIVE_OLD       = True        # ENABLED Jul 8 2026 (v1.6). Was False on a 37.5% WR /
                                      # -₹249k backtest — but that was BS-premium-priced
                                      # (Jun 12 lesson: BS sims distort materially — REV showed
                                      # -₹4.9k on BS vs +₹66k on real premiums) and predates the
