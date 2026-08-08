@@ -1335,7 +1335,16 @@ CHASE_GATE_EXEMPT_PATHS = ('REV',) # REV fades are anti-chase — never gate the
 # PAPER-ONLY (PATH_REV_LIVE=False) — logs [PATH-REV PAPER].  Set True after 30 trades.
 PATH_REV_ENABLED            = True    # enable reversal detection (logs paper signal)
 PATH_REV_LIVE               = True    # LIVE — deployed May 5 2026 after retroactive validation
-PATH_REV_START              = '12:00' # earliest fire time (after ORB window)
+# START was '12:00', a fixed outer-bound guess unrelated to the actual exhaustion
+# condition. Diagnostic (Aug 8 2026, causal replay w/ multi-day ADX warm-up,
+# 236 eligible days): 142/236 (60%) first crossed score>=3 BEFORE 12:00; of
+# those, 26 NEVER re-crossed 3 before PATH_REV_END (pure lost trades under the
+# old floor) and the other 116 fired a median 60min late for a coinflip
+# (49%) on entry price quality. '09:45' matches the "OR ready" boundary
+# already used elsewhere (PATH_A_START comment) -- the score gate itself
+# (needs morning ADX/DI peak + live exhaustion components) still does the
+# real gating; this floor only removes the arbitrary extra wait.
+PATH_REV_START              = '09:45' # earliest fire time (after OR forms, 6 bars)
 PATH_REV_END                = '13:30' # latest fire time (need runway to 14:30 force-close)
 PATH_REV_MIN_SCORE          = 3       # minimum score (0–6) to fire
 PATH_REV_MIN_MORNING_ADX    = 30      # morning must have had a real trend (ADX peak ≥ this)
@@ -1343,6 +1352,57 @@ PATH_REV_MIN_DI_SPREAD_PEAK = 12      # morning DI spread peak ≥ this (real di
 PATH_REV_IVSKEW_FLIP_PCT    = 4.0     # IVSkew must shift ≥ this % toward reversal direction
 PATH_REV_MAXPAIN_PROX_PCT   = 0.005   # within 0.5% of MaxPain → proximity bonus
 PATH_REV_ADX_WANE_RATIO     = 0.85    # ADX < peak × this = momentum waning
+
+# ─── PATH_TREND: Trend-Continuation Pullback Entry ───────────────────────────
+# Built Aug 8 2026 to fill the gap PATH_REV structurally cannot: REV only
+# fades exhaustion (needs ADX already peaked + waning), so it can never ride
+# a trend that is still building. TREND catches that regime instead.
+#
+# Opposite framing from every prior path on TWO counts:
+#   1. It qualifies on ADX RISING (not peaked) + DI spread WIDENING (not
+#      converging) -- an early, still-developing trend, not an exhausted one.
+#   2. Its OI/PCR filter is CONTINUATION-framed, the inverse of
+#      _get_oi_direction_bias()'s MaxPain-proximity ("snap back to the
+#      magnet") reversion framing: PCR should drift WITH the trend, and price
+#      should be moving AWAY from MaxPain (momentum beating the magnet).
+#      Because the global OI-BIAS gate's semantics are reversion-style, it is
+#      exempted for path=='TREND' (see options_bot.py) -- applying it would
+#      tend to reject exactly the continuation setups this path wants.
+#
+# Entry design directly targets the PATH-A failure mode (avg chase_pos
+# 0.96-0.98 on that engine's real trades): qualify on the breakout, but only
+# FIRE on a pullback (25-70% retracement) + a real swing low/high + an ADX
+# uptick + a real-bodied candle -- i.e. buy the dip in the trend, not the
+# breakout itself.
+#
+# Backtest (Aug 8 2026, full causal bar-by-bar replay, all 3 instruments, all
+# available history, proxy P&L since no historical option-premium series
+# exists -- NOT the live premium-based exit stack, which this path shares
+# with every other path via enter_trade()):
+#   27 trades, 40.7% WR, avg chase_pos 0.41 (vs PATH-A's 0.96-0.98).
+#   Trades that ever went favorable: 19, 58% WR, net positive.
+#   Trades that never went favorable (false starts, straight to stop): 8,
+#   0% WR -- this bucket is the entire deficit. First-half/second-half split
+#   was inconsistent (small-sample, 27 trades over 14 months) -- NOT deployed
+#   on backtest confidence. Deployed to paper trading instead (real exit
+#   stack, zero capital risk under PAPER_TRADE_MODE) as the actual forward
+#   validation step, per user direction Aug 8 2026.
+PATH_TREND_ENABLED       = True
+PATH_TREND_LIVE          = True     # paper-trades directly -- no separate shadow stage needed
+PATH_TREND_START         = '09:45'  # after OR forms (6 bars)
+PATH_TREND_END           = '13:00'  # leave >=90min runway to 14:30 force-close
+PATH_TREND_MIN_ADX       = 22       # lower than REV's 30 -- catches the trend while building
+PATH_TREND_ADX_RISE_BARS = 3        # compare ADX to this many bars ago
+PATH_TREND_ADX_RISE_MIN  = 2.0      # must have risen by at least this much
+PATH_TREND_MIN_DI_SPREAD = 10
+PATH_TREND_DI_WIDEN_BARS = 3
+PATH_TREND_PULLBACK_MIN  = 0.25     # retracement fraction of (extreme - OR level)
+PATH_TREND_PULLBACK_MAX  = 0.70
+PATH_TREND_ADX_FLOOR     = 17       # trend invalidated if ADX drops below this during pullback
+PATH_TREND_BODY_ATR_MIN  = 0.15     # resumption candle body >= this x ATR (filters doji noise)
+PATH_TREND_OI_DRIFT_THRESH = 0.05   # PCR drift threshold (same magnitude as OI_PCR_DRIFT_THRESHOLD)
+PATH_TREND_OI_PCR_CALL_MAX = 1.05   # PCR above this contradicts a CALL continuation
+PATH_TREND_OI_PCR_PUT_MIN  = 0.95   # PCR below this contradicts a PUT continuation
 
 # ─── Post-11 Scorer Thresholds ───────────────────────────────────────────────
 # Aggregate score below POST11_SCORE_SKIP_MIN → skip entry (quality too low).

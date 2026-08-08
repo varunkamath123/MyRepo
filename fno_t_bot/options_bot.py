@@ -25,6 +25,7 @@ import pandas as pd
 import pytz
 from scipy.stats import norm
 from ta.trend import ADXIndicator, EMAIndicator
+from ta.volatility import AverageTrueRange
 from ta.momentum import RSIIndicator
 
 import config
@@ -250,6 +251,13 @@ class TradingBot:
         self._path_rev_fired    = False  # one PATH_REV entry per day
         self._ivskew_hist       = []    # [(ts_float, ivskew), …] for 30-min drift
         self._skip_bnf_today    = False  # set daily: Monday before BNF monthly expiry
+
+        # ── PATH_TREND (trend-continuation pullback) state — reset daily ──────
+        self._trend_qual_dir      = None   # 'CALL'/'PUT' once qualification met, else None
+        self._trend_qual_time     = None   # HH:MM qualification first fired
+        self._trend_leg_extreme   = None   # running extreme of the leg since qualification
+        self._trend_anchor        = None   # OR level broken to trigger qualification
+        self._path_trend_fired    = False  # one PATH_TREND entry per day
         self._st15m             = None   # cached 15m SuperTrend (+1/-1) from get_htf_context
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -565,6 +573,9 @@ class TradingBot:
             high=df['High'], low=df['Low'], close=df['Close'], window=14
         )
         df['ADX']      = adx.adx()
+        df['ATR']      = AverageTrueRange(   # used by PATH_TREND (chase-low pullback sizing)
+            high=df['High'], low=df['Low'], close=df['Close'], window=14
+        ).average_true_range()
         df['DI_plus']  = adx.adx_pos()   # +DI: bullish directional strength
         df['DI_minus'] = adx.adx_neg()   # -DI: bearish directional strength
         df['RSI']     = RSIIndicator(df['Close'], 14).rsi()
@@ -3494,6 +3505,201 @@ class TradingBot:
             'dynamic_or' : False,
         }
 
+    def _update_trend_qualification(self, df: 'pd.DataFrame', now: 'datetime') -> None:
+        """Track PATH_TREND qualification: ADX rising + DI spread widening + OR
+        break in that direction (a trend still BUILDING -- the opposite state
+        from PATH_REV, which requires ADX already peaked and now waning).
+        Called every scan tick once the OR is ready. Feeds get_path_trend_signal.
+        """
+        if self._path_trend_fired or not self._or_ready:
+            return
+        _rb = getattr(config, 'PATH_TREND_ADX_RISE_BARS', 3)
+        _wb = getattr(config, 'PATH_TREND_DI_WIDEN_BARS', 3)
+        if len(df) <= max(_rb, _wb):
+            return
+        row = df.iloc[-1]
+        adx = float(row.get('ADX', 0.0) or 0.0)
+        dip = float(row.get('DI_plus', 0.0) or 0.0)
+        dim = float(row.get('DI_minus', 0.0) or 0.0)
+        px  = float(row['Close'])
+        spread = abs(dip - dim)
+
+        if self._trend_qual_dir is None:
+            adx_prev    = float(df['ADX'].iloc[-(_rb + 1)] or 0.0)
+            dip_prev    = float(df['DI_plus'].iloc[-(_wb + 1)] or 0.0)
+            dim_prev    = float(df['DI_minus'].iloc[-(_wb + 1)] or 0.0)
+            spread_prev = abs(dip_prev - dim_prev)
+            cand_dir    = 'CALL' if dip > dim else 'PUT'
+            or_break    = (px > self._or_high) if cand_dir == 'CALL' else (px < self._or_low)
+
+            if (adx >= getattr(config, 'PATH_TREND_MIN_ADX', 22)
+                    and (adx - adx_prev) >= getattr(config, 'PATH_TREND_ADX_RISE_MIN', 2.0)
+                    and spread >= getattr(config, 'PATH_TREND_MIN_DI_SPREAD', 10)
+                    and (spread - spread_prev) >= 0
+                    and or_break):
+                self._trend_qual_dir    = cand_dir
+                self._trend_qual_time   = now.strftime('%H:%M')
+                self._trend_leg_extreme = px
+                self._trend_anchor      = self._or_high if cand_dir == 'CALL' else self._or_low
+                self.logger.info(
+                    f"  [PATH-TREND-QUAL] {self.instrument} {cand_dir} @ {self._trend_qual_time} "
+                    f"| ADX {adx_prev:.1f}→{adx:.1f} | DI-spread {spread_prev:.1f}→{spread:.1f} "
+                    f"| anchor={self._trend_anchor:,.1f}"
+                )
+            return
+
+        # Already qualified -- invalidate on ADX collapse or DI flip, else
+        # extend the leg extreme so get_path_trend_signal can measure pullback %.
+        _floor = getattr(config, 'PATH_TREND_ADX_FLOOR', 17)
+        _still_aligned = (dip > dim) if self._trend_qual_dir == 'CALL' else (dim > dip)
+        if adx < _floor or not _still_aligned:
+            self.logger.debug(
+                f"  [PATH-TREND-QUAL] {self.instrument}: invalidated "
+                f"(ADX={adx:.1f}, aligned={_still_aligned})"
+            )
+            self._trend_qual_dir    = None
+            self._trend_leg_extreme = None
+            self._trend_anchor      = None
+            return
+
+        if self._trend_qual_dir == 'CALL':
+            self._trend_leg_extreme = max(self._trend_leg_extreme, px)
+        else:
+            self._trend_leg_extreme = min(self._trend_leg_extreme, px)
+
+    def get_path_trend_signal(self, df: 'pd.DataFrame', oc: dict,
+                              now: 'datetime') -> 'dict | None':
+        """PATH_TREND: trend-continuation pullback entry.
+
+        Fires when a still-building trend (see _update_trend_qualification)
+        pulls back 25-70% toward the OR level and resumes on a real swing
+        structure (higher-low/lower-high) + an ADX uptick + a real-bodied
+        candle -- filters single-bar noise, which live-fired 46/113 false
+        starts in backtest before this filter was added. Enters on the dip
+        within the trend, not the breakout -- directly targets PATH-A's
+        historical chase_pos 0.96-0.98 failure mode.
+
+        OI/PCR filter is CONTINUATION-framed: the inverse of
+        _get_oi_direction_bias()'s MaxPain-proximity ("snap back to the
+        magnet") reversion framing. Soft gate -- only blocks when OI data is
+        present AND net-contradicts (never blocks on missing data).
+        """
+        if not getattr(config, 'PATH_TREND_ENABLED', False):
+            return None
+        if self._path_trend_fired or self._trend_qual_dir is None:
+            return None
+        if len(df) < 2:
+            return None
+
+        _start = dtime(*[int(x) for x in
+                         getattr(config, 'PATH_TREND_START', '09:45').split(':')])
+        _end   = dtime(*[int(x) for x in
+                         getattr(config, 'PATH_TREND_END',   '13:00').split(':')])
+        if not (_start <= now.time() <= _end):
+            return None
+
+        trend_dir = self._trend_qual_dir
+        anchor    = self._trend_anchor
+        extreme   = self._trend_leg_extreme
+        if anchor is None or extreme is None:
+            return None
+
+        row      = df.iloc[-1]
+        prev     = df.iloc[-2]
+        px       = float(row['Close'])
+        op       = float(row['Open'])
+        adx      = float(row.get('ADX', 0.0) or 0.0)
+        adx_prev = float(prev.get('ADX', 0.0) or 0.0)
+        atr      = float(row.get('ATR', 0.0) or 0.0)
+        if atr <= 0:
+            return None
+
+        leg_range = (extreme - anchor) if trend_dir == 'CALL' else (anchor - extreme)
+        if leg_range <= 0:
+            return None
+        retr = (((extreme - px) / leg_range) if trend_dir == 'CALL'
+                else ((px - extreme) / leg_range))
+
+        _pmin = getattr(config, 'PATH_TREND_PULLBACK_MIN', 0.25)
+        _pmax = getattr(config, 'PATH_TREND_PULLBACK_MAX', 0.70)
+        if not (_pmin <= retr <= _pmax):
+            return None
+
+        _body_min = getattr(config, 'PATH_TREND_BODY_ATR_MIN', 0.15) * atr
+        if trend_dir == 'CALL':
+            resumed = (float(row['Low']) > float(prev['Low']) and px > op
+                       and adx > adx_prev and (px - op) >= _body_min)
+        else:
+            resumed = (float(row['High']) < float(prev['High']) and px < op
+                       and adx > adx_prev and (op - px) >= _body_min)
+        if not resumed:
+            return None
+
+        # ── OI/PCR continuation filter (inverse of REV's reversion framing) ──
+        _oi_reasons = []
+        _oi_score   = 0
+        _oi_n       = 0
+        pcr = oc.get('pcr')
+        if pcr is not None:
+            _oi_n += 1
+            _call_max = getattr(config, 'PATH_TREND_OI_PCR_CALL_MAX', 1.05)
+            _put_min  = getattr(config, 'PATH_TREND_OI_PCR_PUT_MIN',  0.95)
+            if trend_dir == 'CALL':
+                _oi_score += 1 if pcr <= _call_max else -1
+            else:
+                _oi_score += 1 if pcr >= _put_min else -1
+            _oi_reasons.append(f'PCR={pcr:.2f}')
+
+        try:
+            import nse_oi as _nse_oi_m
+            _drift = _nse_oi_m.get_pcr_drift(
+                self.instrument, getattr(config, 'OI_PCR_DRIFT_LOOKBACK_MINS', 30)
+            )
+        except Exception:
+            _drift = None
+        if _drift is not None:
+            _oi_n += 1
+            _thr = getattr(config, 'PATH_TREND_OI_DRIFT_THRESH', 0.05)
+            if trend_dir == 'CALL':
+                _oi_score += 1 if _drift <= -_thr else (-1 if _drift >= _thr else 0)
+            else:
+                _oi_score += 1 if _drift >= _thr else (-1 if _drift <= -_thr else 0)
+            _oi_reasons.append(f'PCR-drift={_drift:+.3f}')
+
+        mp = oc.get('max_pain')
+        if mp and mp > 0:
+            _oi_n += 1
+            _dist = (px - mp) if trend_dir == 'CALL' else (mp - px)
+            _oi_score += 1 if _dist > 0 else -1
+            _oi_reasons.append(f'MaxPain-dist={_dist:+.1f}')
+
+        if _oi_n > 0 and _oi_score < 0:
+            self.logger.info(
+                f"  [PATH-TREND] {self.instrument} {trend_dir}: OI contradicts "
+                f"continuation ({', '.join(_oi_reasons)}) — skipped"
+            )
+            return None
+
+        _oi_str = ', '.join(_oi_reasons) if _oi_reasons else 'no OI data'
+        self.logger.info(
+            f"  [PATH-TREND] {self.instrument} {trend_dir} FIRE @ {now.strftime('%H:%M')} "
+            f"| qualified {self._trend_qual_time} | retrace={retr*100:.0f}% "
+            f"| ADX {adx_prev:.1f}→{adx:.1f} | {_oi_str}"
+        )
+
+        return {
+            'type'       : trend_dir,
+            'price'      : px,
+            'adx'        : float(adx),
+            'strength'   : 1,      # always 1 lot — unvalidated pattern
+            'lots'       : 1,
+            'path'       : 'TREND',
+            'otm_strikes': 0,
+            'otm_reason' : f'Trend pullback {retr*100:.0f}% | {_oi_str}',
+            'gap_type'   : self._gap_type,
+            'dynamic_or' : False,
+        }
+
     def _is_monday_before_bnf_monthly_expiry(self, today) -> bool:
         """Return True on the Monday before BNF's last-Tuesday-of-month expiry.
         On that day MIN_DAYS_TO_EXPIRY=2 rolls forward to next month (~DTE 29),
@@ -3578,6 +3784,11 @@ class TradingBot:
             self._morning_di_peak   = 0.0
             self._path_rev_fired    = False
             self._ivskew_hist       = []
+            self._trend_qual_dir      = None
+            self._trend_qual_time     = None
+            self._trend_leg_extreme   = None
+            self._trend_anchor        = None
+            self._path_trend_fired    = False
 
             # ── BNF Monday-before-monthly-expiry skip ─────────────────────
             self._skip_bnf_today = self._is_monday_before_bnf_monthly_expiry(today)
@@ -4256,6 +4467,9 @@ class TradingBot:
                     if _orb_window:
                         self._update_morning_trend(df)
 
+                if getattr(config, 'PATH_TREND_ENABLED', False):
+                    self._update_trend_qualification(df, now)
+
                 can_enter = (
                     _in_window
                     and len(self.positions) < config.MAX_CONCURRENT_POSITIONS
@@ -4792,6 +5006,24 @@ class TradingBot:
                                 )
                                 self._path_rev_fired = True   # log once per day
 
+                    # ── PATH_TREND: trend-continuation pullback entry ────────────
+                    # Fills the gap PATH_REV structurally cannot: REV only fades an
+                    # already-exhausted trend, so it can never ride one that is
+                    # still building. Runs independently of _main_window (own gate).
+                    # PATH_TREND_LIVE trades directly (no separate shadow stage) --
+                    # PAPER_TRADE_MODE is already the safety net, so a real paper
+                    # position through the real exit stack is the actual forward
+                    # validation, not a log-only shadow entry.
+                    if (signal is None
+                            and getattr(config, 'PATH_TREND_ENABLED', False)
+                            and not self._path_trend_fired
+                            and not self.positions):
+                        _trend_sig = self.get_path_trend_signal(df, oc, now)
+                        if _trend_sig:
+                            if getattr(config, 'PATH_TREND_LIVE', False):
+                                signal = _trend_sig
+                            self._path_trend_fired = True   # one shot per day either way
+
                     # ── Anticipation engine (LIVE) — enter-at-level ──────────────
                     # Placed LAST in the cascade on purpose: it only fires when no
                     # proven path (A / B / C / D / E / REV) produced a signal, so it
@@ -5044,7 +5276,16 @@ class TradingBot:
                         #   NEUTRAL → allowed normally; blocked on days where
                         #             oi_confirm_required=True (Tue, Wed)
                         #   CONFIRM → cleanest entry; no restriction
-                        if signal and getattr(config, 'OI_DIRECTION_BIAS_ENABLED', True):
+                        #
+                        # PATH_TREND exemption: this gate's semantics are
+                        # reversion-framed (MaxPain proximity = "snap back to the
+                        # magnet"), the opposite of what a continuation trade
+                        # wants. PATH_TREND already runs its own inverted OI/PCR
+                        # filter inside get_path_trend_signal() -- applying this
+                        # one on top would tend to reject exactly the setups it's
+                        # designed to take (price moving away from MaxPain).
+                        if (signal and signal.get('path') != 'TREND'
+                                and getattr(config, 'OI_DIRECTION_BIAS_ENABLED', True)):
                             try:
                                 _oi_bias, _oi_reason = self._get_oi_direction_bias(
                                     signal['type'], signal['price'], oc
