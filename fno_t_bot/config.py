@@ -531,7 +531,7 @@ PATH_B_ENABLED         = True        # True = EMA crossover archived (don't reve
 # enabled Jul 8: 9 trades, 4W/5L, -Rs3,768 (-Rs419/trade). It never showed
 # positive expectancy in real trading. Set True only with new evidence.
 PATH_B_LIVE            = False
-_PATH_B_LIVE_OLD       = True        # ENABLED Jul 8 2026 (v1.6). Was False on a 37.5% WR /
+                                     # (history) enabled Jul 8 2026 in v1.6 after a 37.5% WR /
                                      # -₹249k backtest — but that was BS-premium-priced
                                      # (Jun 12 lesson: BS sims distort materially — REV showed
                                      # -₹4.9k on BS vs +₹66k on real premiums) and predates the
