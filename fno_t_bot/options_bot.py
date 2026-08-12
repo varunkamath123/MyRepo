@@ -3626,10 +3626,16 @@ class TradingBot:
         retr = (((extreme - px) / leg_range) if trend_dir == 'CALL'
                 else ((px - extreme) / leg_range))
 
-        _pmin = getattr(config, 'PATH_TREND_PULLBACK_MIN', 0.25)
-        _pmax = getattr(config, 'PATH_TREND_PULLBACK_MAX', 0.70)
-        if not (_pmin <= retr <= _pmax):
-            return None
+        # Retrace band gate RETIRED Aug 12 2026 (user directive). It required a
+        # 25-70% pullback before entering, which a clean one-way trend never
+        # offers -- the extreme keeps extending, so retr stays pinned at 0 by
+        # construction. Aug 12 evidence: NIFTY and SENSEX both qualified, then
+        # ground down 106 / 329 pts with the engine sitting out; "retrace 0%"
+        # was the dominant blocker on 10 and 13 bars respectively.
+        # retr is still computed and LOGGED (below) as telemetry so entry
+        # quality vs retrace level stays measurable for later calibration.
+        # The chase gate remains the anti-chase safety net -- deliberately kept,
+        # so entries at the literal extreme (chase_pos > 0.93) are still blocked.
 
         _body_min = getattr(config, 'PATH_TREND_BODY_ATR_MIN', 0.15) * atr
         if trend_dir == 'CALL':
@@ -4550,7 +4556,11 @@ class TradingBot:
                 # position is held.  reversal_scout has its own per-bar dedup.
                 # Window: same START as vX but capped at 13:00 (PATH_F_ENTRY_END) so
                 # OTM options (2 strikes out) have ≥90 min runway to force-close.
-                if _path_f_in_window:
+                # Path F / reversal_scout STRIPPED Aug 12 2026 (bare-bones):
+                # isolated Rs10k paper pool, no code path to enter_trade().
+                # Backtested 47 trades / 34% WR / -Rs30,300 — verdict was
+                # already 'do not deploy'. Restore via PATH_F_ENABLED=True.
+                if _path_f_in_window and getattr(config, 'PATH_F_ENABLED', False):
                     try:
                         reversal_scout.evaluate_bar(
                             instrument     = self.instrument,
@@ -4575,23 +4585,26 @@ class TradingBot:
                 # momentum (ADX + VWAP + HTF) — no EMA cross required.
                 # Window: 10:00–13:30 (PATH_G_ENTRY_END); wall breaks need 60+ min
                 # follow-through before close. Own capital pool (₹10k), own dedup.
-                try:
-                    breakout_scout.evaluate_bar(
-                        instrument     = self.instrument,
-                        df             = df,
-                        htf            = htf,
-                        oi_zones       = self._oi_zones,
-                        inst_cfg       = self.inst_cfg,
-                        hv             = hv,
-                        logger         = self.logger,
-                        now            = now,
-                        in_window      = _in_window,
-                        days_to_expiry = config.DAYS_TO_EXPIRY,
-                    )
-                except Exception as _pe_exc:
-                    self.logger.warning(
-                        f"  [PATH-G] Breakout scout error: {_pe_exc}"
-                    )
+                # breakout_scout STRIPPED Aug 12 2026 (bare-bones): third
+                # isolated Rs10k paper pool, also with no path to the real book.
+                if getattr(config, 'BREAKOUT_SCOUT_ENABLED', False):
+                    try:
+                        breakout_scout.evaluate_bar(
+                            instrument     = self.instrument,
+                            df             = df,
+                            htf            = htf,
+                            oi_zones       = self._oi_zones,
+                            inst_cfg       = self.inst_cfg,
+                            hv             = hv,
+                            logger         = self.logger,
+                            now            = now,
+                            in_window      = _in_window,
+                            days_to_expiry = config.DAYS_TO_EXPIRY,
+                        )
+                    except Exception as _pe_exc:
+                        self.logger.warning(
+                            f"  [PATH-G] Breakout scout error: {_pe_exc}"
+                        )
 
                 # ── Anticipation Scout (SHADOW) — enter-at-level, before the move
                 # The philosophy-shift engine: logs would-be anticipatory entries
@@ -4957,11 +4970,19 @@ class TradingBot:
                             if signal:
                                 self._path_b_fired = True
 
-                    # ── Path C / Path D fallback (EMA crossover archived in get_signal)
-                    # Path C (CONT): EMA spread widening 3 bars + ADX ≥ 35 + 12:00+
-                    # Path D (ST_FLIP): 5m SuperTrend direction flip + ADX + VWAP
-                    # Both independent of Path B — still valid fallback signals.
-                    if signal is None and _main_window:
+                    # ── Path C / Path D / vX fallback — STRIPPED Aug 12 2026 ────────
+                    # get_signal() hosts three things, and all three are now dead or
+                    # unwanted:
+                    #   * vX (EMA position + ADX + VWAP) — LIVE with no enable flag of
+                    #     its own, 0 trades in ~4 months, yet sat FIRST in this cascade
+                    #     and would silently pre-empt REV/TREND on any bar it did fire.
+                    #     That is pure downside: no demonstrated edge, real interception
+                    #     risk. It also emitted 18,113 [vX-SKIP] lines across 76 days.
+                    #   * Path C (CONT) and Path D (ST_FLIP) — both PATH_*_ENABLED=False
+                    #     since Apr 2026, 0 trades ever recorded.
+                    # Restore by setting VX_PATH_ENABLED=True.
+                    if (signal is None and _main_window
+                            and getattr(config, 'VX_PATH_ENABLED', False)):
                         signal = self.get_signal(df)
 
                     # ── Path E: HTF Trend Continuation (last resort) ─────────────
@@ -5028,7 +5049,21 @@ class TradingBot:
                         if _trend_sig:
                             if getattr(config, 'PATH_TREND_LIVE', False):
                                 signal = _trend_sig
-                            self._path_trend_fired = True   # one shot per day either way
+                            else:
+                                # Shadow/log-only mode: nothing downstream will
+                                # consume it, so burn the daily shot here.
+                                self._path_trend_fired = True
+                            # NOTE (Aug 12): when LIVE, the daily one-shot is NOT
+                            # burned here -- it is set only after the trade actually
+                            # enters (see enter_trade call site). Burning it at
+                            # signal-generation time meant a signal killed later by
+                            # the chase gate (which runs much further downstream)
+                            # consumed the day's only attempt, so the engine went
+                            # quiet after a *blocked* entry and never got to take a
+                            # better-priced one later in the session. This mattered
+                            # once the retrace band was retired: TREND now fires on
+                            # the first resumption candle, which is deepest into the
+                            # extreme and most likely to be chase-blocked.
 
                     # ── Anticipation engine (LIVE) — enter-at-level ──────────────
                     # Placed LAST in the cascade on purpose: it only fires when no
@@ -5063,11 +5098,21 @@ class TradingBot:
                     # Gate: ADX ≥ tuesday_call_adx_min AND DI+ dominance ≥ tuesday_call_di_spread.
                     # PATH_REV exempt: reversal signals fire when ADX is waning + DI just
                     # crossing — applying continuation-CALL criteria would always block them.
+                    #
+                    # Aug 12 2026 (bare-bones pass): the exempt list is now config-driven.
+                    # These Tuesday gates were the single largest real blocker in the logs
+                    # (309 hard blocks over 13 days). REV was already exempt; PATH_TREND is
+                    # now exempt too, because it carries its own strictly stronger trend
+                    # evidence -- an ADX floor, a multi-bar ADX *rise*, a DI-spread floor
+                    # AND DI widening, verified live before it will even arm. Re-checking a
+                    # weaker single-bar ADX/DI threshold on top only removes trades.
+                    _TUE_EXEMPT_PATHS = getattr(
+                        config, 'TUESDAY_GATE_EXEMPT_PATHS', ('REV', 'TREND'))
                     if (signal
                             and self.skip_tuesday
                             and now.weekday() == 1
                             and signal['type'] == 'CALL'
-                            and signal.get('path') != 'REV'):
+                            and signal.get('path') not in _TUE_EXEMPT_PATHS):
                         _sig_adx = signal.get('adx', 0)
                         _dip_val = df['DI_plus'].iloc[-1]  if 'DI_plus'  in df.columns else float('nan')
                         _dim_val = df['DI_minus'].iloc[-1] if 'DI_minus' in df.columns else float('nan')
@@ -5103,7 +5148,7 @@ class TradingBot:
                             and self.skip_tuesday
                             and now.weekday() == 1
                             and signal['type'] == 'PUT'
-                            and signal.get('path') != 'REV'):
+                            and signal.get('path') not in _TUE_EXEMPT_PATHS):
                         _sig_adx = signal.get('adx', 0)
                         # DI spread from latest bar
                         _dip_val = df['DI_plus'].iloc[-1]  if 'DI_plus'  in df.columns else float('nan')
@@ -5173,7 +5218,12 @@ class TradingBot:
                                 getattr(config, 'QUALITY_GATE_ENABLED', True)
                                 and self._quality_state == 'REDUCED'):
                             _lots = min(_lots, 1)
-                            if signal.get('path') == 'REV':
+                            # Aug 12: flag-gated, matching the CHOPPY-regime fix. This is
+                            # the same shape as the bug found Aug 11 -- an unconditional
+                            # REV kill that no flag could reach. It has fired 0 times in
+                            # 392 log files, so this is pre-emptive, not a live fix.
+                            if (signal.get('path') == 'REV'
+                                    and getattr(config, 'QUALITY_GATE_REV_SKIP', True)):
                                 self.logger.info(
                                     f"  [QUALITY] {self.instrument}: REDUCED — REV blocked"
                                 )
@@ -5474,7 +5524,12 @@ class TradingBot:
                             # Only fires for Path A ORB signals at or after 11:00.
                             # Re-entry signals are also evaluated (they fire post-11 by
                             # definition — PATH_A_REENTRY_CUTOFF=13:00).
-                            if signal and signal.get('path') == 'A' and now.time() >= dtime(11, 0):
+                            # Also dead by construction: gated on path=='A', and PATH_A
+                            # has been disabled since Aug 7. Flag kept so the intent is
+                            # explicit rather than incidental.
+                            if (signal and getattr(config, 'POST11_SCORER_ENABLED', True)
+                                    and signal.get('path') == 'A'
+                                    and now.time() >= dtime(11, 0)):
                                 try:
                                     _p11 = post11_scorer.score(
                                         signal_type = signal['type'],
@@ -5621,6 +5676,11 @@ class TradingBot:
                                     f"quality={self._quality_state}"
                                 )
                                 signal['atm_iv'] = oc.get('atm_iv')   # IV-scaled target
+                                if signal.get('path') == 'TREND':
+                                    # Burn PATH_TREND's daily one-shot only on a real
+                                    # entry, so a chase-blocked signal earlier in the
+                                    # session does not silence the engine for the day.
+                                    self._path_trend_fired = True
                                 self.enter_trade(signal, hv, lots=_lots)
                                 self.enter_challenger_trade(signal, hv, oc, lots=_lots)
 
