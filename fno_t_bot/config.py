@@ -1455,6 +1455,31 @@ UNIFIED_SCORE_THRESHOLD = 55     # minimum score to enter (0-100)
 # lunchtime-drift breakouts fail; demand extra quality there. Other bands: no
 # offset (early window 50% WR, noon REV is the top live earner — leave alone).
 UNIFIED_BAND_THRESHOLD_OFFSET = {'11:00': 5}
+# Per-path threshold override. REV is a FADE engine, and UNIFIED's rubric is
+# trend-alignment weighted: in the 12:00 band (where every REV trade has ever
+# fired) 65 of 100 points come from or_breakout/or_thrust/di_align/st5/st15/
+# ema/vwap/momentum -- components a signal that fades an exhausted trend
+# structurally cannot earn. Only adx+oi+exhaustion (35 pts) are genuinely
+# winnable. Demanding 55 asks REV to score near-perfect on a rubric built
+# against it, which is why it went 0-for-6 across Aug 10-12 while qualifying
+# on its own 3/3 score every time.
+#
+# NOT an exemption -- UNIFIED demonstrably discriminates for REV, it is just
+# offset. Replay of REV's own real historical trades (5 of 13 recoverable;
+# the other 8 sit in a June 5-min data gap, see below):
+#     winners: 55, 52, 48   losers: 33, 28
+# Clean separation, 15-pt gap, zero overlap. Exempting REV would have thrown
+# away a filter that correctly caught BOTH losers. Threshold 40 sits mid-gap:
+# keeps all 3 winners (+Rs8,323), still blocks both losers (-Rs1,690 avoided)
+# vs +Rs6,633 actually realised ungated. Independent sanity check: the one
+# rigorously-replayed recent case (Aug 11 BANKNIFTY, score 26) stays BLOCKED
+# at 40 -- this is a recalibration, not a rubber stamp.
+#
+# CAVEAT: n=5. The June 2026 5-min archives for NIFTY/BANKNIFTY are missing
+# (banknifty_5min stops at 20260529), so 8 of REV's 13 real trades could not
+# be replayed. Revisit this number once that gap is patched -- the structural
+# argument above holds regardless, but the exact value 40 is fitted to 5 points.
+UNIFIED_PATH_THRESHOLD = {'REV': 40}
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_DIRECTORY    = "logs"

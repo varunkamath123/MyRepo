@@ -5347,7 +5347,13 @@ class TradingBot:
                                     morning_adx_peak = self._morning_adx_peak,
                                     morning_dir      = self._morning_dir,
                                 )
-                                _ub_thr  = getattr(config, 'UNIFIED_SCORE_THRESHOLD', 55)
+                                # Per-path base: fade engines (REV) score on a
+                                # trend-alignment rubric they structurally fight —
+                                # see UNIFIED_PATH_THRESHOLD in config.
+                                _ub_thr = getattr(
+                                    config, 'UNIFIED_PATH_THRESHOLD', {}
+                                ).get(signal.get('path', ''),
+                                      getattr(config, 'UNIFIED_SCORE_THRESHOLD', 55))
                                 # Per-band offset: 11:00-12:00 lunchtime entries ran
                                 # 0/4 (-₹7,420) live — demand extra quality there.
                                 _ub_thr += getattr(
