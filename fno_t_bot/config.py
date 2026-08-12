@@ -1403,6 +1403,15 @@ PATH_TREND_BODY_ATR_MIN  = 0.15     # resumption candle body >= this x ATR (filt
 PATH_TREND_OI_DRIFT_THRESH = 0.05   # PCR drift threshold (same magnitude as OI_PCR_DRIFT_THRESHOLD)
 PATH_TREND_OI_PCR_CALL_MAX = 1.05   # PCR above this contradicts a CALL continuation
 PATH_TREND_OI_PCR_PUT_MIN  = 0.95   # PCR below this contradicts a PUT continuation
+# Trail: was silently inheriting TRAILING_ACTIVATION/TRAILING_DISTANCE (tuned for
+# REV/RECLAIM's shorter-lived fades) via the generic fallthrough branch in
+# check_exit_position. Given its own named config now so it can be tuned
+# independently once more than one live sample exists -- values currently
+# copied as-is (Aug 12 2026), not yet retuned. First live trade (Aug 11 NIFTY
+# PUT) peaked 12.83%, barely over the 12% arm floor, and gave back to 2.37% --
+# worth watching, not yet enough evidence to change.
+PATH_TREND_TRAIL_ACT       = TRAILING_ACTIVATION
+PATH_TREND_TRAIL_DIST      = TRAILING_DISTANCE
 
 # ─── Post-11 Scorer Thresholds ───────────────────────────────────────────────
 # Aggregate score below POST11_SCORE_SKIP_MIN → skip entry (quality too low).

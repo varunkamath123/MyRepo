@@ -3009,6 +3009,8 @@ class TradingBot:
                           if _entry_dt else datetime.now(IST).strftime('%a'))
             _dcfg_pos  = self._get_day_cfg(_entry_dow)
             _trail_dist = (_dcfg_pos['trail_dist'] if _path == 'A'
+                           else getattr(config, 'PATH_TREND_TRAIL_DIST', config.TRAILING_DISTANCE)
+                           if _path == 'TREND'
                            else config.TRAILING_DISTANCE)
             if _path == 'A':
                 # Dynamic OR uses tighter stop — market has settled by 10:00+
@@ -3040,10 +3042,14 @@ class TradingBot:
                     # showed 12% trail fired prematurely on transient dips (Jun 1 BNF: exited
                     # at +₹1.2k vs +₹4.3k at force-close). REV/RECLAIM use TRAILING_ACTIVATION
                     # (12%) since they are shorter-lived moves where earlier protection helps.
-                    _trail_act = (getattr(config, 'TRAIL_ACT_ORB_HELD',
-                                          config.TRAILING_ACTIVATION)
-                                  if _path == 'A_HELD'
-                                  else config.TRAILING_ACTIVATION)
+                    if _path == 'A_HELD':
+                        _trail_act = getattr(config, 'TRAIL_ACT_ORB_HELD',
+                                              config.TRAILING_ACTIVATION)
+                    elif _path == 'TREND':
+                        _trail_act = getattr(config, 'PATH_TREND_TRAIL_ACT',
+                                              config.TRAILING_ACTIVATION)
+                    else:
+                        _trail_act = config.TRAILING_ACTIVATION
 
             exit_reason = None
             if _sl_triggered:
@@ -5152,7 +5158,8 @@ class TradingBot:
                                 getattr(config, 'REGIME_DETECTION_ENABLED', True)
                                 and self._regime == 'CHOPPY'):
                             _lots = min(_lots, getattr(config, 'REGIME_CHOPPY_LOTS_CAP', 1))
-                            if signal.get('path') == 'REV':
+                            if (signal.get('path') == 'REV'
+                                    and getattr(config, 'REGIME_CHOPPY_REV_SKIP', True)):
                                 self.logger.info(
                                     f"  [REGIME] {self.instrument}: CHOPPY — REV blocked"
                                 )
