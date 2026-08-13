@@ -80,6 +80,45 @@ DEFAULT_WEIGHTS: dict[str, dict[str, int]] = {
 
 _BANDS = ['09:30', '10:00', '11:00', '12:00', '13:00']
 
+# ── Per-path weight profiles (Aug 13 2026) ───────────────────────────────────
+# The band profiles above are trend-alignment heavy: or_breakout + or_thrust +
+# di_align + st5 + st15 + ema + momentum is 65-75 of the 100 points. A fade
+# engine scores ~0 on all of them by construction, which is why PATH_REV came
+# in at 17-55 and almost never traded.
+#
+# These profiles put ADX + OI levels + PCR in charge, and -- critically -- read
+# ADX in the way each engine actually uses it:
+#
+#   PATH_REV  fires when a trend EXHAUSTS. Raw ADX is LOW at that moment, and
+#             the 'adx' component scores a session percentile, so high-ADX
+#             scoring actively penalises REV for its own entry condition. Its
+#             ADX evidence therefore lives in 'exhaustion' (ADX waned from the
+#             morning peak / DI converged), which is exactly REV's thesis.
+#             NOTE: exhaustion carried weight 0 in the 09:30 and 10:00 bands --
+#             fine when REV could only fire from 12:00, but PATH_REV_START moved
+#             to 09:45 on Aug 8 and nobody updated the weights. Every REV signal
+#             on Aug 13 (10:15, 10:20, 10:30) landed in that dead zone.
+#             di_align is 0 on purpose: REV trades AGAINST the prevailing DI.
+#
+#   PATH_TREND fires when a trend is BUILDING, so raw ADX strength is the right
+#             read and di_align genuinely confirms it.
+#
+# Both keep OI levels (room to the next wall) as the largest single input --
+# this is what replaces the retired chase gate, expressed in levels that mean
+# something rather than raw position in the day's range.
+PATH_WEIGHT_PROFILES: dict[str, dict[str, int]] = {
+    'REV': {
+        'or_breakout': 0, 'or_thrust': 0, 'adx': 10, 'di_align':  0,
+        'st5': 0, 'st15': 0, 'ema': 0, 'vwap': 10,
+        'oi': 30, 'pcr': 20, 'exhaustion': 30, 'momentum': 0,
+    },
+    'TREND': {
+        'or_breakout': 0, 'or_thrust': 0, 'adx': 30, 'di_align': 10,
+        'st5': 0, 'st15': 0, 'ema': 0, 'vwap': 10,
+        'oi': 30, 'pcr': 20, 'exhaustion':  0, 'momentum': 0,
+    },
+}
+
 
 # ── Scorer phase (reads scorer_state.json, cached 60 s) ──────────────────────
 _phase_cache: dict = {'phase': 1, '_ts': 0.0}
@@ -151,6 +190,7 @@ def compute_score(
     oi_zone_action: 'str | None' = None,
     pcr: 'float | None' = None,
     max_pain: 'float | None' = None,
+    path: 'str | None' = None,
     morning_adx_peak: float = 0.0,
     morning_dir: 'str | None' = None,
     weights: 'dict | None' = None,
@@ -184,7 +224,14 @@ def compute_score(
         weights = load_weights()
 
     band  = get_time_band(now_str)
-    w     = weights.get(band, DEFAULT_WEIGHTS[band])
+    # Per-path profile wins over the time-band profile when one exists. Bands
+    # encode "what matters at this hour"; the path encodes "what this engine is
+    # actually looking for", which is the stronger signal -- a fade engine wants
+    # the same evidence at 10:00 as at 13:00.
+    if path and path in PATH_WEIGHT_PROFILES:
+        w = PATH_WEIGHT_PROFILES[path]
+    else:
+        w = weights.get(band, DEFAULT_WEIGHTS[band])
     phase = _get_phase()
 
     row   = df.iloc[-1]

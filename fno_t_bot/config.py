@@ -1506,7 +1506,33 @@ STRATEGY_PHASE3_TARGET_SCALE = 0.70    # Phase 3 target = 70% of normal (take pr
 # Threshold 55: permissive enough not to over-filter clean ORB setups,
 # strict enough to block weak reversal trades (e.g. PUT vs ST15=BULL).
 # Raise threshold to 60-65 after 30+ calibration trades.
-UNIFIED_SCORER_ENABLED  = True   # gate: True = block weak signals; False = log only
+UNIFIED_SCORER_ENABLED  = True   # False = skip scoring entirely (no logging either)
+# OBSERVE-ONLY from Aug 13 2026. The scorer still runs and logs a full score +
+# component breakdown on every signal, but no longer vetoes entries.
+#
+# Why: scored against every real trade we have an outcome for (n=8), the new
+# per-path weights do NOT separate winners from losers --
+#     winners 40/42/50/52   losers 35/45/50/72
+# The single largest loser (May 7, -Rs1,488) scores 72, the highest of any
+# trade. Ungated the sample returns +Rs5,064; the best possible threshold
+# returns +Rs5,266, an edge of Rs202 resting on one trade. At the old
+# threshold of 55 it took ZERO winners and one loser.
+#
+# Critically the test could not validate the new design either: OI levels (30)
+# and PCR (20) -- now the two largest inputs -- score 0 on nearly every
+# historical trade, because point-in-time OI zone files do not exist for those
+# dates and SENSEX has no PCR history. Running a hard veto on weights that
+# cannot be validated is the exact failure mode this project keeps repeating.
+#
+# Both engines still gate themselves substantively (REV: morning ADX peak >=30,
+# DI spread >=12, score >=3/6; TREND: ADX floor + multi-bar rise + DI spread +
+# widening + swing structure + body + ADX uptick), so this is not unfiltered.
+#
+# From now on OI zones populate for ALL THREE instruments (the SENSEX EOD fetch
+# was fixed today), so forward signals will finally carry real oi/pcr scores.
+# Re-arm once ~20 scored signals have accumulated AND the score actually
+# separates outcomes. Set True to restore the veto.
+UNIFIED_GATE_ACTIVE     = False
 UNIFIED_SCORE_THRESHOLD = 55     # minimum score to enter (0-100)
 # Per-band threshold offsets, added to UNIFIED_SCORE_THRESHOLD for entries in
 # that time band. Live trades Apr-Jul: 11:00-12:00 entries ran 0/4 (-₹7,420) —

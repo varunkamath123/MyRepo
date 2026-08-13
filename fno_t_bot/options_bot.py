@@ -5405,6 +5405,7 @@ class TradingBot:
                                     oi_zone_action   = _us_zone,
                                     pcr              = oc.get('pcr'),
                                     max_pain         = oc.get('max_pain'),
+                                    path             = signal.get('path'),
                                     morning_adx_peak = self._morning_adx_peak,
                                     morning_dir      = self._morning_dir,
                                 )
@@ -5439,12 +5440,20 @@ class TradingBot:
                                     f"(thr={_ub_thr}) | {_ub_cpts}"
                                 )
                                 if not _ub_pass:
-                                    self.logger.info(
-                                        f"  [UNIFIED-BLOCK] {self.instrument} "
-                                        f"{signal['type']} score={_ub['score']} "
-                                        f"< {_ub_thr} — entry suppressed"
-                                    )
-                                    signal = None
+                                    if getattr(config, 'UNIFIED_GATE_ACTIVE', True):
+                                        self.logger.info(
+                                            f"  [UNIFIED-BLOCK] {self.instrument} "
+                                            f"{signal['type']} score={_ub['score']} "
+                                            f"< {_ub_thr} — entry suppressed"
+                                        )
+                                        signal = None
+                                    else:
+                                        self.logger.info(
+                                            f"  [UNIFIED-OBSERVE] {self.instrument} "
+                                            f"{signal['type']} score={_ub['score']} "
+                                            f"< {_ub_thr} — would block, but gate is "
+                                            f"observe-only; taking trade (forward calibration)"
+                                        )
                             except Exception as _ub_exc:
                                 self.logger.warning(
                                     f"  [UNIFIED] Error: {_ub_exc} — "
