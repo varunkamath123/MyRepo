@@ -5386,6 +5386,14 @@ class TradingBot:
                                     _us_oi = _oi_bias
                                 except NameError:
                                     _us_oi = 'NEUTRAL'
+                                # Aug 13: feed REAL OI levels + PCR. The 'oi'
+                                # component used to key off oi_bias, which went
+                                # permanently NEUTRAL when the OI-BIAS engine was
+                                # stripped -- silently scoring 0 on every signal.
+                                try:
+                                    _us_zone = _oz_action
+                                except NameError:
+                                    _us_zone = None
                                 _ub = unified_scorer.compute_score(
                                     direction        = signal['type'],
                                     df               = df,
@@ -5394,6 +5402,9 @@ class TradingBot:
                                     st15_val         = htf.get('supertrend_15m'),
                                     oi_bias          = _us_oi,
                                     now_str          = now.strftime('%H:%M'),
+                                    oi_zone_action   = _us_zone,
+                                    pcr              = oc.get('pcr'),
+                                    max_pain         = oc.get('max_pain'),
                                     morning_adx_peak = self._morning_adx_peak,
                                     morning_dir      = self._morning_dir,
                                 )

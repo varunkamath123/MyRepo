@@ -1334,7 +1334,28 @@ ANTICIPATION_LIVE = False
 # The reversal-positioning half of the directive is anticipation_scout (shadow,
 # regime-dependent — goes live once it proves it doesn't catch knives).
 # MODE: 'off' | 'shadow' (log only) | 'active' (skip the entry)
-CHASE_GATE_MODE         = 'active'
+# ── Chase gate: REMOVED Aug 13 2026 (user directive) ─────────────────────────
+# Entry-location quality is now judged by ADX + OI levels + PCR (see the
+# unified scorer's adx / oi / pcr components) rather than by where price sits
+# in the day's raw range.
+#
+# Why: chase_pos only asks "is price at today's extreme?", which is a proxy for
+# the real question -- "is there room left to the level that matters?". The
+# proxy broke down structurally on PATH_REV, which was exempted on the theory
+# that "REV fades are anti-chase". Aug 13 disproved that: REV bought a SENSEX
+# PUT at chase_pos 0.978 (2.2% off the day's low), never went green for a
+# single bar, and lost Rs1,566 (-19%). The fade had already fully played out;
+# REV joined the completed move at its extreme.
+#
+# HONEST CAVEAT, recorded so this is revisitable: the chase gate was the single
+# strongest finding in this project's live data -- across 64 trades, blocking
+# chase>0.95 moved the book from -Rs16,788 to -Rs1,096. That evidence was
+# measured on PATH-A/PATH-B breakout entries, and is NOT invalidated by one REV
+# trade. It is being retired on the judgement that ADX/OI/PCR measure the same
+# thing better, not on evidence that chase_pos was wrong. If entry quality
+# degrades over the next few weeks, restore with CHASE_GATE_MODE='active'.
+# chase_pos is still COMPUTED and LOGGED on every entry for exactly that check.
+CHASE_GATE_MODE         = 'off'
 CHASE_GATE_MAX          = 0.93     # chase_pos above this = bought the extreme → block
 CHASE_GATE_AFTER        = '09:15'  # ALL-DAY (mornings chase too — today's -₹2,491 proof)
 CHASE_GATE_EXEMPT_PATHS = ('REV',) # REV fades are anti-chase — never gate them

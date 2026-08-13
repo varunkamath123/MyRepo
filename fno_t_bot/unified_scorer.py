@@ -53,28 +53,28 @@ _STATE_PATH   = os.path.join(_DIR, '..', 'data', 'scorer_state.json')
 DEFAULT_WEIGHTS: dict[str, dict[str, int]] = {
     '09:30': {
         'or_breakout': 25, 'or_thrust': 10, 'adx': 15, 'di_align': 10,
-        'st5':  5, 'st15': 10, 'ema':  5, 'vwap':  5,
-        'oi':   5, 'exhaustion':  0, 'momentum': 10,
+        'st5':  5, 'st15':  5, 'ema':  5, 'vwap':  5,
+        'oi':   5, 'pcr':  5, 'exhaustion':  0, 'momentum': 10,
     },
     '10:00': {
         'or_breakout': 20, 'or_thrust': 10, 'adx': 15, 'di_align': 10,
-        'st5':  5, 'st15': 15, 'ema': 10, 'vwap':  5,
-        'oi':   5, 'exhaustion':  0, 'momentum':  5,
+        'st5':  5, 'st15': 10, 'ema': 10, 'vwap':  5,
+        'oi':   5, 'pcr':  5, 'exhaustion':  0, 'momentum':  5,
     },
     '11:00': {
         'or_breakout': 10, 'or_thrust':  5, 'adx': 15, 'di_align': 10,
-        'st5': 10, 'st15': 15, 'ema': 10, 'vwap':  5,
-        'oi':  10, 'exhaustion':  5, 'momentum':  5,
+        'st5': 10, 'st15': 10, 'ema': 10, 'vwap':  5,
+        'oi':  10, 'pcr':  5, 'exhaustion':  5, 'momentum':  5,
     },
     '12:00': {
         'or_breakout':  5, 'or_thrust':  0, 'adx': 15, 'di_align': 10,
-        'st5': 10, 'st15': 20, 'ema': 10, 'vwap':  5,
-        'oi':  10, 'exhaustion': 10, 'momentum':  5,
+        'st5': 10, 'st15': 15, 'ema': 10, 'vwap':  5,
+        'oi':  10, 'pcr':  5, 'exhaustion': 10, 'momentum':  5,
     },
     '13:00': {
         'or_breakout':  0, 'or_thrust':  0, 'adx': 15, 'di_align':  5,
-        'st5': 10, 'st15': 25, 'ema': 10, 'vwap':  5,
-        'oi':  10, 'exhaustion': 15, 'momentum':  5,
+        'st5': 10, 'st15': 20, 'ema': 10, 'vwap':  5,
+        'oi':  10, 'pcr':  5, 'exhaustion': 15, 'momentum':  5,
     },
 }
 
@@ -148,6 +148,9 @@ def compute_score(
     st15_val: 'int | None',
     oi_bias: str,
     now_str: str,
+    oi_zone_action: 'str | None' = None,
+    pcr: 'float | None' = None,
+    max_pain: 'float | None' = None,
     morning_adx_peak: float = 0.0,
     morning_dir: 'str | None' = None,
     weights: 'dict | None' = None,
@@ -160,7 +163,12 @@ def compute_score(
         df               : 5m OHLCV + indicators DataFrame (uses last row)
         or_hi / or_lo    : Opening Range boundaries (None if not established)
         st15_val         : 15m SuperTrend (+1 bull / -1 bear / None)
-        oi_bias          : 'CONFIRM' / 'NEUTRAL' / 'REJECT'
+        oi_bias          : 'CONFIRM' / 'NEUTRAL' / 'REJECT' (legacy; the OI-BIAS
+                           engine is stripped, so this is normally 'NEUTRAL')
+        oi_zone_action   : 'BOOST'/'TAKE'/'REDUCE'/'SKIP' from oi_zones -- real
+                           OI wall levels, used as the primary OI signal
+        pcr              : live put-call ratio
+        max_pain         : live MaxPain strike
         now_str          : current time as 'HH:MM'
         morning_adx_peak : peak ADX seen during OR window (for exhaustion check)
         morning_dir      : dominant morning direction 'CALL'/'PUT' (for exhaustion)
@@ -292,8 +300,45 @@ def compute_score(
     else:
         components['vwap'] = (w.get('vwap', 0), 0.0, 0)
 
-    # ── 9. OI Bias (binary) ──────────────────────────────────────────────────
-    score += award('oi', oi_bias == 'CONFIRM')
+    # ── 9. OI levels (Aug 13 2026) ───────────────────────────────────────────
+    # WAS: award('oi', oi_bias == 'CONFIRM'). That broke silently when the
+    # OI-BIAS engine was stripped (Aug 12) -- oi_bias became permanently
+    # 'NEUTRAL', so this component scored 0 on every signal, in every band.
+    # Now driven by real OI wall levels from oi_zones, with MaxPain direction
+    # as a fallback when zones are unavailable (SENSEX has no OI feed).
+    #   BOOST = broke through a wall with momentum  -> full credit
+    #   TAKE  = clear air to the next wall          -> full credit
+    #   REDUCE= approaching an opposing wall        -> half credit
+    #   SKIP  = pinned against an adverse wall      -> no credit
+    if oi_zone_action in ('BOOST', 'TAKE'):
+        score += award('oi', True)
+    elif oi_zone_action == 'REDUCE':
+        score += award_pct('oi', 0.5)   # award() is binary; 0.5 there would read truthy
+    elif oi_zone_action == 'SKIP':
+        score += award('oi', False)
+    elif max_pain and max_pain > 0 and not pd.isna(px):
+        # Fallback: room toward MaxPain in the trade's direction.
+        score += award('oi', (px < max_pain) if is_call else (px > max_pain))
+    else:
+        score += award('oi', oi_bias == 'CONFIRM')
+
+    # ── 9b. PCR (Aug 13 2026) ────────────────────────────────────────────────
+    # Momentum orientation: put-heavy book (high PCR) supports PUTs, call-heavy
+    # (low PCR) supports CALLs. Flagged explicitly because a prior PCR-based
+    # gate (OI-BIAS) showed signs of being INVERTED on a 395-signal
+    # reconstruction -- so this is deliberately a scored component, never a hard
+    # block, and it is logged on every signal so the orientation can be checked
+    # forward against real outcomes before anyone leans on it harder.
+    pcr_wt = w.get('pcr', 0)
+    if pcr_wt > 0:
+        if pcr is None:
+            components['pcr'] = (pcr_wt, 0.0, 0)
+        else:
+            if is_call:
+                ratio = 1.0 if pcr <= 0.90 else (0.5 if pcr <= 1.10 else 0.0)
+            else:
+                ratio = 1.0 if pcr >= 1.10 else (0.5 if pcr >= 0.90 else 0.0)
+            score += award_pct('pcr', ratio)   # continuous: award() would treat 0.5 as full
 
     # ── 10. Exhaustion (binary) ──────────────────────────────────────────────
     exh_wt = w.get('exhaustion', 0)
