@@ -113,8 +113,15 @@ def fetch_chain(instrument: str, fyers, strike_count: int = 20,
         print(f"  [ERROR] Unknown instrument: {instrument}")
         return None
 
-    # Fyers option_prefix: 'NSE:NIFTY', 'NSE:BANKNIFTY', 'BSE:SENSEX'
+    # Fyers optionchain symbol. NOTE: this is NOT option_prefix -- for SENSEX the
+    # optionchain endpoint wants 'BSE:SENSEX-INDEX', while option_prefix is
+    # 'BSE:SENSEX' (the contract-name stem used to build tradable symbols).
+    # Passing the stem returns "Please provide a valid symbol", which is why EOD
+    # zones silently produced 2/3 instruments for weeks. bse_oi.py already had
+    # this right; this helper never got the fix.
     prefix = inst_cfg.get('option_prefix', f'NSE:{instrument}')
+    if instrument == 'SENSEX':
+        prefix = inst_cfg.get('index_symbol', 'BSE:SENSEX-INDEX')
 
     resp = fyers.optionchain({
         "symbol"     : prefix,
@@ -128,7 +135,8 @@ def fetch_chain(instrument: str, fyers, strike_count: int = 20,
         return None
 
     data      = resp.get('data', {})
-    opt_chain = data.get('optionChain', [])
+    # BSE returns 'optionsChain' (with an s); NSE returns 'optionChain'.
+    opt_chain = data.get('optionChain') or data.get('optionsChain') or []
     expiryData= data.get('expiryData', [])
 
     if not opt_chain:
@@ -140,22 +148,35 @@ def fetch_chain(instrument: str, fyers, strike_count: int = 20,
     # Sometimes it's inside each row
     if not spot and opt_chain:
         spot = opt_chain[0].get('underlyingValue', float('nan'))
+    # BSE carries spot on a dedicated underlying row that has no option_type,
+    # keyed 'ltp' -- neither of the above finds it.
+    if not spot or (isinstance(spot, float) and spot != spot):
+        _u = [r for r in opt_chain
+              if not r.get('option_type') and not r.get('optionType')]
+        if _u:
+            spot = _u[0].get('ltp')
     spot = float(spot or 0)
 
-    # Available expiries
-    expiries = sorted(set(r['expiryDate'] for r in opt_chain))
-    if not expiries:
-        print(f"  [ERROR] No expiry dates in response for {instrument}")
-        return None
-
-    chosen_expiry = expiries[min(expiry_index, len(expiries) - 1)]
+    # Available expiries. BSE option rows carry no expiryDate field at all (the
+    # endpoint returns a single expiry), so fall back to accepting every row
+    # rather than raising KeyError.
+    expiries = sorted({r['expiryDate'] for r in opt_chain if r.get('expiryDate')})
+    if expiries:
+        chosen_expiry = expiries[min(expiry_index, len(expiries) - 1)]
+    else:
+        chosen_expiry = None   # single-expiry response: accept all rows
 
     # Parse per-strike OI
     rows = {}
     for r in opt_chain:
-        if r.get('expiryDate') != chosen_expiry:
+        if chosen_expiry is not None and r.get('expiryDate') != chosen_expiry:
             continue
-        k  = float(r.get('strikePrice', 0))
+        if r.get('option_type') not in ('CE', 'PE') and not r.get('optionType'):
+            continue   # BSE includes an underlying/spot row with no option_type
+        # BSE uses snake_case 'strike_price'; NSE uses camelCase 'strikePrice'.
+        k  = float(r.get('strikePrice', r.get('strike_price', 0)) or 0)
+        if k <= 0:
+            continue   # unparseable row -- never collapse everything into strike 0
         ot = r.get('option_type', r.get('optionType', ''))
         is_ce = (ot in ('CE', 'CALL') or 'CE' in str(ot))
         is_pe = (ot in ('PE', 'PUT')  or 'PE' in str(ot))
