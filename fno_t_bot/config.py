@@ -1355,10 +1355,24 @@ ANTICIPATION_LIVE = False
 # thing better, not on evidence that chase_pos was wrong. If entry quality
 # degrades over the next few weeks, restore with CHASE_GATE_MODE='active'.
 # chase_pos is still COMPUTED and LOGGED on every entry for exactly that check.
-CHASE_GATE_MODE         = 'off'
+CHASE_GATE_MODE         = 'active'   # RE-ARMED Aug 14 2026 — see below
 CHASE_GATE_MAX          = 0.93     # chase_pos above this = bought the extreme → block
 CHASE_GATE_AFTER        = '09:15'  # ALL-DAY (mornings chase too — today's -₹2,491 proof)
-CHASE_GATE_EXEMPT_PATHS = ('REV',) # REV fades are anti-chase — never gate them
+# RE-ARMED Aug 14 2026 with NO exemptions. The 'REV fades are anti-chase' theory
+# is dead: Aug 13 REV bought a SENSEX PUT at chase_pos 0.978 and lost Rs1,566.
+# REV being exempt is precisely why removing the gate never fixed that trade.
+#
+# Evidence across every entry we have chase_pos for (gate at 0.93, no exemptions):
+#   BLOCKS  Aug13 SENSEX REV  0.978  -Rs1,566
+#   BLOCKS  Aug14 BNF   TREND 0.962  -Rs1,779   (retrace=0%, bought the extreme)
+#   allows  Aug11 NIFTY TREND 0.896  +Rs96
+#   allows  Aug11 SENSEX TREND 0.893  -Rs99
+#   allows  Aug14 BNF   REV   0.286  -Rs2,337   (good location, failed on timing)
+#   -> saves Rs3,345 of Rs5,685 in losses; blocks no winner.
+# Consistent with the original 64-trade finding (blocking chase>0.95 moved the
+# book -Rs16,788 -> -Rs1,096). Removing it was a one-day experiment that cost
+# Rs1,779 on its first live trade.
+CHASE_GATE_EXEMPT_PATHS = ()
 
 # Tuesday elevated-ADX/DI gates: which paths skip them (bare-bones pass, Aug 12
 # 2026). Largest real blocker in the logs — 309 hard blocks over 13 days. REV was
