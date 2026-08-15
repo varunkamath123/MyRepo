@@ -107,21 +107,42 @@ def atm_strike(instrument: str, underlying_price: float) -> int:
 
 # ─── Market Data ─────────────────────────────────────────────────────────────
 
-def get_ltp(fyers, symbol: str) -> float | None:
-    """Fetch Last Traded Price for a symbol."""
-    try:
-        resp = fyers.quotes({"symbols": symbol})
-        if resp.get('s') == 'ok':
-            v = resp['d'][0]['v']
-            # BSE options use 'ltp' instead of 'lp' (NSE/NFO standard)
-            for key in ('lp', 'ltp', 'last_price'):
-                if v.get(key) is not None:
-                    return float(v[key])
-            logger.warning(f"No LTP key in {symbol} quote. Available: {list(v.keys())}")
-        else:
+def get_ltp(fyers, symbol: str, retries: int = 2) -> float | None:
+    """Fetch Last Traded Price for a symbol.
+
+    Retries transient rate-limit errors (Fyers 429 'request limit reached'):
+    all three bots share one API key, and simultaneous evaluations at window
+    boundaries (09:40) can burst past the per-second quota. A one-shot failure
+    killed the Jul 13 BNF entry. 0.4s backoff clears a per-second window.
+    Per-symbol errors (invalid symbol → errmsg in quote body) are NOT retried.
+    """
+    import time as _time
+    for attempt in range(retries + 1):
+        try:
+            resp = fyers.quotes({"symbols": symbol})
+            if resp.get('s') == 'ok':
+                v = resp['d'][0]['v']
+                # BSE options use 'ltp' instead of 'lp' (NSE/NFO standard)
+                for key in ('lp', 'ltp', 'last_price'):
+                    if v.get(key) is not None:
+                        return float(v[key])
+                # Valid transport, no price key → per-symbol error (e.g. bad
+                # contract). Retrying cannot help.
+                logger.warning(f"No LTP key in {symbol} quote. Available: {list(v.keys())}")
+                return None
+            # Transport-level error: retry only rate-limit style failures
+            _msg = str(resp.get('message', '')).lower()
+            if attempt < retries and (resp.get('code') == 429 or 'limit' in _msg):
+                _time.sleep(0.4)
+                continue
             logger.warning(f"LTP fetch failed for {symbol}: {resp}")
-    except Exception as e:
-        logger.error(f"get_ltp({symbol}): {e}")
+            return None
+        except Exception as e:
+            if attempt < retries:
+                _time.sleep(0.4)
+                continue
+            logger.error(f"get_ltp({symbol}): {e}")
+            return None
     return None
 
 
@@ -368,10 +389,35 @@ def enter_live_position(fyers, instrument: str,
     expiry    = get_next_expiry(instrument)
     symbol    = build_option_symbol(instrument, strike, signal['type'], expiry)
 
-    ltp = get_ltp(fyers, symbol)
+    # Single quotes call captures LTP + best bid/ask (entry-quality logging);
+    # falls back to the retrying get_ltp if depth keys are absent.
+    ltp = None
+    entry_bid = entry_ask = None
+    try:
+        _resp = fyers.quotes({"symbols": symbol})
+        if _resp.get('s') == 'ok':
+            _v = _resp['d'][0]['v']
+            for _k in ('lp', 'ltp', 'last_price'):
+                if _v.get(_k) is not None:
+                    ltp = float(_v[_k])
+                    break
+            def _fnum(x):
+                try:
+                    _f = float(x)
+                    return _f if _f > 0 else None
+                except (TypeError, ValueError):
+                    return None
+            entry_bid = _fnum(_v.get('bid'))
+            entry_ask = _fnum(_v.get('ask'))
+    except Exception as _e:
+        logger.warning(f"quote-with-depth failed for {symbol}: {_e}")
+    if ltp is None:
+        ltp = get_ltp(fyers, symbol)   # retrying fallback (handles 429s)
     if ltp is None:
         logger.error(f"Cannot get LTP for {symbol}, skipping entry")
         return None
+    spread_pct = (round((entry_ask - entry_bid) / ltp * 100, 3)
+                  if (entry_bid and entry_ask and entry_ask >= entry_bid) else None)
 
     # ── Pre-order funds check (reinstated v1.6) ──────────────────────────────
     # Skip when order cost exceeds 98% of the live available balance — a broker
@@ -413,6 +459,9 @@ def enter_live_position(fyers, instrument: str,
         'entry_order_id': order_id,
         'sl_order_id'   : sl_order_id,    # None if SL-M placement failed
         'sl_trigger'    : sl_trigger,     # for logging/audit
+        # v1.7.3 entry-quality: quote snapshot at order time
+        'entry_ltp'     : ltp,            # LTP the order was sent against
+        'spread_pct'    : spread_pct,     # bid-ask spread % of premium (None if depth absent)
     }
 
 

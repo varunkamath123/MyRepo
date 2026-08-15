@@ -25,6 +25,7 @@ import pandas as pd
 import pytz
 from scipy.stats import norm
 from ta.trend import ADXIndicator, EMAIndicator
+from ta.volatility import AverageTrueRange
 from ta.momentum import RSIIndicator
 
 import config
@@ -35,6 +36,7 @@ import post11_scorer
 import unified_scorer
 import reversal_scout
 import breakout_scout
+import anticipation_scout
 import max_pain_trap
 import near_miss_tracker
 import trade_probability
@@ -93,6 +95,22 @@ def bs_price(option_type: str, S: float, K: float,
     if option_type == 'CALL':
         return float(S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2))
     return float(K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1))
+
+
+def bs_delta(option_type: str, S: float, K: float,
+             T: float, sigma: float) -> float | None:
+    """Black-Scholes delta of the contract (CALL: N(d1), PUT: N(d1)-1).
+
+    Used for entry-quality logging only (v1.7.3): the risk ladder shifts
+    strikes OTM for capital reasons without recording what delta was
+    actually bought — delta determines the index move needed to profit.
+    """
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return None
+    r  = config.RISK_FREE_RATE
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    nd1 = float(norm.cdf(d1))
+    return nd1 if option_type == 'CALL' else nd1 - 1.0
 
 
 # ─── Bot ─────────────────────────────────────────────────────────────────────
@@ -233,6 +251,13 @@ class TradingBot:
         self._path_rev_fired    = False  # one PATH_REV entry per day
         self._ivskew_hist       = []    # [(ts_float, ivskew), …] for 30-min drift
         self._skip_bnf_today    = False  # set daily: Monday before BNF monthly expiry
+
+        # ── PATH_TREND (trend-continuation pullback) state — reset daily ──────
+        self._trend_qual_dir      = None   # 'CALL'/'PUT' once qualification met, else None
+        self._trend_qual_time     = None   # HH:MM qualification first fired
+        self._trend_leg_extreme   = None   # running extreme of the leg since qualification
+        self._trend_anchor        = None   # OR level broken to trigger qualification
+        self._path_trend_fired    = False  # one PATH_TREND entry per day
         self._st15m             = None   # cached 15m SuperTrend (+1/-1) from get_htf_context
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -548,6 +573,9 @@ class TradingBot:
             high=df['High'], low=df['Low'], close=df['Close'], window=14
         )
         df['ADX']      = adx.adx()
+        df['ATR']      = AverageTrueRange(   # used by PATH_TREND (chase-low pullback sizing)
+            high=df['High'], low=df['Low'], close=df['Close'], window=14
+        ).average_true_range()
         df['DI_plus']  = adx.adx_pos()   # +DI: bullish directional strength
         df['DI_minus'] = adx.adx_neg()   # -DI: bearish directional strength
         df['RSI']     = RSIIndicator(df['Close'], 14).rsi()
@@ -1209,7 +1237,16 @@ class TradingBot:
         Fires when price breaks above OR_high or below OR_low with:
           ADX ≥ per-day minimum | VWAP aligned | no CALL on Thu | gap context gate
         Once per day (_path_a_fired set by caller).
+
+        DISABLED Aug 7 2026 via PATH_A_ENABLED=False — stripped, not repaired.
+        Live record: 29 entries (incl. its A_HELD / ORB_HELD conversions),
+        -Rs3,907 net. Breakdown: only 17% (5/29) survived the 12:00 checkpoint
+        to become held runners (+Rs2,113/trade), while the other 83% bled
+        -Rs603/trade. That is a lottery with negative expectancy, and it was
+        the book's single largest source of loss.
         """
+        if not getattr(config, 'PATH_A_ENABLED', True):
+            return None
         if not self._or_ready or self._path_a_fired:
             return None
 
@@ -2164,6 +2201,32 @@ class TradingBot:
 
         sig_type = 'CALL' if _call_break else 'PUT'
 
+        # ── Break freshness guard (Jul 13, from Path B's first live fire) ────
+        # A breakout entry belongs at the boundary. When ADX lags a drift-led
+        # break, this signal otherwise fires 30-60 min late at full extension
+        # (Jul 13 SENSEX: boundary crossed ~12:15 @ ADX 10.6, fired 12:55 at
+        # +0.39% beyond the range — the day's top tick, -25.8%). Require the
+        # last inside-range close to be within PATH_B_MAX_BREAK_AGE_BARS bars.
+        _max_age = getattr(config, 'PATH_B_MAX_BREAK_AGE_BARS', 3)
+        if _max_age > 0 and len(today_df) >= 2:
+            _thr_hi = mr_high * (1.0 + _buf)
+            _thr_lo = mr_low  * (1.0 - _buf)
+            _closes = today_df['Close'].tolist()
+            _age = None
+            for _i in range(len(_closes) - 2, -1, -1):   # skip current bar
+                _c = float(_closes[_i])
+                if (_call_break and _c <= _thr_hi) or (_put_break and _c >= _thr_lo):
+                    _age = len(_closes) - 1 - _i
+                    break
+            if _age is None or _age > _max_age:
+                _age_str = f"{_age}" if _age is not None else f">{len(_closes)}"
+                self.logger.info(
+                    f"  [PATH-B-SKIP] {self.instrument} {sig_type}: stale break — "
+                    f"boundary crossed {_age_str} bars ago (max {_max_age}); "
+                    f"edge is at the boundary, not the chase"
+                )
+                return None
+
         # ── ADX filter ──────────────────────────────────────────────────────
         if _adx < config.PATH_B_ADX_MIN:
             self.logger.info(
@@ -2690,6 +2753,49 @@ class TradingBot:
             sl_order_id   = None
             sl_trigger    = 0.0
 
+        # ── Entry-quality snapshot (v1.7.3 — option-buyer data pack) ─────────
+        # Logging only, no gating. Captures what long-premium P&L depends on
+        # beyond direction: premium richness (RV/IV), the delta actually
+        # bought after OTM shifts, whether the target needs a normal or a
+        # 2-sigma day (move coverage), and execution cost (spread/slippage).
+        # Gate on these only after the live sample says they discriminate.
+        _T_yrs   = config.DAYS_TO_EXPIRY / 365
+        _iv_chain = signal.get('atm_iv')                   # % (e.g. 12.6) or None
+        # SENSEX chain often lacks ATM-IV (BSE OI gap) — India VIX is a usable
+        # vol proxy for both the rv/iv ratio and the expected-move math.
+        _iv_move = _iv_chain or getattr(self, '_last_vix', None)
+        # rv_iv = realized vol / implied vol (>1 = premium cheap vs realized).
+        # Uses chain ATM-IV when present, else VIX (Jul 21 fix — previously null
+        # on every SENSEX trade, blinding premium-richness on 1/3 of the book).
+        _rv_iv   = (round(hv * 100 / _iv_move, 3)
+                    if (_iv_move and hv) else None)
+        _rv_iv_src = ('chain' if _iv_chain else 'vix' if _iv_move else None)
+        _sigma_d = (_iv_move / 100) if _iv_move else hv    # prefer market IV for delta
+        _delta   = bs_delta(signal['type'], underlying, strike, _T_yrs, _sigma_d)
+        _exp_move_pct = round(_iv_move / (252 ** 0.5), 3) if _iv_move else None
+        _req_move_pct = (round(_dyn_tgt * entry_price / (abs(_delta) * underlying) * 100, 3)
+                         if (_delta and underlying > 0) else None)
+        # Time-adjusted coverage (fixed Jul 16): compare the target's required
+        # move to the expected move over the REMAINING runway to force-close,
+        # √t-scaled — not the full day. A 13:40 entry has ~50min of runway:
+        # both Jul 16 losers showed full-day cover ~1.1 but true window cover
+        # ~0.4 (needed a >2σ residual-day move; theta rent with no runway).
+        try:
+            _fc_h, _fc_m = map(int, str(getattr(config, 'FORCE_CLOSE_TIME', '14:30')).split(':'))
+            _now_dt  = datetime.now(IST)
+            _fc_dt   = _now_dt.replace(hour=_fc_h, minute=_fc_m, second=0, microsecond=0)
+            _runway  = max((_fc_dt - _now_dt).total_seconds() / 60.0, 1.0)
+        except Exception:
+            _runway  = 375.0
+        _exp_move_window = (round(_exp_move_pct * (_runway / 375.0) ** 0.5, 3)
+                            if _exp_move_pct else None)
+        _move_cover   = (round(_exp_move_window / _req_move_pct, 2)
+                         if (_exp_move_window and _req_move_pct) else None)
+        _entry_ltp  = pos_info.get('entry_ltp')  if self.live else None
+        _spread_pct = pos_info.get('spread_pct') if self.live else None
+        _slip_pct   = (round((entry_price - _entry_ltp) / _entry_ltp * 100, 3)
+                       if (self.live and _entry_ltp) else None)
+
         position = {
             'instrument'    : self.instrument,
             'type'             : signal['type'],
@@ -2706,6 +2812,19 @@ class TradingBot:
             'otm_strikes'      : _otm,           # 0=ATM, 1/2=OTM degree (check_exits uses this)
             'otm_reason'       : signal.get('otm_reason', ''),  # S/R rationale for analysis
             'gap_type'         : signal.get('gap_type', self._gap_type or ''),  # for JSONL
+            # Logging only (Jul 24) — is this signal fighting an already-observed
+            # fade? GAP_FADE_DN/UP means price recovered within the OR window;
+            # a fresh signal continuing the ORIGINAL gap direction (not the
+            # fade direction) is a renewed-breakdown/breakout bet on a day that
+            # already showed it can reverse. Today's clean example: NIFTY
+            # GAP_FADE_DN at 09:40, then a PUT (continuing down) at 10:10 that
+            # hit a full 25% stop having peaked only +5.7%. ADX was 45.8 at
+            # entry — high ADX did not discriminate this pattern, so no gate
+            # yet; tag it and build the cohort before acting on it.
+            'gap_fade_continuation': (
+                (self._gap_type == 'GAP_FADE_DN' and signal['type'] == 'PUT') or
+                (self._gap_type == 'GAP_FADE_UP' and signal['type'] == 'CALL')
+            ),
             'dynamic_or'       : signal.get('dynamic_or', False),  # True = DYN-OR fallback
             'sl_order_id'      : sl_order_id,    # Fyers SL-M order id (None if paper/failed)
             'sl_trigger'       : sl_trigger,     # for audit logging
@@ -2719,6 +2838,19 @@ class TradingBot:
             'unified_score'    : signal.get('unified_score'),
             'composite_score'  : signal.get('composite_score'),
             'size_reason'      : signal.get('size_reason', ''),
+            # v1.7.3: option-buyer entry-quality pack (logging only)
+            'rv_iv'            : _rv_iv,          # realized/implied vol ratio (>1 = cheap premium)
+            'rv_iv_src'        : _rv_iv_src,      # 'chain' (real ATM-IV) or 'vix' (SENSEX proxy)
+            'entry_delta'      : round(_delta, 3) if _delta is not None else None,
+            'exp_move_pct'     : _exp_move_pct,   # IV-implied 1-day index move %
+            'req_move_pct'     : _req_move_pct,   # index move % needed to hit target
+            'move_cover'       : _move_cover,     # expected-move-in-runway / required (≥1 = achievable)
+            'runway_min'       : round(_runway),  # minutes to force-close at entry
+            'range_pos'        : signal.get('range_pos'),  # entry loc in day range (0=low,1=high)
+            'chase_pos'        : signal.get('chase_pos'),  # 0=pullback entry, 1=chasing the extreme
+            'spread_pct'       : _spread_pct,     # bid-ask spread % of premium at entry (live)
+            'slippage_pct'     : _slip_pct,       # fill vs LTP % (live)
+            'vix_at_entry'     : getattr(self, '_last_vix', None),
         }
         self.positions.append(position)
         self.trades_today += 1
@@ -2877,6 +3009,8 @@ class TradingBot:
                           if _entry_dt else datetime.now(IST).strftime('%a'))
             _dcfg_pos  = self._get_day_cfg(_entry_dow)
             _trail_dist = (_dcfg_pos['trail_dist'] if _path == 'A'
+                           else getattr(config, 'PATH_TREND_TRAIL_DIST', config.TRAILING_DISTANCE)
+                           if _path == 'TREND'
                            else config.TRAILING_DISTANCE)
             if _path == 'A':
                 # Dynamic OR uses tighter stop — market has settled by 10:00+
@@ -2908,10 +3042,14 @@ class TradingBot:
                     # showed 12% trail fired prematurely on transient dips (Jun 1 BNF: exited
                     # at +₹1.2k vs +₹4.3k at force-close). REV/RECLAIM use TRAILING_ACTIVATION
                     # (12%) since they are shorter-lived moves where earlier protection helps.
-                    _trail_act = (getattr(config, 'TRAIL_ACT_ORB_HELD',
-                                          config.TRAILING_ACTIVATION)
-                                  if _path == 'A_HELD'
-                                  else config.TRAILING_ACTIVATION)
+                    if _path == 'A_HELD':
+                        _trail_act = getattr(config, 'TRAIL_ACT_ORB_HELD',
+                                              config.TRAILING_ACTIVATION)
+                    elif _path == 'TREND':
+                        _trail_act = getattr(config, 'PATH_TREND_TRAIL_ACT',
+                                              config.TRAILING_ACTIVATION)
+                    else:
+                        _trail_act = config.TRAILING_ACTIVATION
 
             exit_reason = None
             if _sl_triggered:
@@ -3047,6 +3185,7 @@ class TradingBot:
                     'regime_at_open'   : pos.get('regime', 'UNKNOWN'),
                     'posture'          : pos.get('posture', 'NORMAL'),
                     'gap_type'         : pos.get('gap_type', ''),     # GAP_AND_GO_*/FADE/INSIDE
+                    'gap_fade_continuation': pos.get('gap_fade_continuation', False),
                     'otm_strikes'      : pos.get('otm_strikes', 0),  # 0=ATM, 1/2=OTM degree
                     'otm_reason'       : pos.get('otm_reason', ''),  # S/R logic rationale
                     'dynamic_or'       : pos.get('dynamic_or', False), # True = DYN-OR fallback
@@ -3057,6 +3196,19 @@ class TradingBot:
                     'unified_score'    : pos.get('unified_score'),
                     'composite_score'  : pos.get('composite_score'),
                     'size_reason'      : pos.get('size_reason', ''),
+                    # ── Option-buyer entry-quality pack (v1.7.3) ──────────
+                    'rv_iv'            : pos.get('rv_iv'),
+                    'rv_iv_src'        : pos.get('rv_iv_src'),
+                    'entry_delta'      : pos.get('entry_delta'),
+                    'exp_move_pct'     : pos.get('exp_move_pct'),
+                    'req_move_pct'     : pos.get('req_move_pct'),
+                    'move_cover'       : pos.get('move_cover'),
+                    'runway_min'       : pos.get('runway_min'),
+                    'range_pos'        : pos.get('range_pos'),
+                    'chase_pos'        : pos.get('chase_pos'),
+                    'spread_pct'       : pos.get('spread_pct'),
+                    'slippage_pct'     : pos.get('slippage_pct'),
+                    'vix_at_entry'     : pos.get('vix_at_entry'),
                 })
                 self._save_trade_log()
                 self._compute_rolling_quality()   # re-evaluate quality after each closed trade
@@ -3282,42 +3434,28 @@ class TradingBot:
                     f'DI converging {_conv_pct*100:.0f}% of peak closed ✓'
                 )
 
-        # ── Component 2: IVSkew flip (0–2) ───────────────────────────────────
-        _cur_iv      = oc.get('iv_skew')
-        _flip_thresh = getattr(config, 'PATH_REV_IVSKEW_FLIP_PCT',   4.0)
-        _skew_thresh = getattr(config, 'OI_IV_SKEW_THRESHOLD',        2.0)
+        # ── Component 2: IVSkew flip — REMOVED Aug 14 2026 ───────────────────
+        # Was worth 0-2 points, half the score ever actually observed. Across
+        # 2,297 production evaluations it contributed to only 8 of 81 qualifying
+        # signals (flipped +2: 2 times; drifting +1: 6 times) -- and to ZERO on
+        # SENSEX, whose BSE feed supplies no ATM-IV at all, so a third of REV's
+        # scoring capacity was permanently unavailable on one of three
+        # instruments. Removing it makes the scale honest: max is now 4, which
+        # is also the highest score ever recorded (5 and 6 were unreachable).
+        # Revert: git history, plus PATH_REV_IVSKEW_FLIP_PCT in config.
 
-        if _cur_iv is not None and self._ivskew_hist:
-            _now_ts  = now.timestamp()
-            # 30-min-ago IVSkew: oldest snapshot within last 30 min
-            _hist_30 = [v for (t, v) in self._ivskew_hist if _now_ts - t <= 1800]
-            _old_iv  = _hist_30[0] if len(_hist_30) >= 2 else self._ivskew_hist[0][1]
-            _iv_shift = _cur_iv - _old_iv   # positive = IV skew rising (more fear/puts)
-
-            if rev_dir == 'CALL':
-                # CALL reversal: IVSkew should turn negative (CALL bid > PUT bid)
-                _full = (_cur_iv < -_skew_thresh and _iv_shift <= -_flip_thresh)
-                _part = (not _full and _iv_shift <= -(_flip_thresh * 0.5))
-            else:
-                # PUT reversal: IVSkew should turn positive (PUT bid > CALL bid)
-                _full = (_cur_iv > _skew_thresh and _iv_shift >= _flip_thresh)
-                _part = (not _full and _iv_shift >= (_flip_thresh * 0.5))
-
-            if _full:
-                score += 2
-                reasons.append(
-                    f'IVSkew flipped {_old_iv:+.1f}%→{_cur_iv:+.1f}% '
-                    f'(Δ{_iv_shift:+.1f}%) → {rev_dir} bid ✓✓'
-                )
-            elif _part:
-                score += 1
-                reasons.append(
-                    f'IVSkew drifting {_iv_shift:+.1f}% toward {rev_dir} ✓'
-                )
-
-        # ── Component 3: MaxPain proximity (0–1) ─────────────────────────────
+        # ── Component 2: MaxPain proximity (0–1) ─────────────────────────────
+        # The ONLY component independent of trend-fade (see note below). Highly
+        # instrument-skewed on the flat 0.5% threshold: it scores on 92% of
+        # NIFTY evaluations (heavy expiry pinning), 35% of SENSEX, but only 14%
+        # of BANKNIFTY. Left as-is rather than made instrument-relative --
+        # equalising the hit-rate would be curve-fitting; if BNF genuinely is
+        # not near MaxPain, that is information. Distance now recorded on every
+        # evaluation so a scaled (ATR- or range-relative) threshold can be
+        # calibrated on real data later.
         _mp      = oc.get('max_pain')
         _mp_prox = getattr(config, 'PATH_REV_MAXPAIN_PROX_PCT', 0.005)
+        _mp_dist = None
         if _mp and _mp > 0:
             _mp_dist = abs(_px - _mp) / _mp
             if _mp_dist <= _mp_prox:
@@ -3326,7 +3464,15 @@ class TradingBot:
                     f'MaxPain={_mp:,.0f} price {_mp_dist*100:.2f}% away (snap zone) ✓'
                 )
 
-        # ── Component 4: ADX waning (0–1) ────────────────────────────────────
+        # ── Component 3: ADX waning (0–1) ────────────────────────────────────
+        # NOTE ON REDUNDANCY: this and DI-convergence above are NOT independent
+        # confirmations -- both measure "the morning trend is dying". In
+        # production they co-occur almost perfectly (DI in 96.2% of qualifying
+        # signals, ADX-waning in 95.1%). So a score of 3 built from DI-flipped
+        # (2) + ADX-waning (1) carries only ONE piece of evidence, while a 3
+        # built from DI (1) + MaxPain (1) + ADX (1) carries two. Not collapsed
+        # into a single component because there is no outcome data yet to say
+        # which formulation predicts better -- n=14 REV trades total.
         _wane = getattr(config, 'PATH_REV_ADX_WANE_RATIO', 0.85)
         if self._morning_adx_peak > 0 and _adx < self._morning_adx_peak * _wane:
             score += 1
@@ -3355,6 +3501,217 @@ class TradingBot:
             'path'       : 'REV',
             'otm_strikes': 0,
             'otm_reason' : f'MaxPain snap | {_reason_str}',
+            'gap_type'   : self._gap_type,
+            'dynamic_or' : False,
+            # Telemetry (Aug 14) — lets score COMPOSITION be tested against
+            # outcome later, not just the total. The open question is whether a
+            # 3 that includes MaxPain beats a 3 built purely from the redundant
+            # trend-fade pair.
+            'rev_score'      : score,
+            'rev_mp_dist'    : (round(_mp_dist, 5) if _mp_dist is not None else None),
+            'rev_di_spread'  : round(_cur_spread, 2),
+            'rev_di_peak'    : round(self._morning_di_peak, 2),
+            'rev_adx_ratio'  : (round(_adx / self._morning_adx_peak, 3)
+                                if self._morning_adx_peak > 0 else None),
+        }
+
+    def _update_trend_qualification(self, df: 'pd.DataFrame', now: 'datetime') -> None:
+        """Track PATH_TREND qualification: ADX rising + DI spread widening + OR
+        break in that direction (a trend still BUILDING -- the opposite state
+        from PATH_REV, which requires ADX already peaked and now waning).
+        Called every scan tick once the OR is ready. Feeds get_path_trend_signal.
+        """
+        if self._path_trend_fired or not self._or_ready:
+            return
+        _rb = getattr(config, 'PATH_TREND_ADX_RISE_BARS', 3)
+        _wb = getattr(config, 'PATH_TREND_DI_WIDEN_BARS', 3)
+        if len(df) <= max(_rb, _wb):
+            return
+        row = df.iloc[-1]
+        adx = float(row.get('ADX', 0.0) or 0.0)
+        dip = float(row.get('DI_plus', 0.0) or 0.0)
+        dim = float(row.get('DI_minus', 0.0) or 0.0)
+        px  = float(row['Close'])
+        spread = abs(dip - dim)
+
+        if self._trend_qual_dir is None:
+            adx_prev    = float(df['ADX'].iloc[-(_rb + 1)] or 0.0)
+            dip_prev    = float(df['DI_plus'].iloc[-(_wb + 1)] or 0.0)
+            dim_prev    = float(df['DI_minus'].iloc[-(_wb + 1)] or 0.0)
+            spread_prev = abs(dip_prev - dim_prev)
+            cand_dir    = 'CALL' if dip > dim else 'PUT'
+            or_break    = (px > self._or_high) if cand_dir == 'CALL' else (px < self._or_low)
+
+            if (adx >= getattr(config, 'PATH_TREND_MIN_ADX', 22)
+                    and (adx - adx_prev) >= getattr(config, 'PATH_TREND_ADX_RISE_MIN', 2.0)
+                    and spread >= getattr(config, 'PATH_TREND_MIN_DI_SPREAD', 10)
+                    and (spread - spread_prev) >= 0
+                    and or_break):
+                self._trend_qual_dir    = cand_dir
+                self._trend_qual_time   = now.strftime('%H:%M')
+                self._trend_leg_extreme = px
+                self._trend_anchor      = self._or_high if cand_dir == 'CALL' else self._or_low
+                self.logger.info(
+                    f"  [PATH-TREND-QUAL] {self.instrument} {cand_dir} @ {self._trend_qual_time} "
+                    f"| ADX {adx_prev:.1f}→{adx:.1f} | DI-spread {spread_prev:.1f}→{spread:.1f} "
+                    f"| anchor={self._trend_anchor:,.1f}"
+                )
+            return
+
+        # Already qualified -- invalidate on ADX collapse or DI flip, else
+        # extend the leg extreme so get_path_trend_signal can measure pullback %.
+        _floor = getattr(config, 'PATH_TREND_ADX_FLOOR', 17)
+        _still_aligned = (dip > dim) if self._trend_qual_dir == 'CALL' else (dim > dip)
+        if adx < _floor or not _still_aligned:
+            self.logger.debug(
+                f"  [PATH-TREND-QUAL] {self.instrument}: invalidated "
+                f"(ADX={adx:.1f}, aligned={_still_aligned})"
+            )
+            self._trend_qual_dir    = None
+            self._trend_leg_extreme = None
+            self._trend_anchor      = None
+            return
+
+        if self._trend_qual_dir == 'CALL':
+            self._trend_leg_extreme = max(self._trend_leg_extreme, px)
+        else:
+            self._trend_leg_extreme = min(self._trend_leg_extreme, px)
+
+    def get_path_trend_signal(self, df: 'pd.DataFrame', oc: dict,
+                              now: 'datetime') -> 'dict | None':
+        """PATH_TREND: trend-continuation pullback entry.
+
+        Fires when a still-building trend (see _update_trend_qualification)
+        pulls back 25-70% toward the OR level and resumes on a real swing
+        structure (higher-low/lower-high) + an ADX uptick + a real-bodied
+        candle -- filters single-bar noise, which live-fired 46/113 false
+        starts in backtest before this filter was added. Enters on the dip
+        within the trend, not the breakout -- directly targets PATH-A's
+        historical chase_pos 0.96-0.98 failure mode.
+
+        OI/PCR filter is CONTINUATION-framed: the inverse of
+        _get_oi_direction_bias()'s MaxPain-proximity ("snap back to the
+        magnet") reversion framing. Soft gate -- only blocks when OI data is
+        present AND net-contradicts (never blocks on missing data).
+        """
+        if not getattr(config, 'PATH_TREND_ENABLED', False):
+            return None
+        if self._path_trend_fired or self._trend_qual_dir is None:
+            return None
+        if len(df) < 2:
+            return None
+
+        _start = dtime(*[int(x) for x in
+                         getattr(config, 'PATH_TREND_START', '09:45').split(':')])
+        _end   = dtime(*[int(x) for x in
+                         getattr(config, 'PATH_TREND_END',   '13:00').split(':')])
+        if not (_start <= now.time() <= _end):
+            return None
+
+        trend_dir = self._trend_qual_dir
+        anchor    = self._trend_anchor
+        extreme   = self._trend_leg_extreme
+        if anchor is None or extreme is None:
+            return None
+
+        row      = df.iloc[-1]
+        prev     = df.iloc[-2]
+        px       = float(row['Close'])
+        op       = float(row['Open'])
+        adx      = float(row.get('ADX', 0.0) or 0.0)
+        adx_prev = float(prev.get('ADX', 0.0) or 0.0)
+        atr      = float(row.get('ATR', 0.0) or 0.0)
+        if atr <= 0:
+            return None
+
+        leg_range = (extreme - anchor) if trend_dir == 'CALL' else (anchor - extreme)
+        if leg_range <= 0:
+            return None
+        retr = (((extreme - px) / leg_range) if trend_dir == 'CALL'
+                else ((px - extreme) / leg_range))
+
+        # Retrace band gate RETIRED Aug 12 2026 (user directive). It required a
+        # 25-70% pullback before entering, which a clean one-way trend never
+        # offers -- the extreme keeps extending, so retr stays pinned at 0 by
+        # construction. Aug 12 evidence: NIFTY and SENSEX both qualified, then
+        # ground down 106 / 329 pts with the engine sitting out; "retrace 0%"
+        # was the dominant blocker on 10 and 13 bars respectively.
+        # retr is still computed and LOGGED (below) as telemetry so entry
+        # quality vs retrace level stays measurable for later calibration.
+        # The chase gate remains the anti-chase safety net -- deliberately kept,
+        # so entries at the literal extreme (chase_pos > 0.93) are still blocked.
+
+        _body_min = getattr(config, 'PATH_TREND_BODY_ATR_MIN', 0.15) * atr
+        if trend_dir == 'CALL':
+            resumed = (float(row['Low']) > float(prev['Low']) and px > op
+                       and adx > adx_prev and (px - op) >= _body_min)
+        else:
+            resumed = (float(row['High']) < float(prev['High']) and px < op
+                       and adx > adx_prev and (op - px) >= _body_min)
+        if not resumed:
+            return None
+
+        # ── OI/PCR continuation filter (inverse of REV's reversion framing) ──
+        _oi_reasons = []
+        _oi_score   = 0
+        _oi_n       = 0
+        pcr = oc.get('pcr')
+        if pcr is not None:
+            _oi_n += 1
+            _call_max = getattr(config, 'PATH_TREND_OI_PCR_CALL_MAX', 1.05)
+            _put_min  = getattr(config, 'PATH_TREND_OI_PCR_PUT_MIN',  0.95)
+            if trend_dir == 'CALL':
+                _oi_score += 1 if pcr <= _call_max else -1
+            else:
+                _oi_score += 1 if pcr >= _put_min else -1
+            _oi_reasons.append(f'PCR={pcr:.2f}')
+
+        try:
+            import nse_oi as _nse_oi_m
+            _drift = _nse_oi_m.get_pcr_drift(
+                self.instrument, getattr(config, 'OI_PCR_DRIFT_LOOKBACK_MINS', 30)
+            )
+        except Exception:
+            _drift = None
+        if _drift is not None:
+            _oi_n += 1
+            _thr = getattr(config, 'PATH_TREND_OI_DRIFT_THRESH', 0.05)
+            if trend_dir == 'CALL':
+                _oi_score += 1 if _drift <= -_thr else (-1 if _drift >= _thr else 0)
+            else:
+                _oi_score += 1 if _drift >= _thr else (-1 if _drift <= -_thr else 0)
+            _oi_reasons.append(f'PCR-drift={_drift:+.3f}')
+
+        mp = oc.get('max_pain')
+        if mp and mp > 0:
+            _oi_n += 1
+            _dist = (px - mp) if trend_dir == 'CALL' else (mp - px)
+            _oi_score += 1 if _dist > 0 else -1
+            _oi_reasons.append(f'MaxPain-dist={_dist:+.1f}')
+
+        if _oi_n > 0 and _oi_score < 0:
+            self.logger.info(
+                f"  [PATH-TREND] {self.instrument} {trend_dir}: OI contradicts "
+                f"continuation ({', '.join(_oi_reasons)}) — skipped"
+            )
+            return None
+
+        _oi_str = ', '.join(_oi_reasons) if _oi_reasons else 'no OI data'
+        self.logger.info(
+            f"  [PATH-TREND] {self.instrument} {trend_dir} FIRE @ {now.strftime('%H:%M')} "
+            f"| qualified {self._trend_qual_time} | retrace={retr*100:.0f}% "
+            f"| ADX {adx_prev:.1f}→{adx:.1f} | {_oi_str}"
+        )
+
+        return {
+            'type'       : trend_dir,
+            'price'      : px,
+            'adx'        : float(adx),
+            'strength'   : 1,      # always 1 lot — unvalidated pattern
+            'lots'       : 1,
+            'path'       : 'TREND',
+            'otm_strikes': 0,
+            'otm_reason' : f'Trend pullback {retr*100:.0f}% | {_oi_str}',
             'gap_type'   : self._gap_type,
             'dynamic_or' : False,
         }
@@ -3443,6 +3800,11 @@ class TradingBot:
             self._morning_di_peak   = 0.0
             self._path_rev_fired    = False
             self._ivskew_hist       = []
+            self._trend_qual_dir      = None
+            self._trend_qual_time     = None
+            self._trend_leg_extreme   = None
+            self._trend_anchor        = None
+            self._path_trend_fired    = False
 
             # ── BNF Monday-before-monthly-expiry skip ─────────────────────
             self._skip_bnf_today = self._is_monday_before_bnf_monthly_expiry(today)
@@ -3504,6 +3866,8 @@ class TradingBot:
             reversal_scout.daily_reset(self.instrument, self.logger)
             # MaxPain Trap: reset daily P&L and fired_today flag
             max_pain_trap.daily_reset(self.instrument, self.logger)
+            # Anticipation scout (shadow): reset daily setup count + P&L tally
+            anticipation_scout.daily_reset(self.instrument, self.logger)
 
     @staticmethod
     def _trade_log_dir() -> str:
@@ -3938,18 +4302,34 @@ class TradingBot:
                             continue   # skip hold evaluation — already closed
 
                         # ── 12PM hard loss stop ───────────────────────────────
-                        # If the position is at a loss at the checkpoint → close
-                        # immediately, unconditionally, regardless of ADX / EMA.
+                        # If the position is at a loss at the checkpoint AND
+                        # never showed real strength → close immediately.
+                        # EXEMPTION (v1.9, Jul 23): a position that peaked past
+                        # CHECKPOINT_LOSS_STOP_MIN_PEAK is red-but-strong, not
+                        # red-and-dead — falls through to the exit-score check
+                        # below instead of an automatic kill on P&L sign alone.
                         # Configured by PATH_A_LOSS_STOP_AT_CHECKPOINT (default True).
+                        _peak_pct      = pos.get('highest_pnl_pct', 0.0)
+                        _ckpt_min_peak = getattr(config, 'CHECKPOINT_LOSS_STOP_MIN_PEAK', 0.05)
                         if (getattr(config, 'PATH_A_LOSS_STOP_AT_CHECKPOINT', True)
-                                and _pnl_pct < 0):
+                                and _pnl_pct < 0
+                                and _peak_pct < _ckpt_min_peak):
                             self.logger.info(
                                 f"[PATH-A{_otm_lbl}] CHECKPOINT LOSS-STOP ✂️ | "
                                 f"{pos['type']} P&L={_pnl_pct*100:+.1f}% "
-                                f"→ hard close at {_path_a_fc_time} (position at a loss)"
+                                f"peak={_peak_pct*100:+.1f}% "
+                                f"→ hard close at {_path_a_fc_time} (never showed strength)"
                             )
                             self.check_exits(_fc_px, _fc_hv, force_close=True)
                             continue   # skip conditional hold evaluation
+                        elif _pnl_pct < 0:
+                            self.logger.info(
+                                f"[PATH-A{_otm_lbl}] CHECKPOINT RED-BUT-STRONG ⚠️ | "
+                                f"{pos['type']} P&L={_pnl_pct*100:+.1f}% "
+                                f"peak={_peak_pct*100:+.1f}% >= {_ckpt_min_peak*100:.0f}% "
+                                f"— evaluating via exit-score instead of hard kill"
+                            )
+                            # falls through to the exit-score evaluation below
 
                         # ── Exit score checkpoint (replaces fixed profit/ADX/EMA check) ──
                         # Score 0-85 across 6 components: directional integrity,
@@ -4096,12 +4476,13 @@ class TradingBot:
                 # IVSkew history: always updated (needed for 30-min drift in Path REV).
                 # Morning DI/ADX peak: only during ORB window (9:30–PATH_A_LATE_END).
                 if getattr(config, 'PATH_REV_ENABLED', False):
-                    _iv_snap = oc.get('iv_skew')
-                    if _iv_snap is not None:
-                        self._ivskew_hist.append((now.timestamp(), float(_iv_snap)))
-                        self._ivskew_hist = self._ivskew_hist[-20:]
+                    # IVSkew history accumulation removed Aug 14 2026 along with
+                    # the component it fed -- it had no other consumer.
                     if _orb_window:
                         self._update_morning_trend(df)
+
+                if getattr(config, 'PATH_TREND_ENABLED', False):
+                    self._update_trend_qualification(df, now)
 
                 can_enter = (
                     _in_window
@@ -4126,6 +4507,8 @@ class TradingBot:
                 if can_enter and config.USE_VIX_FILTER and 'VIX' in df.columns:
                     _vix_now = float(df.iloc[-1].get('VIX', float('nan')))
                     if not pd.isna(_vix_now) and _vix_now > 0:
+                        # Stash for the entry-quality pack (vix_at_entry in JSONL)
+                        self._last_vix = round(_vix_now, 2)
                         if _vix_now > config.VIX_MAX:
                             # Directional conviction override: if BOTH 15m-ST and
                             # 15m-EMA agree on direction, the trend is unambiguous.
@@ -4175,7 +4558,11 @@ class TradingBot:
                 # position is held.  reversal_scout has its own per-bar dedup.
                 # Window: same START as vX but capped at 13:00 (PATH_F_ENTRY_END) so
                 # OTM options (2 strikes out) have ≥90 min runway to force-close.
-                if _path_f_in_window:
+                # Path F / reversal_scout STRIPPED Aug 12 2026 (bare-bones):
+                # isolated Rs10k paper pool, no code path to enter_trade().
+                # Backtested 47 trades / 34% WR / -Rs30,300 — verdict was
+                # already 'do not deploy'. Restore via PATH_F_ENABLED=True.
+                if _path_f_in_window and getattr(config, 'PATH_F_ENABLED', False):
                     try:
                         reversal_scout.evaluate_bar(
                             instrument     = self.instrument,
@@ -4200,23 +4587,48 @@ class TradingBot:
                 # momentum (ADX + VWAP + HTF) — no EMA cross required.
                 # Window: 10:00–13:30 (PATH_G_ENTRY_END); wall breaks need 60+ min
                 # follow-through before close. Own capital pool (₹10k), own dedup.
-                try:
-                    breakout_scout.evaluate_bar(
-                        instrument     = self.instrument,
-                        df             = df,
-                        htf            = htf,
-                        oi_zones       = self._oi_zones,
-                        inst_cfg       = self.inst_cfg,
-                        hv             = hv,
-                        logger         = self.logger,
-                        now            = now,
-                        in_window      = _in_window,
-                        days_to_expiry = config.DAYS_TO_EXPIRY,
-                    )
-                except Exception as _pe_exc:
-                    self.logger.warning(
-                        f"  [PATH-G] Breakout scout error: {_pe_exc}"
-                    )
+                # breakout_scout STRIPPED Aug 12 2026 (bare-bones): third
+                # isolated Rs10k paper pool, also with no path to the real book.
+                if getattr(config, 'BREAKOUT_SCOUT_ENABLED', False):
+                    try:
+                        breakout_scout.evaluate_bar(
+                            instrument     = self.instrument,
+                            df             = df,
+                            htf            = htf,
+                            oi_zones       = self._oi_zones,
+                            inst_cfg       = self.inst_cfg,
+                            hv             = hv,
+                            logger         = self.logger,
+                            now            = now,
+                            in_window      = _in_window,
+                            days_to_expiry = config.DAYS_TO_EXPIRY,
+                        )
+                    except Exception as _pe_exc:
+                        self.logger.warning(
+                            f"  [PATH-G] Breakout scout error: {_pe_exc}"
+                        )
+
+                # ── Anticipation Scout (SHADOW) — enter-at-level, before the move
+                # The philosophy-shift engine: logs would-be anticipatory entries
+                # and tracks the underlying to resolution. NO orders. Runs every
+                # bar to gather forward evidence vs the confirmation breakouts.
+                if getattr(config, 'ANTICIPATION_SHADOW_ENABLED', False):
+                    try:
+                        anticipation_scout.evaluate_bar(
+                            instrument = self.instrument,
+                            df         = df,
+                            oc         = oc,
+                            oi_zones   = self._oi_zones,
+                            inst_cfg   = self.inst_cfg,
+                            logger     = self.logger,
+                            now        = now,
+                            or_high    = self._or_high,
+                            or_low     = self._or_low,
+                        )
+                    except Exception as _as_exc:
+                        self.logger.warning(
+                            f"  [ANTICIP] Scout error: {_as_exc}"
+                        )
 
                 # ── MaxPain Trap (Variant A) — independent paper strategy ─────────
                 # Fires 09:15–10:00 on expiry days when spot is displaced ≥0.5%
@@ -4560,11 +4972,19 @@ class TradingBot:
                             if signal:
                                 self._path_b_fired = True
 
-                    # ── Path C / Path D fallback (EMA crossover archived in get_signal)
-                    # Path C (CONT): EMA spread widening 3 bars + ADX ≥ 35 + 12:00+
-                    # Path D (ST_FLIP): 5m SuperTrend direction flip + ADX + VWAP
-                    # Both independent of Path B — still valid fallback signals.
-                    if signal is None and _main_window:
+                    # ── Path C / Path D / vX fallback — STRIPPED Aug 12 2026 ────────
+                    # get_signal() hosts three things, and all three are now dead or
+                    # unwanted:
+                    #   * vX (EMA position + ADX + VWAP) — LIVE with no enable flag of
+                    #     its own, 0 trades in ~4 months, yet sat FIRST in this cascade
+                    #     and would silently pre-empt REV/TREND on any bar it did fire.
+                    #     That is pure downside: no demonstrated edge, real interception
+                    #     risk. It also emitted 18,113 [vX-SKIP] lines across 76 days.
+                    #   * Path C (CONT) and Path D (ST_FLIP) — both PATH_*_ENABLED=False
+                    #     since Apr 2026, 0 trades ever recorded.
+                    # Restore by setting VX_PATH_ENABLED=True.
+                    if (signal is None and _main_window
+                            and getattr(config, 'VX_PATH_ENABLED', False)):
                         signal = self.get_signal(df)
 
                     # ── Path E: HTF Trend Continuation (last resort) ─────────────
@@ -4615,6 +5035,64 @@ class TradingBot:
                                 )
                                 self._path_rev_fired = True   # log once per day
 
+                    # ── PATH_TREND: trend-continuation pullback entry ────────────
+                    # Fills the gap PATH_REV structurally cannot: REV only fades an
+                    # already-exhausted trend, so it can never ride one that is
+                    # still building. Runs independently of _main_window (own gate).
+                    # PATH_TREND_LIVE trades directly (no separate shadow stage) --
+                    # PAPER_TRADE_MODE is already the safety net, so a real paper
+                    # position through the real exit stack is the actual forward
+                    # validation, not a log-only shadow entry.
+                    if (signal is None
+                            and getattr(config, 'PATH_TREND_ENABLED', False)
+                            and not self._path_trend_fired
+                            and not self.positions):
+                        _trend_sig = self.get_path_trend_signal(df, oc, now)
+                        if _trend_sig:
+                            if getattr(config, 'PATH_TREND_LIVE', False):
+                                signal = _trend_sig
+                            else:
+                                # Shadow/log-only mode: nothing downstream will
+                                # consume it, so burn the daily shot here.
+                                self._path_trend_fired = True
+                            # NOTE (Aug 12): when LIVE, the daily one-shot is NOT
+                            # burned here -- it is set only after the trade actually
+                            # enters (see enter_trade call site). Burning it at
+                            # signal-generation time meant a signal killed later by
+                            # the chase gate (which runs much further downstream)
+                            # consumed the day's only attempt, so the engine went
+                            # quiet after a *blocked* entry and never got to take a
+                            # better-priced one later in the session. This mattered
+                            # once the retrace band was retired: TREND now fires on
+                            # the first resumption candle, which is deepest into the
+                            # extreme and most likely to be chase-blocked.
+
+                    # ── Anticipation engine (LIVE) — enter-at-level ──────────────
+                    # Placed LAST in the cascade on purpose: it only fires when no
+                    # proven path (A / B / C / D / E / REV) produced a signal, so it
+                    # can ADD trades without ever preempting the engines that carry
+                    # the book. Flows into the same downstream pipeline as every
+                    # other path — risk cap, funds check, regime & quality lot caps,
+                    # chase gate, SL-M, exit stack, JSONL. No parallel order path.
+                    # Revert: set ANTICIPATION_LIVE=False (one line).
+                    if (signal is None
+                            and getattr(config, 'ANTICIPATION_LIVE', False)):
+                        try:
+                            signal = anticipation_scout.get_live_signal(
+                                instrument = self.instrument,
+                                df         = df,
+                                oi_zones   = self._oi_zones,
+                                logger     = self.logger,
+                                now        = now,
+                                or_high    = self._or_high,
+                                or_low     = self._or_low,
+                            )
+                        except Exception as _al_exc:
+                            self.logger.warning(
+                                f"  [ANTICIP-LIVE] signal error: {_al_exc} — skipping"
+                            )
+                            signal = None
+
                     # ── Tuesday CALL filter: elevated ADX + DI-spread gate ───────
                     # Backtest: overall Tue CALL WR = 31.2% (danger zone) — but this is
                     # the aggregate including weak setups. A strong unambiguous bull trend
@@ -4622,11 +5100,22 @@ class TradingBot:
                     # Gate: ADX ≥ tuesday_call_adx_min AND DI+ dominance ≥ tuesday_call_di_spread.
                     # PATH_REV exempt: reversal signals fire when ADX is waning + DI just
                     # crossing — applying continuation-CALL criteria would always block them.
+                    #
+                    # Aug 12 2026 (bare-bones pass): the exempt list is now config-driven.
+                    # These Tuesday gates were the single largest real blocker in the logs
+                    # (309 hard blocks over 13 days). REV was already exempt; PATH_TREND is
+                    # now exempt too, because it carries its own strictly stronger trend
+                    # evidence -- an ADX floor, a multi-bar ADX *rise*, a DI-spread floor
+                    # AND DI widening, verified live before it will even arm. Re-checking a
+                    # weaker single-bar ADX/DI threshold on top only removes trades.
+                    _TUE_EXEMPT_PATHS = getattr(
+                        config, 'TUESDAY_GATE_EXEMPT_PATHS', ('REV', 'TREND'))
                     if (signal
+                            and getattr(config, 'TUESDAY_GATE_ENABLED', True)
                             and self.skip_tuesday
                             and now.weekday() == 1
                             and signal['type'] == 'CALL'
-                            and signal.get('path') != 'REV'):
+                            and signal.get('path') not in _TUE_EXEMPT_PATHS):
                         _sig_adx = signal.get('adx', 0)
                         _dip_val = df['DI_plus'].iloc[-1]  if 'DI_plus'  in df.columns else float('nan')
                         _dim_val = df['DI_minus'].iloc[-1] if 'DI_minus' in df.columns else float('nan')
@@ -4662,7 +5151,7 @@ class TradingBot:
                             and self.skip_tuesday
                             and now.weekday() == 1
                             and signal['type'] == 'PUT'
-                            and signal.get('path') != 'REV'):
+                            and signal.get('path') not in _TUE_EXEMPT_PATHS):
                         _sig_adx = signal.get('adx', 0)
                         # DI spread from latest bar
                         _dip_val = df['DI_plus'].iloc[-1]  if 'DI_plus'  in df.columns else float('nan')
@@ -4685,20 +5174,15 @@ class TradingBot:
                                 f"(≥{self.tuesday_put_adx_min}), DI-spread={_di_spread_val:.1f} "
                                 f"(≥{self.tuesday_put_di_spread}), path={path}")
 
-                    if signal and not self._duplicate_signal(signal):
-                        # ── Session handover gate ─────────────────────────────
-                        # Block entry if early_bot still holds an open position
-                        # on this instrument (e.g. trailing through 11:00 handover).
-                        if shared_state.has_open_position(
-                                self.instrument, exclude_bot=self._bot_id):
-                            _eb_pos = shared_state.get_open_positions(
-                                self.instrument)
-                            self.logger.info(
-                                f"  [GATE] {self.instrument}: early_bot has open "
-                                f"position — holding entry until it closes. "
-                                f"Positions: {_eb_pos}"
-                            )
-                            signal = None
+                    # ── Session handover gate — REMOVED Aug 14 2026 ──────────
+                    # Blocked entry while early_bot held an open position on this
+                    # instrument. Removed because it can no longer fire: all three
+                    # fno_t_bot_early_* systemd units are `disabled disabled` (unit
+                    # state AND preset), so early_bot never runs and never registers
+                    # a position in shared_state. It fired exactly once, on
+                    # 2026-04-16, four months ago.
+                    # Restore by reinstating this block if early_bot is ever revived
+                    # -- shared_state.has_open_position() is untouched.
 
                     if signal and not self._duplicate_signal(signal):
                         # Lot sizing: signal.get('lots') = 1 or 2 from signal_strength score.
@@ -4717,7 +5201,8 @@ class TradingBot:
                                 getattr(config, 'REGIME_DETECTION_ENABLED', True)
                                 and self._regime == 'CHOPPY'):
                             _lots = min(_lots, getattr(config, 'REGIME_CHOPPY_LOTS_CAP', 1))
-                            if signal.get('path') == 'REV':
+                            if (signal.get('path') == 'REV'
+                                    and getattr(config, 'REGIME_CHOPPY_REV_SKIP', True)):
                                 self.logger.info(
                                     f"  [REGIME] {self.instrument}: CHOPPY — REV blocked"
                                 )
@@ -4731,7 +5216,12 @@ class TradingBot:
                                 getattr(config, 'QUALITY_GATE_ENABLED', True)
                                 and self._quality_state == 'REDUCED'):
                             _lots = min(_lots, 1)
-                            if signal.get('path') == 'REV':
+                            # Aug 12: flag-gated, matching the CHOPPY-regime fix. This is
+                            # the same shape as the bug found Aug 11 -- an unconditional
+                            # REV kill that no flag could reach. It has fired 0 times in
+                            # 392 log files, so this is pre-emptive, not a live fix.
+                            if (signal.get('path') == 'REV'
+                                    and getattr(config, 'QUALITY_GATE_REV_SKIP', True)):
                                 self.logger.info(
                                     f"  [QUALITY] {self.instrument}: REDUCED — REV blocked"
                                 )
@@ -4841,7 +5331,16 @@ class TradingBot:
                         #   NEUTRAL → allowed normally; blocked on days where
                         #             oi_confirm_required=True (Tue, Wed)
                         #   CONFIRM → cleanest entry; no restriction
-                        if signal and getattr(config, 'OI_DIRECTION_BIAS_ENABLED', True):
+                        #
+                        # PATH_TREND exemption: this gate's semantics are
+                        # reversion-framed (MaxPain proximity = "snap back to the
+                        # magnet"), the opposite of what a continuation trade
+                        # wants. PATH_TREND already runs its own inverted OI/PCR
+                        # filter inside get_path_trend_signal() -- applying this
+                        # one on top would tend to reject exactly the setups it's
+                        # designed to take (price moving away from MaxPain).
+                        if (signal and signal.get('path') != 'TREND'
+                                and getattr(config, 'OI_DIRECTION_BIAS_ENABLED', True)):
                             try:
                                 _oi_bias, _oi_reason = self._get_oi_direction_bias(
                                     signal['type'], signal['price'], oc
@@ -4885,6 +5384,14 @@ class TradingBot:
                                     _us_oi = _oi_bias
                                 except NameError:
                                     _us_oi = 'NEUTRAL'
+                                # Aug 13: feed REAL OI levels + PCR. The 'oi'
+                                # component used to key off oi_bias, which went
+                                # permanently NEUTRAL when the OI-BIAS engine was
+                                # stripped -- silently scoring 0 on every signal.
+                                try:
+                                    _us_zone = _oz_action
+                                except NameError:
+                                    _us_zone = None
                                 _ub = unified_scorer.compute_score(
                                     direction        = signal['type'],
                                     df               = df,
@@ -4893,10 +5400,20 @@ class TradingBot:
                                     st15_val         = htf.get('supertrend_15m'),
                                     oi_bias          = _us_oi,
                                     now_str          = now.strftime('%H:%M'),
+                                    oi_zone_action   = _us_zone,
+                                    pcr              = oc.get('pcr'),
+                                    max_pain         = oc.get('max_pain'),
+                                    path             = signal.get('path'),
                                     morning_adx_peak = self._morning_adx_peak,
                                     morning_dir      = self._morning_dir,
                                 )
-                                _ub_thr  = getattr(config, 'UNIFIED_SCORE_THRESHOLD', 55)
+                                # Per-path base: fade engines (REV) score on a
+                                # trend-alignment rubric they structurally fight —
+                                # see UNIFIED_PATH_THRESHOLD in config.
+                                _ub_thr = getattr(
+                                    config, 'UNIFIED_PATH_THRESHOLD', {}
+                                ).get(signal.get('path', ''),
+                                      getattr(config, 'UNIFIED_SCORE_THRESHOLD', 55))
                                 # Per-band offset: 11:00-12:00 lunchtime entries ran
                                 # 0/4 (-₹7,420) live — demand extra quality there.
                                 _ub_thr += getattr(
@@ -4921,12 +5438,20 @@ class TradingBot:
                                     f"(thr={_ub_thr}) | {_ub_cpts}"
                                 )
                                 if not _ub_pass:
-                                    self.logger.info(
-                                        f"  [UNIFIED-BLOCK] {self.instrument} "
-                                        f"{signal['type']} score={_ub['score']} "
-                                        f"< {_ub_thr} — entry suppressed"
-                                    )
-                                    signal = None
+                                    if getattr(config, 'UNIFIED_GATE_ACTIVE', True):
+                                        self.logger.info(
+                                            f"  [UNIFIED-BLOCK] {self.instrument} "
+                                            f"{signal['type']} score={_ub['score']} "
+                                            f"< {_ub_thr} — entry suppressed"
+                                        )
+                                        signal = None
+                                    else:
+                                        self.logger.info(
+                                            f"  [UNIFIED-OBSERVE] {self.instrument} "
+                                            f"{signal['type']} score={_ub['score']} "
+                                            f"< {_ub_thr} — would block, but gate is "
+                                            f"observe-only; taking trade (forward calibration)"
+                                        )
                             except Exception as _ub_exc:
                                 self.logger.warning(
                                     f"  [UNIFIED] Error: {_ub_exc} — "
@@ -4934,6 +5459,34 @@ class TradingBot:
                                 )
 
                         if signal:
+                            # ── Entry location within today's range (Jul 16) ────
+                            # The real fault in the Jul 16 grind losers was not
+                            # theta — it was buying PUTs at the day's LOW (and,
+                            # Jul 13/9, CALLs at the day's HIGH): chasing an
+                            # exhausted move right before mean reversion. Freshness
+                            # checks staleness vs the OR boundary; on a grind the
+                            # boundary itself sits at the extreme. range_pos =
+                            # where entry sits in [today_low, today_high]:
+                            #   PUT bought near 0.0  = at the low  = chase
+                            #   CALL bought near 1.0 = at the high = chase
+                            # Logged as chase_pos (0=ideal pullback entry, 1=full
+                            # chase) so it is comparable across CALL/PUT.
+                            try:
+                                _td   = df[df.index.date == datetime.now(IST).date()]
+                                _d_hi = float(_td['High'].max())
+                                _d_lo = float(_td['Low'].min())
+                                _pxn  = float(signal['price'])
+                                if _d_hi > _d_lo:
+                                    _rpos = (_pxn - _d_lo) / (_d_hi - _d_lo)
+                                    signal['range_pos'] = round(_rpos, 3)
+                                    # chase_pos: how far INTO the trade's own
+                                    # direction the entry already is
+                                    signal['chase_pos'] = round(
+                                        _rpos if signal['type'] == 'CALL'
+                                        else 1.0 - _rpos, 3)
+                            except Exception:
+                                pass
+
                             # ── Composite Signal Scorer (Phase 2: gate active) ────
                             # Logs a weighted 0-100 breakdown of signal quality
                             # across 6 components.
@@ -4989,7 +5542,12 @@ class TradingBot:
                             # Only fires for Path A ORB signals at or after 11:00.
                             # Re-entry signals are also evaluated (they fire post-11 by
                             # definition — PATH_A_REENTRY_CUTOFF=13:00).
-                            if signal and signal.get('path') == 'A' and now.time() >= dtime(11, 0):
+                            # Also dead by construction: gated on path=='A', and PATH_A
+                            # has been disabled since Aug 7. Flag kept so the intent is
+                            # explicit rather than incidental.
+                            if (signal and getattr(config, 'POST11_SCORER_ENABLED', True)
+                                    and signal.get('path') == 'A'
+                                    and now.time() >= dtime(11, 0)):
                                 try:
                                     _p11 = post11_scorer.score(
                                         signal_type = signal['type'],
@@ -5063,6 +5621,45 @@ class TradingBot:
                                     )
 
                             if signal:
+                                # ── Chase gate (Jul 16) — shadow/active ───────
+                                # Vetoes afternoon entries that bought the day's
+                                # own extreme (chase_pos > MAX), except REV.
+                                # Placed last: the signal here is one every other
+                                # gate would have entered, so the shadow log is a
+                                # clean forward test of the rule in isolation.
+                                _cg_mode = getattr(config, 'CHASE_GATE_MODE', 'off')
+                                if _cg_mode != 'off':
+                                    _cp   = signal.get('chase_pos')
+                                    _cgp  = signal.get('path', '')
+                                    _cg_after = getattr(config, 'CHASE_GATE_AFTER', '12:00')
+                                    _cg_exempt = getattr(config, 'CHASE_GATE_EXEMPT_PATHS', ('REV',))
+                                    _cg_hit = (
+                                        _cp is not None
+                                        and _cp > getattr(config, 'CHASE_GATE_MAX', 0.75)
+                                        and now.strftime('%H:%M') >= _cg_after
+                                        and _cgp not in _cg_exempt
+                                    )
+                                    if _cg_hit:
+                                        if _cg_mode == 'active':
+                                            self.logger.info(
+                                                f"  [CHASE-GATE] {self.instrument} "
+                                                f"{signal['type']} path={_cgp}: BLOCK — "
+                                                f"chase_pos={_cp} > "
+                                                f"{getattr(config, 'CHASE_GATE_MAX', 0.75)} "
+                                                f"after {_cg_after} (bought the extreme)"
+                                            )
+                                            signal = None
+                                        else:  # shadow
+                                            self.logger.info(
+                                                f"  [CHASE-GATE] {self.instrument} "
+                                                f"{signal['type']} path={_cgp}: SHADOW "
+                                                f"would-block chase_pos={_cp} > "
+                                                f"{getattr(config, 'CHASE_GATE_MAX', 0.75)} "
+                                                f"after {_cg_after} — taking trade anyway "
+                                                f"(forward test)"
+                                            )
+
+                            if signal:
                                 # ── Final sizing clamp (v1.6) ─────────────────
                                 # The composite-scorer (≥65 → 2 lots) and post-11
                                 # STRONG upgrades run AFTER the regime/quality
@@ -5097,6 +5694,11 @@ class TradingBot:
                                     f"quality={self._quality_state}"
                                 )
                                 signal['atm_iv'] = oc.get('atm_iv')   # IV-scaled target
+                                if signal.get('path') == 'TREND':
+                                    # Burn PATH_TREND's daily one-shot only on a real
+                                    # entry, so a chase-blocked signal earlier in the
+                                    # session does not silence the engine for the day.
+                                    self._path_trend_fired = True
                                 self.enter_trade(signal, hv, lots=_lots)
                                 self.enter_challenger_trade(signal, hv, oc, lots=_lots)
 

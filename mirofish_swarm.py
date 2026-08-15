@@ -43,7 +43,13 @@ log = logging.getLogger(__name__)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-OUT_FILE = Path(__file__).parent / "mirofish_scores.json"
+# Overridable via MIROFISH_OUT_FILE (set in the systemd unit on EC2, where this
+# script runs as 'tradingbot' but the repo checkout is owned by a different
+# user — writing next to the script would hit a PermissionError). Falls back
+# to the script's own directory for local/dev runs.
+OUT_FILE = Path(os.environ.get(
+    'MIROFISH_OUT_FILE', str(Path(__file__).parent / "mirofish_scores.json")
+))
 MAX_HEADLINE_AGE_HOURS = 168     # 7 days — niche angles (banking, FII/DII) post less often
 HEADLINES_PER_ANGLE    = 6
 
@@ -163,9 +169,8 @@ def synthesize(headlines_by_angle: dict[str, list[dict]]) -> dict:
 
     prompt = _SYNTHESIS_PROMPT.replace("__HEADLINES_BLOCK__", headlines_block)
     resp = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         max_tokens=600,
-        temperature=0.0,
         messages=[{"role": "user", "content": prompt}],
     )
     text = resp.content[0].text.strip()

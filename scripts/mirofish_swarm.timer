@@ -1,0 +1,9 @@
+[Unit]
+Description=MiroFish pre-market swarm timer (08:45 IST Mon-Fri)
+
+[Timer]
+OnCalendar=Mon-Fri 03:15:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

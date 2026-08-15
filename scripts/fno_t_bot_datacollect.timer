@@ -1,0 +1,9 @@
+[Unit]
+Description=FnO_T_Bot Data Collection Timer (15:33 IST Mon-Fri)
+
+[Timer]
+OnCalendar=Mon-Fri 10:03:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

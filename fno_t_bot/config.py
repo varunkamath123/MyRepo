@@ -26,7 +26,15 @@ BOT_NAME = "FnO_T_Bot"     # Futures & Options Trading Bot
 # ─── Trading Mode ─────────────────────────────────────────────────────────────
 # Global fallback. Per-instrument 'live_mode' in INSTRUMENT_STRATEGY overrides this.
 # Set True to paper-trade all; set False to use per-instrument live_mode flags.
-PAPER_TRADE_MODE = False   # Global flag — overridden per-instrument via live_mode below
+# PAPER MODE (Jul 31 2026) — user is withdrawing capital from the account.
+# True here is a GLOBAL kill-switch for real orders: options_bot sets
+#   self.live = (not config.PAPER_TRADE_MODE) and _inst_live
+# so this overrides every per-instrument live_mode AND the FORCE_*_LIVE
+# overrides below. No Fyers order can be placed while this is True; entries
+# and exits are simulated via Black-Scholes and still written to the trade
+# JSONL, so paper results keep accumulating normally.
+# Set back to False only when capital is restored and you intend to trade live.
+PAPER_TRADE_MODE = True    # <-- PAPER: no real orders
 
 # ─── Multi-Instrument Configuration ──────────────────────────────────────────
 # Lot sizes (confirmed Mar 2026):
@@ -231,8 +239,47 @@ TRAILING_DISTANCE    = 0.10        # Trail distance 10% from peak (was 20%)
 # (REV at 12:00, late PATH-A) previously had no progress-based exit at all
 # (e.g. Jun 9 BNF REV -₹4,180 bled the full 150min to force-close).
 NEVER_PROGRESS_ENABLED   = True
-NEVER_PROGRESS_MINUTES   = 90      # minimum age before the check applies
-NEVER_PROGRESS_MIN_PEAK  = 0.03    # peaked ≥ +3% at any point = exempt (has shown life)
+NEVER_PROGRESS_MINUTES   = 45      # min age before the check applies. LOWERED 90→45
+                                   # (Jul 21 diag): at 90 the exit was DEAD CODE — 0
+                                   # fires ever. It was pincered: morning entries hit the
+                                   # 12:00 checkpoint first, afternoon Path B entries hit
+                                   # the 14:30 force-close first (they enter 13:40+ with
+                                   # <50min runway). 45min fits inside the afternoon runway
+                                   # so a never-progressed Path B bleeder gets cut ~14:25
+                                   # instead of riding to force-close (Jul 16 losers peaked
+                                   # +1.9%/+3.0%, force-closed -5.7%/-11.6%).
+NEVER_PROGRESS_MIN_PEAK  = 0.05    # RAISED 3%->5% (Jul 24 v1.9.1 — "peak giveback" gap).
+                                   # exempt-if-ever-shown-life is a ONE-TIME check: once a
+                                   # position peaks past the floor it is exempt for the
+                                   # REST OF THE DAY, even if it fully gives the gain back
+                                   # and keeps decaying. A peak just above the old 3% floor
+                                   # is also below trail-activation (12-18%), so the
+                                   # trailing stop never arms either — a true dead zone with
+                                   # no active protection. Two same-shape casualties: Jul 16
+                                   # SENSEX B peaked 3.0% -> -11.6% at EOD; Jul 24 SENSEX B
+                                   # peaked 3.75% (exempt under the old 3% floor) -> -8.97%
+                                   # at EOD, unmonitored for ~2h after its peak. Raising to
+                                   # 5% (matching CHECKPOINT_LOSS_STOP_MIN_PEAK below — same
+                                   # underlying question: did this show ENOUGH real strength
+                                   # to deserve protection) catches both retroactively.
+                                   # Still requires pnl_pct<0 to fire — can NEVER cut a
+                                   # position that is currently green, only accelerates
+                                   # cutting a red one that peaked modestly and decayed.
+
+# Checkpoint loss-stop exemption (Jul 23 2026 — v1.9). The 12PM hard loss-stop
+# was killing red-at-that-instant positions unconditionally, regardless of how
+# strong the thesis had been intraday — using P&L SIGN as the only signal.
+# Two documented casualties: Jul 17 SENSEX peaked +8.3% -> killed -1.3%;
+# Jul 22 NIFTY peaked +15.4% -> killed -1.7%. Meanwhile Jul 22 SENSEX at only
+# +0.2% at checkpoint got the exit-score evaluation (score 65 HOLD) and ran to
+# +1,095 — the SAME mechanism exists, it just never got applied to red trades.
+# Fix: a position that peaked >= this threshold is red-but-strong, not
+# red-and-dead — route it to the SAME exit-score evaluation used for green
+# positions instead of an automatic kill. Set above NEVER_PROGRESS_MIN_PEAK
+# (3%) since converting to A_HELD has a bigger consequence (runs for hours)
+# than the never-progress cut — a barely-positive peak (e.g. 2.9%, still
+# correctly killed live on Jul 22 BANKNIFTY) shouldn't earn a second look.
+CHECKPOINT_LOSS_STOP_MIN_PEAK = 0.05
 
 # Dynamic profit target — scale BASE_TARGET with ATM-IV at entry (May 2026)
 # High IV = bigger daily swings → option can reach 50% gain on same move
@@ -375,14 +422,45 @@ REGIME_CHOPPY_ADX_MAX       = 25.0   # ADX@11:00 below this = choppy day
 REGIME_TRENDING_ADX_MIN     = 28.0   # ADX@11:00 at/above this = trending day
 REGIME_CHOPPY_DAYS_NEEDED   = 2      # N choppy days in window → CHOPPY mode
 REGIME_CHOPPY_LOTS_CAP      = 1      # max lots in CHOPPY mode
-REGIME_CHOPPY_REV_SKIP      = True   # suppress REV entirely in CHOPPY mode
+# ── REV REGIME BLOCKS REMOVED (Aug 7 2026) ──────────────────────────────────
+# These two flags were switched off after they were shown to suppress the only
+# profitable engine in the book, in 98% of all observed sessions.
+#   Regime observed over 96 instrument-days: CHOPPY 94 (97.9%), MIXED 2 (2.1%).
+#   Last 20 trading days: 60/60 CHOPPY.
+#   With both skips True, REV could only fire in MIXED -> it has not fired
+#   since 2026-06-17, i.e. it was effectively deleted.
+# REV's own record, split by the very regimes these gates blocked:
+#   TRENDING_BULL  7 trades 4W/3L  +Rs5,516
+#   CHOPPY         6 trades 3W/3L    +Rs879
+# Both cohorts positive. Neither block is supported by REV's own data; they
+# were added in v1.3/v1.4 from a loss study that attributed losses to REV in
+# those regimes, but the full-book split contradicts it.
+# REV overall: 13 trades, 54% WR, +Rs6,395 (+Rs492/trade) -- the ONLY engine
+# with positive expectancy in 64 live trades.
+REGIME_CHOPPY_REV_SKIP      = False  # was True -- see above
 REGIME_CHOPPY_LATE_ORB_SKIP = True   # block late-window ORB in CHOPPY (theta trap on INSIDE days)
-REGIME_TRENDING_REV_SKIP    = True   # block REV in TRENDING regime (waning-ADX ≠ reversal in trend)
+REGIME_TRENDING_REV_SKIP    = False  # was True -- see above
+
+# ─── PATH-A (Opening Range Breakout) master switch ───────────────────────────
+# DISABLED Aug 7 2026 — stripped rather than repaired, per the full-book audit.
+# PATH-A incl. its A_HELD / ORB_HELD conversions: 29 entries, -Rs3,907 net.
+#   converted to held runner :  5 (17%)  3W/2L  +Rs10,564  (+Rs2,113/trade)
+#   did not convert          : 24 (83%)  5W/19L -Rs14,471  (-Rs603/trade)
+# The held runners produce the biggest single wins (incl. the book's best,
+# +Rs8,010) but at a 17% conversion rate they do not pay for the 83% that
+# bleed. It was simultaneously the primary engine and the largest loss source.
+# Re-enable only with evidence that the conversion rate or the non-converting
+# loss has structurally changed.
+PATH_A_ENABLED = False
 
 # ─── Rolling Signal Quality Gate ──────────────────────────────────────────────
 # Tracks last N live trades. WR + combined loss both must breach thresholds
 # before reducing exposure (REDUCED: 1 lot, no REV). Resets on 2 consec wins.
 QUALITY_GATE_ENABLED        = True
+# Aug 12 2026: the REDUCED-state REV kill is now flag-gated (same shape as the
+# CHOPPY-regime block that silently ate 6 REV signals Aug 10-12). Set False so a
+# quality-throttled session caps size instead of removing our only proven engine.
+QUALITY_GATE_REV_SKIP       = False
 QUALITY_GATE_LOOKBACK       = 5      # rolling window (live trades)
 QUALITY_GATE_WR_MIN         = 0.40   # WR below this triggers check
 QUALITY_GATE_LOSS_THRESHOLD = 5000.0 # combined P&L must also be < -₹5,000
@@ -405,7 +483,10 @@ PATH_F_ENTRY_END   = '13:00' # OTM options need runway: cap Path F entries at 13
 # On expiry days (DTE ≤ 2), when spot opens ≥ 0.5% above/below MaxPain,
 # writers are offside and will defend aggressively to pull price back.
 # Paper-only until validated over 30+ live sessions.
-MP_TRAP_ENABLED         = True    # master switch — enables evaluate_bar calls
+# STRIPPED Aug 12 2026 (bare-bones pass): isolated Rs10k paper pool with no code
+# path to enter_trade() -- it can never affect the book, so every bar it evaluates
+# is pure overhead and log noise (247 "no displacement" lines over 24 days).
+MP_TRAP_ENABLED         = False   # master switch — enables evaluate_bar calls
 # Per-instrument gap thresholds (how far spot must be from MaxPain to fire).
 # BNF uses a tighter threshold: weekly expiry creates more frequent but smaller
 # opening displacements vs NIFTY's monthly expiry where displacements are rarer
@@ -453,7 +534,11 @@ MP_TRAP_TARGET_SPEND    = 3_000   # target ₹3k deployment per trade
 #
 # Set PATH_B_ENABLED = False to revert to EMA 9/21 fresh crossover.
 PATH_B_ENABLED         = True        # True = EMA crossover archived (don't revert)
-PATH_B_LIVE            = True        # ENABLED Jul 8 2026 (v1.6). Was False on a 37.5% WR /
+# DISABLED Aug 7 2026 — stripped, not repaired. Live record since it was
+# enabled Jul 8: 9 trades, 4W/5L, -Rs3,768 (-Rs419/trade). It never showed
+# positive expectancy in real trading. Set True only with new evidence.
+PATH_B_LIVE            = False
+                                     # (history) enabled Jul 8 2026 in v1.6 after a 37.5% WR /
                                      # -₹249k backtest — but that was BS-premium-priced
                                      # (Jun 12 lesson: BS sims distort materially — REV showed
                                      # -₹4.9k on BS vs +₹66k on real premiums) and predates the
@@ -467,6 +552,14 @@ PATH_B_RANGE_END       = '10:55'     # morning range = 09:15–10:55 (all bars b
 PATH_B_ADX_MIN         = 25          # uniform for CALL and PUT (no 2-DTE asymmetry at 12 DTE)
 PATH_B_BUFFER          = 0.0008      # 0.08% buffer above MR_high / below MR_low
                                      # NIFTY ≈ 19–20 pts | BANKNIFTY ≈ 40 pts | SENSEX ≈ 63 pts
+PATH_B_MAX_BREAK_AGE_BARS = 3        # break freshness (Jul 13, first live fire): the ADX
+                                     # filter can lag a drift-led breakout by 30-60 min —
+                                     # SENSEX broke MR_high ~12:15 at ADX 10.6, ADX crossed
+                                     # 25 only at 12:55 with price +0.39% extended = top tick
+                                     # (-25.8%). Entry must be within 3 bars (15 min) of the
+                                     # boundary cross; momentum-led breaks (ADX already high,
+                                     # e.g. Jul 8 waterfall) pass, drift-then-ADX-lag chases
+                                     # are skipped. 0 disables.
 PATH_B_OI_SNAP_DIST    = 0.003       # snap range edge to OI MAJOR/WALL if within 0.3%
 PATH_B_PCR_BULL_GATE   = 1.3         # PCR > 1.3 → heavy put writing → suppress PUT breakout
 PATH_B_PCR_BEAR_GATE   = 0.75        # PCR < 0.75 → heavy call writing → suppress CALL breakout
@@ -498,8 +591,17 @@ PATH_B_MAX_TRADES      = 1           # once per day per instrument (same discipl
 # Calibration note: PCR thresholds are starting values.  Review after 30+ live
 # sessions.  If OI_DIRECTION_BIAS_REJECT is blocking too many good setups, raise
 # PCR thresholds; if CALL bias is wrong after BNF gap-ups, keep thresholds tight.
-OI_DIRECTION_BIAS_ENABLED   = True   # master switch for the live OI bias engine
-OI_DIRECTION_BIAS_REJECT    = True   # hard-block entry when bias score ≤ −2 (REJECT)
+# STRIPPED Aug 12 2026 (bare-bones pass). This gate hard-blocked 36 entries
+# across 24 days, and the evidence says it blocks the wrong ones: on a 395-signal
+# reconstruction, CONFIRM (score>=+2) returned -Rs396/trade while REJECT (<=-2)
+# returned +Rs1,696/trade -- i.e. inverted. It also independently rejected the
+# May 21 BANKNIFTY REV entry that became the 2nd-largest winner in the book
+# (+Rs4,283). Its four inputs (PCR, PCR-drift, MaxPain, IVskew) are all still
+# scored inside PATH_REV itself and inside PATH_TREND's own continuation-framed
+# filter, so removing this layer loses no information -- only the bad veto.
+# Set both True to restore.
+OI_DIRECTION_BIAS_ENABLED   = False
+OI_DIRECTION_BIAS_REJECT    = False
 OI_PCR_CALL_CONFIRM_MAX     = 0.90   # PCR below this  → CALL-buyer dominant  (+1 CALL)
 OI_PCR_PUT_CONFIRM_MIN      = 1.10   # PCR above this  → PUT-buyer dominant   (+1 PUT)
 OI_MAXPAIN_GRAVITY_PCT      = 0.008  # 0.8% from MaxPain triggers gravity bias (DTE≤2 only)
@@ -543,6 +645,12 @@ TMS_SLOPE_BARS     = 3       # bars to look back for ADX slope + EMA spread chec
 PATH_E_ENABLED    = False    # DISABLED Apr 2026: ORB (Path A) is the only validated live signal.
                              # Path E has not fired live; no edge confirmed. Re-enable after ORB
                              # proves out with 30+ clean live days.
+# STRIPPED Aug 12 2026 (bare-bones pass). vX is the EMA-position/ADX/VWAP path
+# inside get_signal(). It had NO enable flag of its own — it was reachable purely
+# because PATH_B_ENABLED=True routes there — and it sat FIRST in the dispatch
+# cascade, ahead of both REV and TREND. 0 trades in ~4 months, but on any bar it
+# did fire it would have pre-empted a proven engine. Now explicitly gated.
+VX_PATH_ENABLED   = False
 PATH_C_ENABLED    = False    # CONT: EMA spread widening 3 bars + ADX≥35 — DISABLED Apr 2026.
                              # No live edge confirmed; phantom trade risk on non-ORB days.
 PATH_D_ENABLED    = False    # ST_FLIP: 5m SuperTrend direction flip — DISABLED Apr 2026.
@@ -828,7 +936,10 @@ PATH_A_EXCEPTIONAL_PROFIT_CLOSE = 0.50   # ≥50% gain at checkpoint → lock in
 # After a stop-loss exit, allow one re-entry if the OR level re-tests and holds
 # with higher conviction (ADX≥35) before 13:00. Captures "second break" days
 # where the first break was a false start but the underlying trend re-asserts.
-PATH_A_REENTRY_ENABLED     = True    # allow one re-entry after PATH-A stop-loss
+# Unreachable since PATH_A_ENABLED=False (Aug 7 strip) — PATH-A never enters,
+# so it can never stop out, so there is nothing to re-enter. Flag left in
+# place for whenever PATH-A is revisited.
+PATH_A_REENTRY_ENABLED     = False   # allow one re-entry after PATH-A stop-loss
 PATH_A_REENTRY_ADX_MIN     = 35     # higher bar than initial entry (day min is 20-30)
 PATH_A_REENTRY_CUTOFF      = '13:00' # no re-entry after 13:00 (need 90 min runway to EOD)
 
@@ -1093,7 +1204,9 @@ PATH_A_DYNAMIC_OR_DI_MIN_SPREAD = 15   # If |DI+ − DI−| ≥ 15 pts, only the
 # Evidence (May 13 2026): NIFTY gap-dn, PUT caught at 09:35 (+44%), but
 # 247-pt CALL recovery (23,263→23,510) fully missed — ADX stuck at 17–24
 # while DI+=28–31 dominated for 5+ hours.
-GAP_REV_ENABLED        = True
+# Unreachable since PATH_A_ENABLED=False — GAP_REV only ever supplemented
+# PATH-A's ADX gate; with PATH-A off it can never fire.
+GAP_REV_ENABLED        = False
 GAP_REV_MIN_GAP_PCT    = 0.005   # ≥0.5% open gap to qualify (smaller = noise)
 GAP_REV_RECOVERY_PCT   = 0.50    # price must recover ≥ 50% of gap before entry
 GAP_REV_ADX_MIN        = 18      # reduced ADX floor (normal 25–30 biased by gap bars)
@@ -1113,21 +1226,12 @@ GAP_REV_ENTRY_EXT      = '12:30' # extended entry window for gap-reversal direct
 # Adding BNF at Rs50k and SENSEX at Rs75k matches existing manual thresholds
 # while making the transitions automatic.
 
-# -- PATH_BTR: Bull / Bear Trap Reversal --------------------------------------
-# Fires when an OI-REJECTED ORB is followed by price reversing back through
-# the OR boundary.  Double OI filter provides high conviction:
-#   (1) OI REJECTED the original direction  (score <= -2)
-#   (2) OI CONFIRMS the reversal direction  (score >= +2)
-# Bull-trap: CALL blocked -> watches for PUT reversal.
-# Bear-trap: PUT  blocked -> watches for CALL reversal.
-# Live from day 1 — tighter ADX (22) compensated by OI double-filter.
-PATH_BTR_ENABLED       = True    # activate detection + live entry
-PATH_BTR_ADX_MIN       = 22      # lower than ORB 25 -- OI context compensates
-PATH_BTR_OI_REQUIRED   = True    # OI MUST CONFIRM reversal (no NEUTRAL allowed)
-PATH_BTR_REVERSAL_BARS = 2       # consecutive closes back through OR boundary
-PATH_BTR_MIN_HOUR      = '10:30' # don't fire too early (reversal needs to develop)
-PATH_BTR_MAX_HOUR      = '12:30' # no BTR after 12:30 (insufficient session runway)
-PATH_BTR_LOTS          = 1       # 1 lot only -- conservative until WR proven
+# -- PATH_BTR: Bull / Bear Trap Reversal -- DELETED Aug 12 2026 -------------
+# Removed in the bare-bones pass. This was an ORPHANED FLAG: PATH_BTR_ENABLED
+# read True and a full parameter block was defined, but no implementation ever
+# existed anywhere in the codebase -- no get_path_btr_signal(), no dispatch
+# call, nothing. It looked live and did nothing. Its dependency (the OI-BIAS
+# REJECT signal it was meant to trigger on) is itself stripped now.
 
 CAPITAL_GATE_ENABLED     = True
 CAPITAL_GATE_BNF_LIVE    = 50_000   # BNF goes live when combined capital >= Rs50k
@@ -1178,6 +1282,125 @@ PATH_A_SMA_PROX_PCT     = 0.003   # within 0.3% of SMA_slow = potential headwind
 PATH_A_PDH_PDL_ENABLED  = True    # track prev-day high/low as S/R reference
 PATH_A_PDH_PDL_PROX     = 0.002   # within 0.2% of PDH (CALL) or PDL (PUT) = log wall proximity
 
+# ─── Anticipation-first entry engine (Jul 22 2026) ───────────────────────────
+# Shadow module (anticipation_scout.py): enter at a LEVEL price is holding,
+# BEFORE the breakout — the "capture before it happens" thesis. Logs would-be
+# entries + tracks the underlying to resolution; places NO orders. Runs live to
+# gather forward evidence vs the confirmation-breakout paths on the same tape.
+# Promote to a live-order path only if it beats breakouts forward.
+# STRIPPED Aug 12 2026 (bare-bones pass): log-only, has never placed a position.
+# Its forward record is also not compelling enough to keep paying for -- Aug 10
+# three green shadow entries, Aug 12 two straight stop-outs (-Rs2,169/-Rs1,422).
+# Set True to resume shadow logging.
+ANTICIPATION_SHADOW_ENABLED = False
+
+# LIVE anticipation entries (Jul 31 2026) — places REAL orders.
+# Enabled at user's explicit direction after the exhaustion gate was retired.
+# Evidence: replaying Jul 27-30 through the current entry stack gives 21 trades
+# 10W/11L ~+Rs5,078, vs the old (exhaustion-gated) config's 9 trades 0W/9L
+# ~-Rs12,102 on identical data.
+# Honest limits of that evidence, recorded deliberately:
+#   - 4 days only, and those days are INSIDE the 60-day window the entry
+#     parameters were calibrated on -> partially in-sample, not a clean test
+#   - 10W/11L is a LOSING win rate; profitable only because winners ran larger
+#   - P&L approximated at delta 0.5 on index moves, not real option fills
+#   - the engine had never placed a real order before this flag
+# Safety: signal always requests 1 lot; runs LAST in the cascade so it cannot
+# preempt PATH-A/B/REV; inherits the full downstream gate stack (risk cap,
+# funds check, regime/quality caps, chase gate, SL-M, exit management).
+# Revert: set False.
+# REVERTED TO FALSE (Jul 31 2026, same day it was enabled).
+# It was enabled on a 4-day replay (Jul 27-30: 21 trades 10W/11L ~+Rs5,078).
+# The full-month test then contradicted it: across ALL of July the engine is
+# 105 trades 38W/67L ~-Rs4,976. Removing PDH/PDL (stale prev-day levels, 1 win
+# in 14, -Rs15,788) improved it to 96 trades 37W/59L ~-Rs1,025 -- better, but
+# still NEGATIVE. There is no demonstrated positive expectancy, so it should
+# not be risking capital.
+# The 4-day window was simply a favourable slice; treating it as sufficient
+# evidence was the error. Set back to True only after a genuinely
+# out-of-sample period shows positive expectancy.
+ANTICIPATION_LIVE = False
+
+# ─── Chase gate (Jul 16, ACTIVATED Jul 24 2026 — user directive) ─────────────
+# chase_pos = direction-normalized entry location in today's range (0=pullback
+# entry, 1=bought the extreme). NEVER buy a PUT at the day's low or a CALL at
+# the day's high — that is buying an option at the point of maximum extension.
+# FULL 64-TRADE LIVE EVIDENCE (Jul 24): the book's entire lifetime loss lives
+# in extreme-chase entries. Extreme (chase>0.90) = 42 trades, -₹8,552; blocking
+# chase>0.95 removes 39 trades netting -₹15,692 and takes the book from
+# -₹16,788 to -₹1,096. Pullback entries (chase<0.30) are the only +EV bucket
+# (3t, +₹327). This is the single strongest signal in the whole live dataset.
+# ACTIVE, ALL-DAY (was shadow, afternoon-only). Accepted cost: forgoes ~13
+# winners incl. the occasional held-runner — the user's stated risk preference
+# is to never chase the extreme even at that cost. REV stays exempt (anti-chase
+# by design, +EV, structurally low-chase anyway). Threshold 0.93 = "at the
+# genuine extreme"; in-sample-noisy between 0.92-0.95 so NOT curve-fit to the
+# optimum — logged on every block so it can be tuned forward.
+# The reversal-positioning half of the directive is anticipation_scout (shadow,
+# regime-dependent — goes live once it proves it doesn't catch knives).
+# MODE: 'off' | 'shadow' (log only) | 'active' (skip the entry)
+# ── Chase gate: REMOVED Aug 13 2026 (user directive) ─────────────────────────
+# Entry-location quality is now judged by ADX + OI levels + PCR (see the
+# unified scorer's adx / oi / pcr components) rather than by where price sits
+# in the day's raw range.
+#
+# Why: chase_pos only asks "is price at today's extreme?", which is a proxy for
+# the real question -- "is there room left to the level that matters?". The
+# proxy broke down structurally on PATH_REV, which was exempted on the theory
+# that "REV fades are anti-chase". Aug 13 disproved that: REV bought a SENSEX
+# PUT at chase_pos 0.978 (2.2% off the day's low), never went green for a
+# single bar, and lost Rs1,566 (-19%). The fade had already fully played out;
+# REV joined the completed move at its extreme.
+#
+# HONEST CAVEAT, recorded so this is revisitable: the chase gate was the single
+# strongest finding in this project's live data -- across 64 trades, blocking
+# chase>0.95 moved the book from -Rs16,788 to -Rs1,096. That evidence was
+# measured on PATH-A/PATH-B breakout entries, and is NOT invalidated by one REV
+# trade. It is being retired on the judgement that ADX/OI/PCR measure the same
+# thing better, not on evidence that chase_pos was wrong. If entry quality
+# degrades over the next few weeks, restore with CHASE_GATE_MODE='active'.
+# chase_pos is still COMPUTED and LOGGED on every entry for exactly that check.
+CHASE_GATE_MODE         = 'active'   # RE-ARMED Aug 14 2026 — see below
+CHASE_GATE_MAX          = 0.93     # chase_pos above this = bought the extreme → block
+CHASE_GATE_AFTER        = '09:15'  # ALL-DAY (mornings chase too — today's -₹2,491 proof)
+# RE-ARMED Aug 14 2026 with NO exemptions. The 'REV fades are anti-chase' theory
+# is dead: Aug 13 REV bought a SENSEX PUT at chase_pos 0.978 and lost Rs1,566.
+# REV being exempt is precisely why removing the gate never fixed that trade.
+#
+# Evidence across every entry we have chase_pos for (gate at 0.93, no exemptions):
+#   BLOCKS  Aug13 SENSEX REV  0.978  -Rs1,566
+#   BLOCKS  Aug14 BNF   TREND 0.962  -Rs1,779   (retrace=0%, bought the extreme)
+#   allows  Aug11 NIFTY TREND 0.896  +Rs96
+#   allows  Aug11 SENSEX TREND 0.893  -Rs99
+#   allows  Aug14 BNF   REV   0.286  -Rs2,337   (good location, failed on timing)
+#   -> saves Rs3,345 of Rs5,685 in losses; blocks no winner.
+# Consistent with the original 64-trade finding (blocking chase>0.95 moved the
+# book -Rs16,788 -> -Rs1,096). Removing it was a one-day experiment that cost
+# Rs1,779 on its first live trade.
+CHASE_GATE_EXEMPT_PATHS = ()
+
+# Tuesday elevated-ADX/DI gates: which paths skip them (bare-bones pass, Aug 12
+# 2026). Largest real blocker in the logs — 309 hard blocks over 13 days. REV was
+# always exempt; TREND added because its own qualification (ADX floor + multi-bar
+# ADX rise + DI-spread floor + DI widening, all verified live) is strictly
+# stronger than the single-bar ADX/DI threshold this gate re-checks.
+TUESDAY_GATE_EXEMPT_PATHS = ('REV', 'TREND')
+
+# STRIPPED Aug 14 2026: the gate is now UNREACHABLE. Every one of its 5 blocks
+# in 4 months landed on a path that is since disabled --
+#   2026-05-12 ADX 32.7 < 35  path=A
+#   2026-05-26 ADX 32.3 < 35  path=ORB
+#   2026-06-23 ADX 33.4 < 35  path=A
+#   2026-07-14 ADX 32.2 < 35  path=B
+#   2026-07-21 ADX 29.4 < 30  path=B
+# -- and the only two live paths (REV, TREND) are exempt above. With A/B/ORB/E
+# all off, no signal can reach it. Note every block was also a marginal miss
+# (32.7 vs 35, 33.4 vs 35, 32.2 vs 35, 29.4 vs 30), never a decisive rejection.
+# Original rationale, still valid if PATH_A/B are ever revived: Tuesday is
+# expiry for NIFTY/BNF, so low DTE means low gamma and a weak trend is punished
+# harder than on other days. Set True to restore.
+TUESDAY_GATE_ENABLED      = False
+
 # ─── PATH_REV: MaxPain Snap Reversal ─────────────────────────────────────────
 # Fires after the ORB window closes when the morning trend exhausts and price
 # snaps toward MaxPain.  Strongest on DTE≤2 (options-pinning effect is sharpest).
@@ -1191,14 +1414,94 @@ PATH_A_PDH_PDL_PROX     = 0.002   # within 0.2% of PDH (CALL) or PDL (PUT) = log
 # PAPER-ONLY (PATH_REV_LIVE=False) — logs [PATH-REV PAPER].  Set True after 30 trades.
 PATH_REV_ENABLED            = True    # enable reversal detection (logs paper signal)
 PATH_REV_LIVE               = True    # LIVE — deployed May 5 2026 after retroactive validation
-PATH_REV_START              = '12:00' # earliest fire time (after ORB window)
+# START was '12:00', a fixed outer-bound guess unrelated to the actual exhaustion
+# condition. Diagnostic (Aug 8 2026, causal replay w/ multi-day ADX warm-up,
+# 236 eligible days): 142/236 (60%) first crossed score>=3 BEFORE 12:00; of
+# those, 26 NEVER re-crossed 3 before PATH_REV_END (pure lost trades under the
+# old floor) and the other 116 fired a median 60min late for a coinflip
+# (49%) on entry price quality. '09:45' matches the "OR ready" boundary
+# already used elsewhere (PATH_A_START comment) -- the score gate itself
+# (needs morning ADX/DI peak + live exhaustion components) still does the
+# real gating; this floor only removes the arbitrary extra wait.
+PATH_REV_START              = '09:45' # earliest fire time (after OR forms, 6 bars)
 PATH_REV_END                = '13:30' # latest fire time (need runway to 14:30 force-close)
 PATH_REV_MIN_SCORE          = 3       # minimum score (0–6) to fire
 PATH_REV_MIN_MORNING_ADX    = 30      # morning must have had a real trend (ADX peak ≥ this)
 PATH_REV_MIN_DI_SPREAD_PEAK = 12      # morning DI spread peak ≥ this (real directional trend)
-PATH_REV_IVSKEW_FLIP_PCT    = 4.0     # IVSkew must shift ≥ this % toward reversal direction
+# PATH_REV_IVSKEW_FLIP_PCT (was 4.0) RETIRED Aug 14 2026 — the IVSkew
+# component it drove contributed to 8 of 81 qualifying signals in 2,297
+# production evaluations, and to ZERO on SENSEX (BSE feed has no ATM-IV).
+# PATH_REV max score is now 4, which is also the highest ever recorded.
 PATH_REV_MAXPAIN_PROX_PCT   = 0.005   # within 0.5% of MaxPain → proximity bonus
 PATH_REV_ADX_WANE_RATIO     = 0.85    # ADX < peak × this = momentum waning
+
+# ─── PATH_TREND: Trend-Continuation Pullback Entry ───────────────────────────
+# Built Aug 8 2026 to fill the gap PATH_REV structurally cannot: REV only
+# fades exhaustion (needs ADX already peaked + waning), so it can never ride
+# a trend that is still building. TREND catches that regime instead.
+#
+# Opposite framing from every prior path on TWO counts:
+#   1. It qualifies on ADX RISING (not peaked) + DI spread WIDENING (not
+#      converging) -- an early, still-developing trend, not an exhausted one.
+#   2. Its OI/PCR filter is CONTINUATION-framed, the inverse of
+#      _get_oi_direction_bias()'s MaxPain-proximity ("snap back to the
+#      magnet") reversion framing: PCR should drift WITH the trend, and price
+#      should be moving AWAY from MaxPain (momentum beating the magnet).
+#      Because the global OI-BIAS gate's semantics are reversion-style, it is
+#      exempted for path=='TREND' (see options_bot.py) -- applying it would
+#      tend to reject exactly the continuation setups this path wants.
+#
+# Entry design directly targets the PATH-A failure mode (avg chase_pos
+# 0.96-0.98 on that engine's real trades): qualify on the breakout, but only
+# FIRE on a pullback (25-70% retracement) + a real swing low/high + an ADX
+# uptick + a real-bodied candle -- i.e. buy the dip in the trend, not the
+# breakout itself.
+#
+# Backtest (Aug 8 2026, full causal bar-by-bar replay, all 3 instruments, all
+# available history, proxy P&L since no historical option-premium series
+# exists -- NOT the live premium-based exit stack, which this path shares
+# with every other path via enter_trade()):
+#   27 trades, 40.7% WR, avg chase_pos 0.41 (vs PATH-A's 0.96-0.98).
+#   Trades that ever went favorable: 19, 58% WR, net positive.
+#   Trades that never went favorable (false starts, straight to stop): 8,
+#   0% WR -- this bucket is the entire deficit. First-half/second-half split
+#   was inconsistent (small-sample, 27 trades over 14 months) -- NOT deployed
+#   on backtest confidence. Deployed to paper trading instead (real exit
+#   stack, zero capital risk under PAPER_TRADE_MODE) as the actual forward
+#   validation step, per user direction Aug 8 2026.
+PATH_TREND_ENABLED       = True
+PATH_TREND_LIVE          = True     # paper-trades directly -- no separate shadow stage needed
+PATH_TREND_START         = '09:45'  # after OR forms (6 bars)
+PATH_TREND_END           = '13:00'  # leave >=90min runway to 14:30 force-close
+PATH_TREND_MIN_ADX       = 22       # lower than REV's 30 -- catches the trend while building
+PATH_TREND_ADX_RISE_BARS = 3        # compare ADX to this many bars ago
+PATH_TREND_ADX_RISE_MIN  = 2.0      # must have risen by at least this much
+PATH_TREND_MIN_DI_SPREAD = 10
+PATH_TREND_DI_WIDEN_BARS = 3
+# PATH_TREND_PULLBACK_MIN/MAX (were 0.25 / 0.70) RETIRED Aug 12 2026.
+# The band required a 25-70% pullback before entry -- unreachable on a clean
+# one-way trend, where the leg extreme extends every bar and retrace stays 0%
+# by construction. It blocked the exact regime this engine was built for
+# (Aug 12: NIFTY -106pts, SENSEX -329pts, both correctly signalled, neither
+# taken). Entry quality is now carried by the remaining structural filters
+# (swing high/low, candle direction, body >= 0.15*ATR, ADX uptick, plus the
+# live ADX floor / DI alignment in _update_trend_qualification) and by the
+# chase gate, which still blocks entries at the literal extreme.
+# retr is still computed and logged on every fire for forward calibration.
+PATH_TREND_ADX_FLOOR     = 17       # trend invalidated if ADX drops below this during pullback
+PATH_TREND_BODY_ATR_MIN  = 0.15     # resumption candle body >= this x ATR (filters doji noise)
+PATH_TREND_OI_DRIFT_THRESH = 0.05   # PCR drift threshold (same magnitude as OI_PCR_DRIFT_THRESHOLD)
+PATH_TREND_OI_PCR_CALL_MAX = 1.05   # PCR above this contradicts a CALL continuation
+PATH_TREND_OI_PCR_PUT_MIN  = 0.95   # PCR below this contradicts a PUT continuation
+# Trail: was silently inheriting TRAILING_ACTIVATION/TRAILING_DISTANCE (tuned for
+# REV/RECLAIM's shorter-lived fades) via the generic fallthrough branch in
+# check_exit_position. Given its own named config now so it can be tuned
+# independently once more than one live sample exists -- values currently
+# copied as-is (Aug 12 2026), not yet retuned. First live trade (Aug 11 NIFTY
+# PUT) peaked 12.83%, barely over the 12% arm floor, and gave back to 2.37% --
+# worth watching, not yet enough evidence to change.
+PATH_TREND_TRAIL_ACT       = TRAILING_ACTIVATION
+PATH_TREND_TRAIL_DIST      = TRAILING_DISTANCE
 
 # ─── Post-11 Scorer Thresholds ───────────────────────────────────────────────
 # Aggregate score below POST11_SCORE_SKIP_MIN → skip entry (quality too low).
@@ -1206,6 +1509,11 @@ PATH_REV_ADX_WANE_RATIO     = 0.85    # ADX < peak × this = momentum waning
 # POST11_OTM_BOOST: for STRONG signals (≥POST11_SCORE_STRONG_MIN), add +1 OTM
 # strike to buy a currently-OTM option that converts to near-ATM/ITM on continuation.
 POST11_SCORE_SKIP_MIN   = 40    # aggregate < 40 → skip (bad overall quality)
+# STRIPPED Aug 12 2026 (bare-bones pass): the post-11 scorer has produced ZERO
+# blocks in 392 production log files — it has never once changed an outcome, so
+# it is pure evaluation cost and one more thing to reason about. UNIFIED already
+# covers aggregate quality. Set True to restore.
+POST11_SCORER_ENABLED   = False
 POST11_SCORE_STRONG_MIN = 70    # aggregate ≥ 70 → STRONG (2 lots, OTM boost eligible)
 POST11_OTM_BOOST        = True  # STRONG signal → +1 OTM strike for better leverage payout
 
@@ -1235,13 +1543,64 @@ STRATEGY_PHASE3_TARGET_SCALE = 0.70    # Phase 3 target = 70% of normal (take pr
 # Threshold 55: permissive enough not to over-filter clean ORB setups,
 # strict enough to block weak reversal trades (e.g. PUT vs ST15=BULL).
 # Raise threshold to 60-65 after 30+ calibration trades.
-UNIFIED_SCORER_ENABLED  = True   # gate: True = block weak signals; False = log only
+UNIFIED_SCORER_ENABLED  = True   # False = skip scoring entirely (no logging either)
+# OBSERVE-ONLY from Aug 13 2026. The scorer still runs and logs a full score +
+# component breakdown on every signal, but no longer vetoes entries.
+#
+# Why: scored against every real trade we have an outcome for (n=8), the new
+# per-path weights do NOT separate winners from losers --
+#     winners 40/42/50/52   losers 35/45/50/72
+# The single largest loser (May 7, -Rs1,488) scores 72, the highest of any
+# trade. Ungated the sample returns +Rs5,064; the best possible threshold
+# returns +Rs5,266, an edge of Rs202 resting on one trade. At the old
+# threshold of 55 it took ZERO winners and one loser.
+#
+# Critically the test could not validate the new design either: OI levels (30)
+# and PCR (20) -- now the two largest inputs -- score 0 on nearly every
+# historical trade, because point-in-time OI zone files do not exist for those
+# dates and SENSEX has no PCR history. Running a hard veto on weights that
+# cannot be validated is the exact failure mode this project keeps repeating.
+#
+# Both engines still gate themselves substantively (REV: morning ADX peak >=30,
+# DI spread >=12, score >=3/6; TREND: ADX floor + multi-bar rise + DI spread +
+# widening + swing structure + body + ADX uptick), so this is not unfiltered.
+#
+# From now on OI zones populate for ALL THREE instruments (the SENSEX EOD fetch
+# was fixed today), so forward signals will finally carry real oi/pcr scores.
+# Re-arm once ~20 scored signals have accumulated AND the score actually
+# separates outcomes. Set True to restore the veto.
+UNIFIED_GATE_ACTIVE     = False
 UNIFIED_SCORE_THRESHOLD = 55     # minimum score to enter (0-100)
 # Per-band threshold offsets, added to UNIFIED_SCORE_THRESHOLD for entries in
 # that time band. Live trades Apr-Jul: 11:00-12:00 entries ran 0/4 (-₹7,420) —
 # lunchtime-drift breakouts fail; demand extra quality there. Other bands: no
 # offset (early window 50% WR, noon REV is the top live earner — leave alone).
 UNIFIED_BAND_THRESHOLD_OFFSET = {'11:00': 5}
+# Per-path threshold override. REV is a FADE engine, and UNIFIED's rubric is
+# trend-alignment weighted: in the 12:00 band (where every REV trade has ever
+# fired) 65 of 100 points come from or_breakout/or_thrust/di_align/st5/st15/
+# ema/vwap/momentum -- components a signal that fades an exhausted trend
+# structurally cannot earn. Only adx+oi+exhaustion (35 pts) are genuinely
+# winnable. Demanding 55 asks REV to score near-perfect on a rubric built
+# against it, which is why it went 0-for-6 across Aug 10-12 while qualifying
+# on its own 3/3 score every time.
+#
+# NOT an exemption -- UNIFIED demonstrably discriminates for REV, it is just
+# offset. Replay of REV's own real historical trades (5 of 13 recoverable;
+# the other 8 sit in a June 5-min data gap, see below):
+#     winners: 55, 52, 48   losers: 33, 28
+# Clean separation, 15-pt gap, zero overlap. Exempting REV would have thrown
+# away a filter that correctly caught BOTH losers. Threshold 40 sits mid-gap:
+# keeps all 3 winners (+Rs8,323), still blocks both losers (-Rs1,690 avoided)
+# vs +Rs6,633 actually realised ungated. Independent sanity check: the one
+# rigorously-replayed recent case (Aug 11 BANKNIFTY, score 26) stays BLOCKED
+# at 40 -- this is a recalibration, not a rubber stamp.
+#
+# CAVEAT: n=5. The June 2026 5-min archives for NIFTY/BANKNIFTY are missing
+# (banknifty_5min stops at 20260529), so 8 of REV's 13 real trades could not
+# be replayed. Revisit this number once that gap is patched -- the structural
+# argument above holds regardless, but the exact value 40 is fitted to 5 points.
+UNIFIED_PATH_THRESHOLD = {'REV': 40}
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_DIRECTORY    = "logs"
