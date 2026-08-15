@@ -5109,6 +5109,7 @@ class TradingBot:
                     _TUE_EXEMPT_PATHS = getattr(
                         config, 'TUESDAY_GATE_EXEMPT_PATHS', ('REV', 'TREND'))
                     if (signal
+                            and getattr(config, 'TUESDAY_GATE_ENABLED', True)
                             and self.skip_tuesday
                             and now.weekday() == 1
                             and signal['type'] == 'CALL'
@@ -5171,20 +5172,15 @@ class TradingBot:
                                 f"(≥{self.tuesday_put_adx_min}), DI-spread={_di_spread_val:.1f} "
                                 f"(≥{self.tuesday_put_di_spread}), path={path}")
 
-                    if signal and not self._duplicate_signal(signal):
-                        # ── Session handover gate ─────────────────────────────
-                        # Block entry if early_bot still holds an open position
-                        # on this instrument (e.g. trailing through 11:00 handover).
-                        if shared_state.has_open_position(
-                                self.instrument, exclude_bot=self._bot_id):
-                            _eb_pos = shared_state.get_open_positions(
-                                self.instrument)
-                            self.logger.info(
-                                f"  [GATE] {self.instrument}: early_bot has open "
-                                f"position — holding entry until it closes. "
-                                f"Positions: {_eb_pos}"
-                            )
-                            signal = None
+                    # ── Session handover gate — REMOVED Aug 14 2026 ──────────
+                    # Blocked entry while early_bot held an open position on this
+                    # instrument. Removed because it can no longer fire: all three
+                    # fno_t_bot_early_* systemd units are `disabled disabled` (unit
+                    # state AND preset), so early_bot never runs and never registers
+                    # a position in shared_state. It fired exactly once, on
+                    # 2026-04-16, four months ago.
+                    # Restore by reinstating this block if early_bot is ever revived
+                    # -- shared_state.has_open_position() is untouched.
 
                     if signal and not self._duplicate_signal(signal):
                         # Lot sizing: signal.get('lots') = 1 or 2 from signal_strength score.

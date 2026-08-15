@@ -1381,6 +1381,21 @@ CHASE_GATE_EXEMPT_PATHS = ()
 # stronger than the single-bar ADX/DI threshold this gate re-checks.
 TUESDAY_GATE_EXEMPT_PATHS = ('REV', 'TREND')
 
+# STRIPPED Aug 14 2026: the gate is now UNREACHABLE. Every one of its 5 blocks
+# in 4 months landed on a path that is since disabled --
+#   2026-05-12 ADX 32.7 < 35  path=A
+#   2026-05-26 ADX 32.3 < 35  path=ORB
+#   2026-06-23 ADX 33.4 < 35  path=A
+#   2026-07-14 ADX 32.2 < 35  path=B
+#   2026-07-21 ADX 29.4 < 30  path=B
+# -- and the only two live paths (REV, TREND) are exempt above. With A/B/ORB/E
+# all off, no signal can reach it. Note every block was also a marginal miss
+# (32.7 vs 35, 33.4 vs 35, 32.2 vs 35, 29.4 vs 30), never a decisive rejection.
+# Original rationale, still valid if PATH_A/B are ever revived: Tuesday is
+# expiry for NIFTY/BNF, so low DTE means low gamma and a weak trend is punished
+# harder than on other days. Set True to restore.
+TUESDAY_GATE_ENABLED      = False
+
 # ─── PATH_REV: MaxPain Snap Reversal ─────────────────────────────────────────
 # Fires after the ORB window closes when the morning trend exhausts and price
 # snaps toward MaxPain.  Strongest on DTE≤2 (options-pinning effect is sharpest).
