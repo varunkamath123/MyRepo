@@ -3434,42 +3434,28 @@ class TradingBot:
                     f'DI converging {_conv_pct*100:.0f}% of peak closed ✓'
                 )
 
-        # ── Component 2: IVSkew flip (0–2) ───────────────────────────────────
-        _cur_iv      = oc.get('iv_skew')
-        _flip_thresh = getattr(config, 'PATH_REV_IVSKEW_FLIP_PCT',   4.0)
-        _skew_thresh = getattr(config, 'OI_IV_SKEW_THRESHOLD',        2.0)
+        # ── Component 2: IVSkew flip — REMOVED Aug 14 2026 ───────────────────
+        # Was worth 0-2 points, half the score ever actually observed. Across
+        # 2,297 production evaluations it contributed to only 8 of 81 qualifying
+        # signals (flipped +2: 2 times; drifting +1: 6 times) -- and to ZERO on
+        # SENSEX, whose BSE feed supplies no ATM-IV at all, so a third of REV's
+        # scoring capacity was permanently unavailable on one of three
+        # instruments. Removing it makes the scale honest: max is now 4, which
+        # is also the highest score ever recorded (5 and 6 were unreachable).
+        # Revert: git history, plus PATH_REV_IVSKEW_FLIP_PCT in config.
 
-        if _cur_iv is not None and self._ivskew_hist:
-            _now_ts  = now.timestamp()
-            # 30-min-ago IVSkew: oldest snapshot within last 30 min
-            _hist_30 = [v for (t, v) in self._ivskew_hist if _now_ts - t <= 1800]
-            _old_iv  = _hist_30[0] if len(_hist_30) >= 2 else self._ivskew_hist[0][1]
-            _iv_shift = _cur_iv - _old_iv   # positive = IV skew rising (more fear/puts)
-
-            if rev_dir == 'CALL':
-                # CALL reversal: IVSkew should turn negative (CALL bid > PUT bid)
-                _full = (_cur_iv < -_skew_thresh and _iv_shift <= -_flip_thresh)
-                _part = (not _full and _iv_shift <= -(_flip_thresh * 0.5))
-            else:
-                # PUT reversal: IVSkew should turn positive (PUT bid > CALL bid)
-                _full = (_cur_iv > _skew_thresh and _iv_shift >= _flip_thresh)
-                _part = (not _full and _iv_shift >= (_flip_thresh * 0.5))
-
-            if _full:
-                score += 2
-                reasons.append(
-                    f'IVSkew flipped {_old_iv:+.1f}%→{_cur_iv:+.1f}% '
-                    f'(Δ{_iv_shift:+.1f}%) → {rev_dir} bid ✓✓'
-                )
-            elif _part:
-                score += 1
-                reasons.append(
-                    f'IVSkew drifting {_iv_shift:+.1f}% toward {rev_dir} ✓'
-                )
-
-        # ── Component 3: MaxPain proximity (0–1) ─────────────────────────────
+        # ── Component 2: MaxPain proximity (0–1) ─────────────────────────────
+        # The ONLY component independent of trend-fade (see note below). Highly
+        # instrument-skewed on the flat 0.5% threshold: it scores on 92% of
+        # NIFTY evaluations (heavy expiry pinning), 35% of SENSEX, but only 14%
+        # of BANKNIFTY. Left as-is rather than made instrument-relative --
+        # equalising the hit-rate would be curve-fitting; if BNF genuinely is
+        # not near MaxPain, that is information. Distance now recorded on every
+        # evaluation so a scaled (ATR- or range-relative) threshold can be
+        # calibrated on real data later.
         _mp      = oc.get('max_pain')
         _mp_prox = getattr(config, 'PATH_REV_MAXPAIN_PROX_PCT', 0.005)
+        _mp_dist = None
         if _mp and _mp > 0:
             _mp_dist = abs(_px - _mp) / _mp
             if _mp_dist <= _mp_prox:
@@ -3478,7 +3464,15 @@ class TradingBot:
                     f'MaxPain={_mp:,.0f} price {_mp_dist*100:.2f}% away (snap zone) ✓'
                 )
 
-        # ── Component 4: ADX waning (0–1) ────────────────────────────────────
+        # ── Component 3: ADX waning (0–1) ────────────────────────────────────
+        # NOTE ON REDUNDANCY: this and DI-convergence above are NOT independent
+        # confirmations -- both measure "the morning trend is dying". In
+        # production they co-occur almost perfectly (DI in 96.2% of qualifying
+        # signals, ADX-waning in 95.1%). So a score of 3 built from DI-flipped
+        # (2) + ADX-waning (1) carries only ONE piece of evidence, while a 3
+        # built from DI (1) + MaxPain (1) + ADX (1) carries two. Not collapsed
+        # into a single component because there is no outcome data yet to say
+        # which formulation predicts better -- n=14 REV trades total.
         _wane = getattr(config, 'PATH_REV_ADX_WANE_RATIO', 0.85)
         if self._morning_adx_peak > 0 and _adx < self._morning_adx_peak * _wane:
             score += 1
@@ -3509,6 +3503,16 @@ class TradingBot:
             'otm_reason' : f'MaxPain snap | {_reason_str}',
             'gap_type'   : self._gap_type,
             'dynamic_or' : False,
+            # Telemetry (Aug 14) — lets score COMPOSITION be tested against
+            # outcome later, not just the total. The open question is whether a
+            # 3 that includes MaxPain beats a 3 built purely from the redundant
+            # trend-fade pair.
+            'rev_score'      : score,
+            'rev_mp_dist'    : (round(_mp_dist, 5) if _mp_dist is not None else None),
+            'rev_di_spread'  : round(_cur_spread, 2),
+            'rev_di_peak'    : round(self._morning_di_peak, 2),
+            'rev_adx_ratio'  : (round(_adx / self._morning_adx_peak, 3)
+                                if self._morning_adx_peak > 0 else None),
         }
 
     def _update_trend_qualification(self, df: 'pd.DataFrame', now: 'datetime') -> None:
@@ -4472,10 +4476,8 @@ class TradingBot:
                 # IVSkew history: always updated (needed for 30-min drift in Path REV).
                 # Morning DI/ADX peak: only during ORB window (9:30–PATH_A_LATE_END).
                 if getattr(config, 'PATH_REV_ENABLED', False):
-                    _iv_snap = oc.get('iv_skew')
-                    if _iv_snap is not None:
-                        self._ivskew_hist.append((now.timestamp(), float(_iv_snap)))
-                        self._ivskew_hist = self._ivskew_hist[-20:]
+                    # IVSkew history accumulation removed Aug 14 2026 along with
+                    # the component it fed -- it had no other consumer.
                     if _orb_window:
                         self._update_morning_trend(df)
 

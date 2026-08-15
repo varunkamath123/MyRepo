@@ -936,7 +936,10 @@ PATH_A_EXCEPTIONAL_PROFIT_CLOSE = 0.50   # ≥50% gain at checkpoint → lock in
 # After a stop-loss exit, allow one re-entry if the OR level re-tests and holds
 # with higher conviction (ADX≥35) before 13:00. Captures "second break" days
 # where the first break was a false start but the underlying trend re-asserts.
-PATH_A_REENTRY_ENABLED     = True    # allow one re-entry after PATH-A stop-loss
+# Unreachable since PATH_A_ENABLED=False (Aug 7 strip) — PATH-A never enters,
+# so it can never stop out, so there is nothing to re-enter. Flag left in
+# place for whenever PATH-A is revisited.
+PATH_A_REENTRY_ENABLED     = False   # allow one re-entry after PATH-A stop-loss
 PATH_A_REENTRY_ADX_MIN     = 35     # higher bar than initial entry (day min is 20-30)
 PATH_A_REENTRY_CUTOFF      = '13:00' # no re-entry after 13:00 (need 90 min runway to EOD)
 
@@ -1201,7 +1204,9 @@ PATH_A_DYNAMIC_OR_DI_MIN_SPREAD = 15   # If |DI+ − DI−| ≥ 15 pts, only the
 # Evidence (May 13 2026): NIFTY gap-dn, PUT caught at 09:35 (+44%), but
 # 247-pt CALL recovery (23,263→23,510) fully missed — ADX stuck at 17–24
 # while DI+=28–31 dominated for 5+ hours.
-GAP_REV_ENABLED        = True
+# Unreachable since PATH_A_ENABLED=False — GAP_REV only ever supplemented
+# PATH-A's ADX gate; with PATH-A off it can never fire.
+GAP_REV_ENABLED        = False
 GAP_REV_MIN_GAP_PCT    = 0.005   # ≥0.5% open gap to qualify (smaller = noise)
 GAP_REV_RECOVERY_PCT   = 0.50    # price must recover ≥ 50% of gap before entry
 GAP_REV_ADX_MIN        = 18      # reduced ADX floor (normal 25–30 biased by gap bars)
@@ -1423,7 +1428,10 @@ PATH_REV_END                = '13:30' # latest fire time (need runway to 14:30 f
 PATH_REV_MIN_SCORE          = 3       # minimum score (0–6) to fire
 PATH_REV_MIN_MORNING_ADX    = 30      # morning must have had a real trend (ADX peak ≥ this)
 PATH_REV_MIN_DI_SPREAD_PEAK = 12      # morning DI spread peak ≥ this (real directional trend)
-PATH_REV_IVSKEW_FLIP_PCT    = 4.0     # IVSkew must shift ≥ this % toward reversal direction
+# PATH_REV_IVSKEW_FLIP_PCT (was 4.0) RETIRED Aug 14 2026 — the IVSkew
+# component it drove contributed to 8 of 81 qualifying signals in 2,297
+# production evaluations, and to ZERO on SENSEX (BSE feed has no ATM-IV).
+# PATH_REV max score is now 4, which is also the highest ever recorded.
 PATH_REV_MAXPAIN_PROX_PCT   = 0.005   # within 0.5% of MaxPain → proximity bonus
 PATH_REV_ADX_WANE_RATIO     = 0.85    # ADX < peak × this = momentum waning
 
