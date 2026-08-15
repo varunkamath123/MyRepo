@@ -33,6 +33,17 @@ Morning news-exit scan (--morning-scan):
   with reason NEWS_EXIT. Thresholds are tighter than the entry veto — this
   only fires on a clear overnight flip, not a moderate contradiction.
 
+TIME_EXIT / CONFIDENCE_DECAY — profit-gated, never realize a loss:
+  A position stuck well past the backtest's typical hold (max_hold_days, per
+  instrument) with no resolution ties up capital for no new information.
+  Separately, a day's fresh Kronos read can quietly stop supporting the held
+  direction (weak same-direction, NEUTRAL, or a sub-threshold opposing lean)
+  without ever crossing the KRONOS_REV bar. Both are real exit signals, but
+  neither is a loss-cutting mechanism — that's the stop-loss's job alone.
+  So both only fire when unrealized P&L >= 0; if the position is red when
+  either condition is met, it holds and stays governed by the existing
+  stop/trail/reversal/ST-flip/news checks instead.
+
 Capital: one lot per instrument, max one open position across all instruments.
 
 Run manually:
@@ -288,6 +299,7 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
     pnl_pct = ((price - pos.entry_price) / pos.entry_price
                if pos.direction == "LONG"
                else (pos.entry_price - price) / pos.entry_price)
+    in_profit = pnl_pct >= 0
 
     # Hard stop
     if pnl_pct <= -p["stop_loss_pct"]:
@@ -309,6 +321,18 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
         if pos.direction == "SHORT" and price > pos.trail_stop:
             return "TRAIL_STOP"
 
+    # Time-based exit: a position stuck this long has already exceeded the
+    # backtest's typical hold with no resolution. Only realizes a win or
+    # scratch, never a loss — if P&L is negative, hold and let the stop-loss
+    # stay the sole loss-cutting mechanism rather than adding a second one.
+    hold_days = (date.today() - date.fromisoformat(pos.entry_date)).days
+    max_hold = p.get("max_hold_days")
+    if max_hold and hold_days >= max_hold:
+        if in_profit:
+            return "TIME_EXIT"
+        log.info("[%s] Held %dd (max %dd) but P&L is negative — holding, not "
+                 "realizing a loss on a time-based exit", instrument, hold_days, max_hold)
+
     # Signal exits
     try:
         direction, confidence, _ = get_signal(df, force_fallback=False)
@@ -318,6 +342,14 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
             opp = "SHORT" if pos.direction == "LONG" else "LONG"
             if direction == opp and confidence >= p["kronos_rev_conf_min"]:
                 return "KRONOS_REV"
+
+        # Confidence decay: today's read no longer independently supports
+        # holding at entry-quality conviction (weak same-direction, NEUTRAL,
+        # or a sub-threshold opposing lean). Only realizes a win — if the
+        # position is red, the stop-loss remains the only way to cut it.
+        still_supported = (direction == pos.direction and confidence >= p["kronos_conf_min"])
+        if not still_supported and in_profit:
+            return "CONFIDENCE_DECAY"
 
         if EXIT_ON_SUPERTREND_FLIP:
             if pos.direction == "LONG" and st == "BEAR":
