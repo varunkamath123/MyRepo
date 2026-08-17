@@ -153,10 +153,16 @@ def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> s
 
 # ── Signal ────────────────────────────────────────────────────────────────────
 
-def get_signal(ctx: pd.DataFrame, force_fallback: bool = False) -> tuple[str, float, str]:
+def get_signal(ctx: pd.DataFrame, force_fallback: bool = False) -> tuple[str, float, str, float, float]:
     """
-    Returns (direction, confidence, source).
+    Returns (direction, confidence, source, risk_reward, price_target).
     direction ∈ {"LONG", "SHORT", "NEUTRAL"}
+
+    risk_reward/price_target come from score_forecast() on Kronos's own
+    predicted candles (core/candle_patterns.py) — computed on every call but
+    previously discarded here. risk_reward = predicted move / predicted
+    worst-case wick in the forecast window; price_target = predicted close
+    at the final forecast bar.
     """
     from core.kronos_signal import forecast as _kf
 
@@ -171,7 +177,7 @@ def get_signal(ctx: pd.DataFrame, force_fallback: bool = False) -> tuple[str, fl
     else:
         f = _kf(ctx, FORECAST_BARS)
 
-    return f.direction, f.confidence, f.source
+    return f.direction, f.confidence, f.source, f.quality.risk_reward, f.quality.price_target
 
 
 def _force_fail():
@@ -195,6 +201,8 @@ class Trade:
     pnl_pts:     float          = 0.0
     pnl_inr:     float          = 0.0
     hold_days:   int            = 0
+    risk_reward: float          = 0.0   # Kronos-predicted R:R at entry (instrumentation only, not yet a gate)
+    price_target: float         = 0.0   # Kronos-predicted close at entry's forecast window end
 
 
 # ── Backtest engine ───────────────────────────────────────────────────────────
@@ -232,6 +240,8 @@ def backtest_instrument(
     _cached_dir:  str   = "NEUTRAL"
     _cached_conf: float = 0.0
     _cached_src:  str   = ""
+    _cached_rr:   float = 0.0
+    _cached_tgt:  float = 0.0
     _last_signal_bar: int = -999
 
     log.info("[BT] %s | %d bars | lot=%d", instrument, len(df), lot_size)
@@ -248,7 +258,7 @@ def backtest_instrument(
         need_signal = (i - _last_signal_bar) >= SIGNAL_CACHE_BARS
         if need_signal:
             try:
-                _cached_dir, _cached_conf, _cached_src = get_signal(ctx, force_fallback)
+                _cached_dir, _cached_conf, _cached_src, _cached_rr, _cached_tgt = get_signal(ctx, force_fallback)
                 _last_signal_bar = i
             except Exception as e:
                 log.debug("[BT] Signal error bar %d: %s", i, e)
@@ -331,12 +341,14 @@ def backtest_instrument(
                 entry_date=nxt_date,
                 entry_price=nxt_open,
                 lot_size=lot_size,
+                risk_reward=_cached_rr,
+                price_target=_cached_tgt,
             )
             hwm = nxt_open
             trail_active = False
             trail_stop   = 0.0
-            log.info("[BT] ENTRY  %s %-5s @ %8.1f  conf=%.0f%%  src=%s  adx=%.1f",
-                     instrument, direction, nxt_open, confidence * 100, source, adx)
+            log.info("[BT] ENTRY  %s %-5s @ %8.1f  conf=%.0f%%  src=%s  adx=%.1f  R:R=%.2f  tgt=%.1f",
+                     instrument, direction, nxt_open, confidence * 100, source, adx, _cached_rr, _cached_tgt)
 
         except Exception as e:
             log.debug("[BT] Entry error bar %d: %s", i, e)
@@ -487,6 +499,8 @@ def save_csv(all_trades: list[Trade], path: str):
         "pnl_pts":     t.pnl_pts,
         "pnl_inr":     t.pnl_inr,
         "lot_size":    t.lot_size,
+        "risk_reward":  t.risk_reward,
+        "price_target": t.price_target,
     } for t in all_trades]
     pd.DataFrame(rows).to_csv(path, index=False)
     log.info("Results saved -> %s", path)

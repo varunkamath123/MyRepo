@@ -46,6 +46,16 @@ CONFIDENCE_DECAY — profit-gated, never realizes a loss:
   by the existing stop/trail/reversal/ST-flip/news checks instead — the
   stop-loss remains the sole loss-cutting mechanism.
 
+Predicted target / risk:reward (instrumentation, not yet a gate):
+  score_forecast() in core/candle_patterns.py already computes a price
+  target, stop level, and risk:reward from Kronos's own predicted candles on
+  every call -- previously computed and discarded. get_signal() now returns
+  it; every qualified entry logs predicted_target/predicted_risk_reward/
+  predicted_profit_inr, and every exit logs the predicted profit alongside
+  the actual one. Not yet used to filter entries -- collecting real R:R data
+  first (same approach as the hold-days check) before picking a threshold,
+  rather than guessing one.
+
 Capital: one lot per instrument, max one open position across all instruments.
 
 Run manually:
@@ -133,6 +143,8 @@ class Position:
     hwm:           float        # high-water mark for trail
     trail_active:  bool
     trail_stop:    float
+    predicted_target:      float = 0.0   # Kronos's predicted close at entry, for later calibration
+    predicted_risk_reward: float = 0.0   # Kronos's predicted R:R at entry
 
 @dataclass
 class PaperState:
@@ -236,10 +248,14 @@ def _log_trade(record: dict):
 
 # ── Signal evaluation ─────────────────────────────────────────────────────────
 
-def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float]:
+def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float, float, float]:
     """
     Evaluate the full entry gate chain on complete daily context `df`.
-    Returns (direction, confidence); direction is NEUTRAL if any gate fails.
+    Returns (direction, confidence, risk_reward, price_target);
+    direction is NEUTRAL if any gate fails (risk_reward/price_target are 0.0
+    in that case). risk_reward/price_target come from Kronos's own predicted
+    candles (see backtest.get_signal) -- logged for every qualified entry as
+    a checkable prediction, not yet used as a gate (see module docstring).
     """
     p = INSTRUMENT_PARAMS.get(instrument, _DEFAULT_PARAMS)
     ctx = df.copy()
@@ -247,26 +263,26 @@ def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float]:
     adx = compute_adx(ctx)
     if adx < MIN_ADX:
         log.info("[%s] Gate FAIL: ADX %.1f < %d (ranging market)", instrument, adx, MIN_ADX)
-        return "NEUTRAL", 0.0
+        return "NEUTRAL", 0.0, 0.0, 0.0
 
-    direction, confidence, source = get_signal(ctx, force_fallback=False)
-    log.info("[%s] Kronos: %s conf=%.0f%% src=%s adx=%.1f",
-             instrument, direction, confidence * 100, source, adx)
+    direction, confidence, source, risk_reward, price_target = get_signal(ctx, force_fallback=False)
+    log.info("[%s] Kronos: %s conf=%.0f%% src=%s adx=%.1f R:R=%.2f tgt=%.1f",
+             instrument, direction, confidence * 100, source, adx, risk_reward, price_target)
 
     if direction == "NEUTRAL":
-        return "NEUTRAL", 0.0
+        return "NEUTRAL", 0.0, 0.0, 0.0
     if confidence < p["kronos_conf_min"]:
         log.info("[%s] Gate FAIL: confidence %.0f%% < %.0f%%",
                  instrument, confidence * 100, p["kronos_conf_min"] * 100)
-        return "NEUTRAL", 0.0
+        return "NEUTRAL", 0.0, 0.0, 0.0
 
     st = supertrend(ctx)
     if direction == "LONG" and st != "BULL":
         log.info("[%s] Gate FAIL: SuperTrend %s not aligned with LONG", instrument, st)
-        return "NEUTRAL", 0.0
+        return "NEUTRAL", 0.0, 0.0, 0.0
     if direction == "SHORT" and st != "BEAR":
         log.info("[%s] Gate FAIL: SuperTrend %s not aligned with SHORT", instrument, st)
-        return "NEUTRAL", 0.0
+        return "NEUTRAL", 0.0, 0.0, 0.0
 
     mf = get_mirofish(instrument)
     if mf is not None:
@@ -274,17 +290,17 @@ def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float]:
         if direction == "LONG" and mf_score < MIROFISH_BEARISH_VETO:
             log.info("[%s] Gate FAIL: MiroFish bearish (score=%.2f) vetoes LONG — %s",
                      instrument, mf_score, "; ".join(mf.get("reasons", [])[:2]))
-            return "NEUTRAL", 0.0
+            return "NEUTRAL", 0.0, 0.0, 0.0
         if direction == "SHORT" and mf_score > MIROFISH_BULLISH_VETO:
             log.info("[%s] Gate FAIL: MiroFish bullish (score=%.2f) vetoes SHORT — %s",
                      instrument, mf_score, "; ".join(mf.get("reasons", [])[:2]))
-            return "NEUTRAL", 0.0
+            return "NEUTRAL", 0.0, 0.0, 0.0
         log.info("[%s] MiroFish %s (score=%.2f) does not contradict %s",
                  instrument, mf.get("lean"), mf_score, direction)
 
-    log.info("[%s] Gate PASS: %s conf=%.0f%% adx=%.1f st=%s — entry qualified",
-             instrument, direction, confidence * 100, adx, st)
-    return direction, confidence
+    log.info("[%s] Gate PASS: %s conf=%.0f%% adx=%.1f st=%s R:R=%.2f tgt=%.1f — entry qualified",
+             instrument, direction, confidence * 100, adx, st, risk_reward, price_target)
+    return direction, confidence, risk_reward, price_target
 
 
 # ── Exit check ────────────────────────────────────────────────────────────────
@@ -325,7 +341,7 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
 
     # Signal exits
     try:
-        direction, confidence, _ = get_signal(df, force_fallback=False)
+        direction, confidence, _, _, _ = get_signal(df, force_fallback=False)
         st = supertrend(df)
 
         if EXIT_ON_KRONOS_REVERSAL:
@@ -390,20 +406,34 @@ def cmd_daily_run(instruments: list[str]):
             pnl = pts * pos.lot_size
             state.realised_pnl += pnl
             state.trade_count  += 1
-            log.info("[%s] EXIT %s @ %.1f  reason=%s  PnL INR %+.0f  [held from %s]",
-                     inst, pos.direction, price, reason, pnl, pos.entry_date)
+
+            # Calibration check: how did Kronos's entry-time prediction compare
+            # to what actually happened? Logged only, not used for anything yet.
+            predicted_profit_inr = None
+            if pos.predicted_target:
+                pred_pts = ((pos.predicted_target - pos.entry_price) if pos.direction == "LONG"
+                           else (pos.entry_price - pos.predicted_target))
+                predicted_profit_inr = pred_pts * pos.lot_size
+
+            log.info("[%s] EXIT %s @ %.1f  reason=%s  PnL INR %+.0f  "
+                     "(predicted INR %s)  [held from %s]",
+                     inst, pos.direction, price, reason, pnl,
+                     f"{predicted_profit_inr:+.0f}" if predicted_profit_inr is not None else "n/a",
+                     pos.entry_date)
             _log_trade({
-                "event":       "EXIT",
-                "instrument":  inst,
-                "direction":   pos.direction,
-                "entry_date":  pos.entry_date,
-                "entry_price": pos.entry_price,
-                "exit_date":   today,
-                "exit_price":  price,
-                "exit_reason": reason,
-                "pnl_pts":     pts,
-                "pnl_inr":     pnl,
-                "lot_size":    pos.lot_size,
+                "event":                "EXIT",
+                "instrument":           inst,
+                "direction":            pos.direction,
+                "entry_date":           pos.entry_date,
+                "entry_price":          pos.entry_price,
+                "exit_date":            today,
+                "exit_price":           price,
+                "exit_reason":          reason,
+                "pnl_pts":              pts,
+                "pnl_inr":              pnl,
+                "lot_size":             pos.lot_size,
+                "predicted_target":     pos.predicted_target,
+                "predicted_profit_inr": predicted_profit_inr,
             })
             del state.positions[inst]
         else:
@@ -420,12 +450,15 @@ def cmd_daily_run(instruments: list[str]):
             log.info("[%s] A position is already open — one at a time, skipping entry", inst)
             continue
 
-        direction, confidence = evaluate_signal(inst, ctx[inst])
+        direction, confidence, risk_reward, price_target = evaluate_signal(inst, ctx[inst])
         if direction == "NEUTRAL":
             continue
 
         price = px[inst]
         lot   = LOT_SIZES.get(inst, 1)
+        predicted_pts = ((price_target - price) if direction == "LONG"
+                         else (price - price_target))
+        predicted_profit_inr = predicted_pts * lot
         state.positions[inst] = Position(
             instrument=inst,
             direction=direction,
@@ -435,17 +468,24 @@ def cmd_daily_run(instruments: list[str]):
             hwm=price,
             trail_active=False,
             trail_stop=0.0,
+            predicted_target=price_target,
+            predicted_risk_reward=risk_reward,
         )
-        log.info("[%s] ENTRY %s @ %.1f  conf=%.0f%%  lot=%d  (same-day close)",
-                 inst, direction, price, confidence * 100, lot)
+        log.info("[%s] ENTRY %s @ %.1f  conf=%.0f%%  lot=%d  R:R=%.2f  "
+                 "predicted_tgt=%.1f  predicted_profit=INR %+.0f  (same-day close)",
+                 inst, direction, price, confidence * 100, lot,
+                 risk_reward, price_target, predicted_profit_inr)
         _log_trade({
-            "event":       "ENTRY",
-            "instrument":  inst,
-            "direction":   direction,
-            "entry_date":  today,
-            "entry_price": price,
-            "confidence":  confidence,
-            "lot_size":    lot,
+            "event":                 "ENTRY",
+            "instrument":            inst,
+            "direction":             direction,
+            "entry_date":            today,
+            "entry_price":           price,
+            "confidence":            confidence,
+            "lot_size":              lot,
+            "predicted_risk_reward": risk_reward,
+            "predicted_target":      price_target,
+            "predicted_profit_inr":  predicted_profit_inr,
         })
 
     _save_state(state)
