@@ -1490,6 +1490,14 @@ PATH_TREND_DI_WIDEN_BARS = 3
 # retr is still computed and logged on every fire for forward calibration.
 PATH_TREND_ADX_FLOOR     = 17       # trend invalidated if ADX drops below this during pullback
 PATH_TREND_BODY_ATR_MIN  = 0.15     # resumption candle body >= this x ATR (filters doji noise)
+# Minimum leg size, in ATR multiples (Aug 17 2026). TREND previously had NO
+# concept of how large the move it trades actually is. The Aug 17 BANKNIFTY
+# loser traded a 42.6-pt leg = 0.54xATR = 6.7% of the day's range, while the
+# index had already fallen 298pts from the open; it entered at 76% retrace with
+# ~10pts of room and lost Rs4,477. Logged qualification ratios were
+# 1.58/1.59/1.42/1.31 with that loser alone at 0.54 -- so 1.0 is a noise floor
+# ("bigger than one bar's typical range"), not a fitted value. 0 disables.
+PATH_TREND_MIN_LEG_ATR   = 1.0
 PATH_TREND_OI_DRIFT_THRESH = 0.05   # PCR drift threshold (same magnitude as OI_PCR_DRIFT_THRESHOLD)
 PATH_TREND_OI_PCR_CALL_MAX = 1.05   # PCR above this contradicts a CALL continuation
 PATH_TREND_OI_PCR_PUT_MIN  = 0.95   # PCR below this contradicts a PUT continuation

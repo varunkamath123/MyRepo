@@ -3627,6 +3627,31 @@ class TradingBot:
         leg_range = (extreme - anchor) if trend_dir == 'CALL' else (anchor - extreme)
         if leg_range <= 0:
             return None
+
+        # ── Minimum leg size (Aug 17 2026) ───────────────────────────────────
+        # TREND had NO concept of how big the move it is trading actually is --
+        # it would qualify on a leg of any magnitude. Aug 17 BANKNIFTY is the
+        # case: it traded a 42.6-point leg (0.54 x ATR, 6.7% of the day's range)
+        # while the index had already fallen 298 points from the open, entered
+        # at 76% retrace with ~10 points of room left, and lost Rs4,477.
+        #
+        # Requiring the leg to exceed one ATR is a noise floor, not a fitted
+        # parameter: a move smaller than a single bar's typical range is not a
+        # trend to continue. Across every logged qualification the ratios were
+        # 1.58 / 1.59 / 1.42 / 1.31 and the Aug 17 loser alone at 0.54 -- so a
+        # 1.0 floor removes that outlier and touches nothing else.
+        # Fails OPEN if ATR is unavailable (production loads 3 days, so ATR is
+        # warm from the first bar; a single-day frame would not be).
+        _min_leg_atr = getattr(config, 'PATH_TREND_MIN_LEG_ATR', 1.0)
+        if _min_leg_atr > 0 and atr > 0:
+            _leg_atr = leg_range / atr
+            if _leg_atr < _min_leg_atr:
+                self.logger.info(
+                    f"  [PATH-TREND] {self.instrument} {trend_dir}: leg "
+                    f"{leg_range:.1f}pts = {_leg_atr:.2f}xATR < {_min_leg_atr} "
+                    f"— move too small to continue, skipped"
+                )
+                return None
         retr = (((extreme - px) / leg_range) if trend_dir == 'CALL'
                 else ((px - extreme) / leg_range))
 
@@ -3697,9 +3722,22 @@ class TradingBot:
             return None
 
         _oi_str = ', '.join(_oi_reasons) if _oi_reasons else 'no OI data'
+        # Session-move context — how far the index has ALREADY travelled today,
+        # which the engine was previously blind to. Logged (not gated) so a
+        # threshold can be set on evidence rather than intuition.
+        _sess = df[df.index.date == df.index[-1].date()]
+        _s_open = float(_sess['Open'].iloc[0]) if len(_sess) else px
+        _s_hi   = float(_sess['High'].max()) if len(_sess) else px
+        _s_lo   = float(_sess['Low'].min())  if len(_sess) else px
+        _moved_pct = ((px - _s_open) / _s_open * 100) if _s_open else 0.0
+        _rng_atr   = ((_s_hi - _s_lo) / atr) if atr > 0 else 0.0
+        _leg_atr_v = (leg_range / atr) if atr > 0 else 0.0
+
         self.logger.info(
             f"  [PATH-TREND] {self.instrument} {trend_dir} FIRE @ {now.strftime('%H:%M')} "
             f"| qualified {self._trend_qual_time} | retrace={retr*100:.0f}% "
+            f"| leg={leg_range:.0f}pts ({_leg_atr_v:.2f}xATR) "
+            f"| session moved {_moved_pct:+.2f}% from open, range={_rng_atr:.1f}xATR "
             f"| ADX {adx_prev:.1f}→{adx:.1f} | {_oi_str}"
         )
 
@@ -3712,6 +3750,10 @@ class TradingBot:
             'path'       : 'TREND',
             'otm_strikes': 0,
             'otm_reason' : f'Trend pullback {retr*100:.0f}% | {_oi_str}',
+            'trend_leg_pts'   : round(leg_range, 1),
+            'trend_leg_atr'   : round(_leg_atr_v, 2),
+            'session_move_pct': round(_moved_pct, 3),
+            'session_rng_atr' : round(_rng_atr, 2),
             'gap_type'   : self._gap_type,
             'dynamic_or' : False,
         }
