@@ -67,7 +67,6 @@ INSTRUMENT_PARAMS = {
         "trail_distance_pct":  0.025,   # 2.5%
         "kronos_conf_min":     0.55,    # higher bar: only high-conviction entries
         "kronos_rev_conf_min": 0.50,
-        "max_hold_days":       32,      # ~2x backtest avg hold (16.1d) — see paper_trader TIME_EXIT
     },
     "BANKNIFTY": {
         "stop_loss_pct":       0.030,   # 3%: BNF moves bigger, needs room
@@ -75,7 +74,6 @@ INSTRUMENT_PARAMS = {
         "trail_distance_pct":  0.025,   # 2.5%
         "kronos_conf_min":     0.45,    # keep as-is (PF 1.97 already)
         "kronos_rev_conf_min": 0.45,
-        "max_hold_days":       35,      # ~2x backtest avg hold (17.4d)
     },
     "SENSEX": {
         "stop_loss_pct":       0.025,   # conservative until we have backtest
@@ -83,7 +81,6 @@ INSTRUMENT_PARAMS = {
         "trail_distance_pct":  0.025,
         "kronos_conf_min":     0.55,
         "kronos_rev_conf_min": 0.50,
-        "max_hold_days":       32,      # same conservative default as NIFTY
     },
 }
 _DEFAULT_PARAMS = INSTRUMENT_PARAMS["NIFTY"]  # fallback for unknown instruments

@@ -33,16 +33,18 @@ Morning news-exit scan (--morning-scan):
   with reason NEWS_EXIT. Thresholds are tighter than the entry veto — this
   only fires on a clear overnight flip, not a moderate contradiction.
 
-TIME_EXIT / CONFIDENCE_DECAY — profit-gated, never realize a loss:
-  A position stuck well past the backtest's typical hold (max_hold_days, per
-  instrument) with no resolution ties up capital for no new information.
-  Separately, a day's fresh Kronos read can quietly stop supporting the held
-  direction (weak same-direction, NEUTRAL, or a sub-threshold opposing lean)
-  without ever crossing the KRONOS_REV bar. Both are real exit signals, but
-  neither is a loss-cutting mechanism — that's the stop-loss's job alone.
-  So both only fire when unrealized P&L >= 0; if the position is red when
-  either condition is met, it holds and stays governed by the existing
-  stop/trail/reversal/ST-flip/news checks instead.
+CONFIDENCE_DECAY — profit-gated, never realizes a loss:
+  A day's fresh Kronos read can quietly stop supporting the held direction
+  (weak same-direction, NEUTRAL, or a sub-threshold opposing lean) without
+  ever crossing the KRONOS_REV bar. This is conviction-based, not calendar-
+  based — a deliberate choice: a real-Kronos backtest check showed the
+  strategy's two best trades held 48 and 56 days respectively, well past any
+  defensible calendar cap derived from the (small, 12-20 trade) backtest
+  sample, so a time-based exit was tried and dropped as too likely to cut a
+  genuine trend early. CONFIDENCE_DECAY only fires when unrealized P&L >= 0;
+  if the position is red when conviction fades, it holds and stays governed
+  by the existing stop/trail/reversal/ST-flip/news checks instead — the
+  stop-loss remains the sole loss-cutting mechanism.
 
 Capital: one lot per instrument, max one open position across all instruments.
 
@@ -320,18 +322,6 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
             return "TRAIL_STOP"
         if pos.direction == "SHORT" and price > pos.trail_stop:
             return "TRAIL_STOP"
-
-    # Time-based exit: a position stuck this long has already exceeded the
-    # backtest's typical hold with no resolution. Only realizes a win or
-    # scratch, never a loss — if P&L is negative, hold and let the stop-loss
-    # stay the sole loss-cutting mechanism rather than adding a second one.
-    hold_days = (date.today() - date.fromisoformat(pos.entry_date)).days
-    max_hold = p.get("max_hold_days")
-    if max_hold and hold_days >= max_hold:
-        if in_profit:
-            return "TIME_EXIT"
-        log.info("[%s] Held %dd (max %dd) but P&L is negative — holding, not "
-                 "realizing a loss on a time-based exit", instrument, hold_days, max_hold)
 
     # Signal exits
     try:
