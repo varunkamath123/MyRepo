@@ -2851,6 +2851,19 @@ class TradingBot:
             'spread_pct'       : _spread_pct,     # bid-ask spread % of premium at entry (live)
             'slippage_pct'     : _slip_pct,       # fill vs LTP % (live)
             'vix_at_entry'     : getattr(self, '_last_vix', None),
+            # Entry-quality telemetry (Aug 18). These were added to the signal
+            # dict but never copied here or into the JSONL writer, so they
+            # logged as None on every trade -- the values existed only in the
+            # text log line. Both hops are required.
+            'trend_leg_pts'    : signal.get('trend_leg_pts'),
+            'trend_leg_atr'    : signal.get('trend_leg_atr'),
+            'session_move_pct' : signal.get('session_move_pct'),
+            'session_rng_atr'  : signal.get('session_rng_atr'),
+            'rev_score'        : signal.get('rev_score'),
+            'rev_mp_dist'      : signal.get('rev_mp_dist'),
+            'rev_di_spread'    : signal.get('rev_di_spread'),
+            'rev_di_peak'      : signal.get('rev_di_peak'),
+            'rev_adx_ratio'    : signal.get('rev_adx_ratio'),
         }
         self.positions.append(position)
         self.trades_today += 1
@@ -3209,6 +3222,15 @@ class TradingBot:
                     'spread_pct'       : pos.get('spread_pct'),
                     'slippage_pct'     : pos.get('slippage_pct'),
                     'vix_at_entry'     : pos.get('vix_at_entry'),
+                    'trend_leg_pts'    : pos.get('trend_leg_pts'),
+                    'trend_leg_atr'    : pos.get('trend_leg_atr'),
+                    'session_move_pct' : pos.get('session_move_pct'),
+                    'session_rng_atr'  : pos.get('session_rng_atr'),
+                    'rev_score'        : pos.get('rev_score'),
+                    'rev_mp_dist'      : pos.get('rev_mp_dist'),
+                    'rev_di_spread'    : pos.get('rev_di_spread'),
+                    'rev_di_peak'      : pos.get('rev_di_peak'),
+                    'rev_adx_ratio'    : pos.get('rev_adx_ratio'),
                 })
                 self._save_trade_log()
                 self._compute_rolling_quality()   # re-evaluate quality after each closed trade
