@@ -1673,8 +1673,9 @@ class TradingBot:
         pos = self.positions[0]
         elapsed_days = (datetime.now(IST) - pos['entry_time']).total_seconds() / 86400
 
-        # Current option price (live LTP or Black-Scholes)
-        if self.live and pos.get('option_symbol'):
+        # Current option price. Quote whenever a symbol exists (paper included,
+        # Aug 18) so this agrees with check_exits() and the checkpoint.
+        if pos.get('option_symbol'):
             from fyers_orders import get_ltp
             current_opt = get_ltp(self.fyers, pos['option_symbol'])
             if current_opt is None:
@@ -2741,15 +2742,59 @@ class TradingBot:
                     f"({_stop_pct*100:.0f}% below entry ₹{entry_price:.2f})"
                 )
         else:
-            # ── PAPER: Black-Scholes simulation ──────────────────────────────
-            T           = config.DAYS_TO_EXPIRY / 365
-            entry_price = bs_price(signal['type'], underlying, strike, T, hv)
+            # ── PAPER: real quoted premium, Black-Scholes only as fallback ────
+            # Aug 18 2026. Paper used to price everything with bs_price() and a
+            # rolling HV, and set option_symbol=None so exits had nothing to
+            # quote either. That made paper P&L a model artefact, not a
+            # simulation of trading: on Aug 18 BANKNIFTY the index moved -10.8
+            # pts (-0.019%) while the modelled premium fell 38.26% -- an
+            # impossible move for a real 7-DTE option, caused purely by HV
+            # shifting as bars entered and left the 30-bar window. It stopped
+            # out a position that then ran +104.8 index points our way.
+            # The bot holds a live Fyers session even in paper mode, so quote
+            # the real contract. BS remains the fallback when the quote fails,
+            # and is tagged so distorted fills stay identifiable in the log.
+            T             = config.DAYS_TO_EXPIRY / 365
+            _bs_price_est = bs_price(signal['type'], underlying, strike, T, hv)
+            entry_price   = None
+            option_symbol = None
+            _px_src       = 'BS'
+            try:
+                from fyers_orders import build_option_symbol, get_next_expiry, get_ltp
+                _expiry       = get_next_expiry(self.instrument)
+                option_symbol = build_option_symbol(
+                    self.instrument, strike, signal['type'], _expiry
+                )
+                if self.fyers and option_symbol:
+                    _ltp = get_ltp(self.fyers, option_symbol)
+                    if _ltp and _ltp > 0:
+                        entry_price = float(_ltp)
+                        _px_src     = 'LTP'
+            except Exception as _q_err:
+                self.logger.warning(
+                    f"  [PAPER-QUOTE] {self.instrument}: real quote unavailable "
+                    f"({_q_err}) — falling back to Black-Scholes"
+                )
+            if entry_price is None:
+                entry_price = _bs_price_est
+                self.logger.warning(
+                    f"  [PAPER-QUOTE] {self.instrument}: no LTP for "
+                    f"{option_symbol or 'symbol?'} — using BS ₹{entry_price:.2f} "
+                    f"(this trade's P&L is model-priced, not market-priced)"
+                )
+            else:
+                _dev = ((entry_price - _bs_price_est) / _bs_price_est * 100
+                        if _bs_price_est > 0 else 0.0)
+                self.logger.info(
+                    f"  [PAPER-QUOTE] {self.instrument} {option_symbol}: "
+                    f"LTP ₹{entry_price:.2f} (BS said ₹{_bs_price_est:.2f}, "
+                    f"{_dev:+.1f}%)"
+                )
             if entry_price < config.MIN_OPTION_PRICE:
                 self.logger.info(
                     f"Option price ₹{entry_price:.2f} < min ₹{config.MIN_OPTION_PRICE}, skipping."
                 )
                 return
-            option_symbol = None
             sl_order_id   = None
             sl_trigger    = 0.0
 
@@ -2976,8 +3021,11 @@ class TradingBot:
                     self.fyers, sl_order_id
                 )
 
-            if self.live and pos.get('option_symbol'):
-                # Live: get actual option LTP for P&L calculation
+            # Quote the real contract whenever we HAVE one -- paper positions
+            # now carry an option_symbol too (Aug 18), so paper marks to market
+            # exactly like live instead of drifting with modelled HV.
+            if pos.get('option_symbol'):
+                # get actual option LTP for P&L calculation
                 from fyers_orders import get_ltp
                 # If exchange already stopped us out, use that fill price directly
                 if _sl_triggered and _sl_fill_price > 0:
@@ -4336,7 +4384,12 @@ class TradingBot:
                             _min_profit = getattr(config, 'PATH_A_MIN_PROFIT_TO_HOLD', 0.15)
 
                         # Compute current P&L % for this position
-                        if self.live and pos.get('option_symbol'):
+                        # Same rule as check_exits(): quote whenever a symbol
+                        # exists. Left on `self.live` this would price paper
+                        # positions with BS while exits used real quotes, so the
+                        # checkpoint and the exit stack would disagree about the
+                        # P&L of the same position at the same instant.
+                        if pos.get('option_symbol'):
                             from fyers_orders import get_ltp
                             _opt_ltp = get_ltp(self.fyers, pos['option_symbol'])
                             _cur_opt = _opt_ltp if _opt_ltp else pos['entry_price']
