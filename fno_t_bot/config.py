@@ -1433,6 +1433,15 @@ PATH_REV_MIN_DI_SPREAD_PEAK = 12      # morning DI spread peak ≥ this (real di
 # production evaluations, and to ZERO on SENSEX (BSE feed has no ATM-IV).
 # PATH_REV max score is now 4, which is also the highest ever recorded.
 PATH_REV_MAXPAIN_PROX_PCT   = 0.005   # within 0.5% of MaxPain → proximity bonus
+# Max fraction of the reversal that may already be complete at entry (Aug 19
+# 2026). REV fades an exhausted move, so it should enter NEAR that move's
+# extreme; the global chase gate (0.93) does not constrain a fade at all,
+# because for a fade the extreme is the GOOD end. Live entries, ranked:
+#   0.261 +Rs4,284 | 0.282 +Rs2,950 | 0.309 +Rs1,877 | 0.348 -Rs863 | 0.611 -Rs2,110
+# Monotone; 0.40 keeps the winning cluster and cuts the tail. Rupees before
+# Aug 18 are Black-Scholes-priced, so the RANKING is the evidence, not the
+# amounts. 0 disables.
+PATH_REV_MAX_CHASE          = 0.40
 PATH_REV_ADX_WANE_RATIO     = 0.85    # ADX < peak × this = momentum waning
 
 # ─── PATH_TREND: Trend-Continuation Pullback Entry ───────────────────────────

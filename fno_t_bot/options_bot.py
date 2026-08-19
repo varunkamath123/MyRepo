@@ -3551,6 +3551,41 @@ class TradingBot:
                 f'(={_adx/self._morning_adx_peak*100:.0f}% of peak) ✓'
             )
 
+        # ── Reversal-entry location gate (Aug 19 2026) ───────────────────────
+        # REV fades an exhausted move, so by construction it should enter NEAR
+        # the extreme of that move. The global chase gate (0.93) is no
+        # constraint here -- it only stops buying the literal extreme, which for
+        # a fade is the GOOD end.
+        #
+        # Aug 19 BANKNIFTY is the case: morning fell 57,356.8 -> 57,001.8
+        # (-355 pts), bounced 209 pts, and REV bought the CALL at 57,210.7 --
+        # 59% of the reversal already done. It then rolled over 196 pts and
+        # Never-Progressed cut it for -Rs2,110. That is not fading an exhausted
+        # move, it is buying the middle of one already underway.
+        #
+        # chase_pos for a CALL = position in the day's range (0 = at the low,
+        # the ideal fade entry); for a PUT it is mirrored. Live entries:
+        #   0.261 +Rs4,284 | 0.282 +Rs2,950 | 0.309 +Rs1,877
+        #   0.348   -Rs863 | 0.611 -Rs2,110
+        # Monotone. 0.40 keeps the whole winning cluster and cuts the tail.
+        # NOTE the P&L above except the last two is Black-Scholes-priced
+        # (pre Aug 18 fix), so treat the RANKING as the signal, not the rupees.
+        _max_chase = getattr(config, 'PATH_REV_MAX_CHASE', 0.40)
+        if _max_chase > 0:
+            _td_rev = df[df.index.date == df.index[-1].date()]
+            if len(_td_rev) > 0:
+                _d_hi = float(_td_rev['High'].max()); _d_lo = float(_td_rev['Low'].min())
+                if _d_hi > _d_lo:
+                    _rp = (_px - _d_lo) / (_d_hi - _d_lo)
+                    _rev_chase = _rp if rev_dir == 'CALL' else (1.0 - _rp)
+                    if _rev_chase > _max_chase:
+                        self.logger.info(
+                            f"  [PATH-REV] {self.instrument} {rev_dir}: entry "
+                            f"{_rev_chase:.3f} into the reversal > {_max_chase} "
+                            f"— the turn is already {_rev_chase*100:.0f}% done, skipped"
+                        )
+                        return None
+
         # ── Score gate ────────────────────────────────────────────────────────
         _min_score = getattr(config, 'PATH_REV_MIN_SCORE', 3)
         _reason_str = ' | '.join(reasons) if reasons else 'no conditions met'
