@@ -1628,3 +1628,18 @@ EMAIL_ADDRESS    = "your_email@example.com"
 # ─── Options Settings (legacy, used by bot.py) ────────────────────────────────
 OPTION_SYMBOL    = "NIFTY"
 STRIKE_SELECTION = "atm"
+
+# ─── PATH_SYNFUT — deep-ITM trend as a synthetic intraday future ─────────────
+# Added Sep 1 2026 on user spec: entry from OI levels + PCR + ADX (all three
+# required), trend-continuation only, deep-ITM strikes so the position tracks
+# the index ~1:1 rather than behaving like an option.
+#
+# Runs as an ISOLATED PAPER BOOK in parallel with the live strategy. It places
+# no orders and cannot affect the live position.
+#
+# Its exits are ATR-scaled INDEX POINTS, not premium percentages -- a delta~0.85
+# contract priced near intrinsic would essentially never reach a 25% stop or a
+# 55% target, so transplanting the live stack would leave it with no working
+# stop. Parameters live in synthetic_futures.py, are pre-registered and frozen;
+# any later tuning must be counted as a new trial for Deflated Sharpe purposes.
+SYNFUT_ENABLED = True

@@ -38,6 +38,7 @@ import reversal_scout
 import breakout_scout
 import anticipation_scout
 import max_pain_trap
+import synthetic_futures
 import near_miss_tracker
 import trade_probability
 from fyers_auth import FyersAuth
@@ -4801,6 +4802,25 @@ class TradingBot:
                         self.logger.warning(
                             f"  [MP-TRAP] evaluate_bar error: {_mp_exc}"
                         )
+
+                # ── PATH_SYNFUT (Sep 1 2026) — deep-ITM trend, synthetic future
+                # Isolated paper book running in parallel with the live strategy.
+                # Entry needs OI levels + PCR + ADX to agree; exits are in INDEX
+                # POINTS (ATR-scaled), because a delta~0.85 contract would never
+                # reach the live stack's premium-percentage stop or target.
+                # Cannot touch the live position; failures are swallowed.
+                if getattr(config, 'SYNFUT_ENABLED', False):
+                    try:
+                        synthetic_futures.evaluate_bar(
+                            bot        = self,
+                            instrument = self.instrument,
+                            df         = df,
+                            oc         = oc,
+                            now        = now,
+                            logger     = self.logger,
+                        )
+                    except Exception as _sf_exc:
+                        self.logger.debug(f"  [SYNFUT] evaluate_bar error: {_sf_exc}")
 
                 # Log exactly why entry is blocked (once per new bar to avoid spam)
                 if not can_enter:
