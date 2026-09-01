@@ -56,8 +56,20 @@ SYNFUT_ADX_MIN      = 25.0      # trend must exist
 SYNFUT_ADX_RISE     = 1.5       # ...and be building, over N bars
 SYNFUT_ADX_BARS     = 3
 SYNFUT_DI_SPREAD    = 12.0      # directional conviction
-SYNFUT_PCR_CALL_MAX = 0.95      # call-heavy book supports a CALL
-SYNFUT_PCR_PUT_MIN  = 1.05      # put-heavy book supports a PUT
+# PCR gate — PERCENTILE based, per instrument (fixed 2026-09-01)
+# The first version used absolute thresholds 0.95 / 1.05, symmetric around 1.0.
+# Real PCR here is not centred on 1.0: NIFTY median 0.928, BANKNIFTY median
+# 0.878 with a 75th percentile of 0.948. Those thresholds therefore admitted
+# CALLs on 64.6% of snapshots but PUTs on only 23.8% -- a 2.7x directional bias
+# that was never part of the spec, and worst on BANKNIFTY where our own gap
+# study says the index FADES (so PUT setups matter).
+# Percentiles make the gate mean "unusually call-heavy FOR THIS INDEX", which
+# is the intended signal, and keeps both directions reachable as the regime
+# drifts.
+SYNFUT_PCR_CALL_PCTL = 0.40     # CALL needs PCR below this percentile
+SYNFUT_PCR_PUT_PCTL  = 0.60     # PUT  needs PCR above this percentile
+SYNFUT_PCR_LOOKBACK_DAYS = 30   # trailing window for the reference distribution
+SYNFUT_PCR_MIN_SAMPLES   = 200  # below this, fall back and take no trade
 SYNFUT_ITM_PCT      = 0.012     # ~1.2% in the money -> delta ~0.80-0.90
 SYNFUT_STOP_ATR     = 1.0       # index-point stop
 SYNFUT_TARGET_ATR   = 2.0       # 2:1 reward:risk
@@ -83,6 +95,52 @@ def _write(inst: str, rec: dict) -> None:
             f.write(json.dumps(rec) + '\n')
     except Exception:
         pass
+
+
+_pcr_cache: dict = {}
+
+
+def _pcr_thresholds(inst: str, now):
+    """Trailing-window PCR percentiles for one instrument, cached per day.
+
+    Reads the same oi_intraday.jsonl the OI-BIAS engine writes. Returns
+    (call_max, put_min) or (None, None) when there is not enough history --
+    in which case the caller takes no trade rather than guessing.
+    """
+    key = (inst, now.strftime('%Y-%m-%d'))
+    if key in _pcr_cache:
+        return _pcr_cache[key]
+    vals = []
+    try:
+        import datetime as _dt
+        cutoff = (now - _dt.timedelta(days=SYNFUT_PCR_LOOKBACK_DAYS)).timestamp()
+        path = os.path.join(LOG_DIR, 'oi_intraday.jsonl')
+        with open(path, encoding='utf-8', errors='ignore') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or inst not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get('instrument') != inst:
+                    continue
+                if d.get('ts', 0) < cutoff:
+                    continue
+                v = d.get('pcr')
+                if v:
+                    vals.append(float(v))
+    except Exception:
+        pass
+    if len(vals) < SYNFUT_PCR_MIN_SAMPLES:
+        _pcr_cache[key] = (None, None)
+        return _pcr_cache[key]
+    vals.sort()
+    q = lambda f: vals[int(f * (len(vals) - 1))]
+    out = (q(SYNFUT_PCR_CALL_PCTL), q(SYNFUT_PCR_PUT_PCTL))
+    _pcr_cache[key] = out
+    return out
 
 
 def _signal(df, oc, oi_zones, now, logger, inst):
@@ -115,9 +173,12 @@ def _signal(df, oc, oi_zones, now, logger, inst):
     pcr = (oc or {}).get('pcr')
     if pcr is None:
         return None                      # PCR is REQUIRED by spec, not optional
-    if direction == 'CALL' and pcr > SYNFUT_PCR_CALL_MAX:
+    call_max, put_min = _pcr_thresholds(inst, now)
+    if call_max is None:
+        return None                      # insufficient PCR history -> no trade
+    if direction == 'CALL' and pcr > call_max:
         return None
-    if direction == 'PUT' and pcr < SYNFUT_PCR_PUT_MIN:
+    if direction == 'PUT' and pcr < put_min:
         return None
 
     # ── 3. OI levels: is there room to the next opposing wall? ──────────────
@@ -144,7 +205,8 @@ def _signal(df, oc, oi_zones, now, logger, inst):
         zone_action = 'MAXPAIN'
 
     return dict(type=direction, price=px, adx=adx, atr=atr, pcr=pcr,
-                di_spread=spread, adx_prev=adx_prev, zone=zone_action)
+                di_spread=spread, adx_prev=adx_prev, zone=zone_action,
+                pcr_call_max=round(call_max, 3), pcr_put_min=round(put_min, 3))
 
 
 def _deep_itm_strike(px: float, direction: str, gap: int) -> int:
