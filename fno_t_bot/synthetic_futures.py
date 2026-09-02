@@ -263,11 +263,15 @@ def evaluate_bar(bot, instrument, df, oc, now, logger=None):
             b['capital'] += net
             b['trades'] += 1
             b['position'] = None
-            realised = ((exit_px - pos['entry_price']) /
-                        max(index_px - pos['entry_index'], 1e-9)) \
-                if pos['type'] == 'CALL' else \
-                       ((exit_px - pos['entry_price']) /
-                        max(pos['entry_index'] - index_px, 1e-9))
+            # Realised delta = premium change per index point moved in the
+            # trade's OWN direction. The previous guard used max(move, 1e-9),
+            # which broke on LOSING trades: a negative move became 1e-9 and the
+            # division exploded (Sep 2 logged delta = -7.3e10). Guard on
+            # MAGNITUDE instead, and keep the sign.
+            _den = ((index_px - pos['entry_index']) if pos['type'] == 'CALL'
+                    else (pos['entry_index'] - index_px))
+            realised = ((exit_px - pos['entry_price']) / _den
+                        if abs(_den) > 1e-6 else None)
             _write(instrument, dict(
                 strategy='synfut', instrument=instrument, type=pos['type'],
                 strike=pos['strike'], symbol=pos['symbol'],
@@ -285,7 +289,7 @@ def evaluate_bar(bot, instrument, df, oc, now, logger=None):
                 pnl_net=round(net, 2), exit_reason=why,
                 adx=round(pos['adx'], 1), pcr=pos['pcr'], zone=pos['zone'],
                 itm_pts=round(pos['itm_pts'], 1),
-                realised_delta=round(realised, 3),
+                realised_delta=(round(realised, 3) if realised is not None else None),
                 capital=round(b['capital'], 2)))
             if logger:
                 logger.info(f"  [SYNFUT] {instrument} EXIT {pos['type']} {why} | "
