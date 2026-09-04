@@ -1506,7 +1506,23 @@ PATH_TREND_BODY_ATR_MIN  = 0.15     # resumption candle body >= this x ATR (filt
 # ~10pts of room and lost Rs4,477. Logged qualification ratios were
 # 1.58/1.59/1.42/1.31 with that loser alone at 0.54 -- so 1.0 is a noise floor
 # ("bigger than one bar's typical range"), not a fitted value. 0 disables.
-PATH_TREND_MIN_LEG_ATR   = 1.0
+# RAISED 1.0 -> 1.5 (Sep 4 2026) on a 197-signal replay of get_path_trend_signal
+# across every local session. 1.0 was a reasoned noise floor but had never been
+# measured; measured, it sits directly beneath the worst cohort in the sample.
+#     leg < 1.5 ATR   n=101   40.6% right   -1.00 ATR
+#     leg 1.5-5 ATR   n= 84   63.1% right   +0.20 ATR
+#     leg > 5   ATR   n= 12   41.7% right   -2.64 ATR
+# Mann-Whitney p=0.0003 for the 1.5-5 band vs the rest. NOT a cherry-picked
+# edge: every floor swept from 1.1 to 2.0 separates the same way (dropped
+# cohort worse at all 8), and it holds on a chronological holdout (at 1.5 the
+# second half keeps 66.0% right vs 28.6% for what it drops).
+# Retroactive effect on the 8 live TREND trades: blocks legs 1.04/1.16 (losses
+# -Rs3,261/-Rs1,462) and 1.18/1.00 (wins +Rs888/+Rs633) = +Rs3,202, taking
+# TREND from -Rs4,208 to -Rs1,006.
+# HONEST LIMIT: this makes TREND less bad, it does not make it good. The kept
+# cohort is still -0.15 ATR overall and -0.41 in the holdout. Loss reduction,
+# not edge creation. The 5x upper cap is NOT applied -- it rests on n=12.
+PATH_TREND_MIN_LEG_ATR   = 1.5
 PATH_TREND_OI_DRIFT_THRESH = 0.05   # PCR drift threshold (same magnitude as OI_PCR_DRIFT_THRESHOLD)
 PATH_TREND_OI_PCR_CALL_MAX = 1.05   # PCR above this contradicts a CALL continuation
 PATH_TREND_OI_PCR_PUT_MIN  = 0.95   # PCR below this contradicts a PUT continuation
