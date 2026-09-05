@@ -1536,6 +1536,53 @@ PATH_TREND_OI_PCR_PUT_MIN  = 0.95   # PCR below this contradicts a PUT continuat
 PATH_TREND_TRAIL_ACT       = TRAILING_ACTIVATION
 PATH_TREND_TRAIL_DIST      = TRAILING_DISTANCE
 
+# ── RV/IV premium-richness gate (v1.9.3, Sep 4 2026) ─────────────────────────
+# The first candidate edge in this project to survive every control thrown at
+# it. Blocks entries where realised vol has ALREADY caught up to implied.
+#
+# READ THIS BEFORE "FIXING" THE DIRECTION OF THE TEST:
+# rv_iv > 1 reads as "cheap premium" in valuation terms, so blocking HIGH rv_iv
+# looks inverted. It is not. This ratio behaves as a FORECAST, not a valuation.
+# Low rv_iv -- the chain pricing more movement than has recently occurred --
+# precedes LARGER forward moves, and larger moves pay a long-premium book
+# because the 25% stop caps the downside while the move feeds the convex side.
+#
+# MECHANISM, independently powered (n=6,529 five-min-spaced observations):
+#   forward 60-min move by rv_iv quintile: 2.39 / 2.35 / 2.21 / 1.98 / 1.80 ATR
+#   rho(rv_iv, forward move) = -0.2269   p=4.9e-77   monotone across all five
+#   CONTROL -- is it just vol mean-reversion?
+#     rho(HV,    fwd) = -0.1910  p=1.1e-54   mean-reversion is real, and partial
+#     rho(IV,    fwd) = +0.0194  p=0.116     IV LEVEL predicts nothing at all
+#     rho(rv_iv, fwd) = -0.2269              the RATIO beats either alone
+#   Within HV quartiles rv_iv still predicts (q2 -0.13, q3 -0.29, q4 -0.08),
+#   vanishing only in the lowest-HV quartile. So IV adds information beyond
+#   trailing realised vol -- but only as a ratio, never as a level.
+#
+# LIVE BOOK, chain-sourced trades (n=40: 28 logged + 12 reconstructed from
+# journal ATM-IV; reconstruction validated at Pearson r=0.92, median relative
+# error 1.0%, same side of the gate 90% of the time):
+#   EVERY threshold 0.55-0.90 separates -- kept always positive, blocked always
+#   negative, 8/8. At 0.70: kept 18 @ 72.2% win +Rs1,066; blocked 22 @ 27.3%
+#   win -Rs1,201. Book -Rs7,240 -> +Rs19,191. Holdout (Aug 14-Sep 2) holds:
+#   kept +Rs1,193 vs blocked -Rs1,732. Mann-Whitney p=0.0011, rho -0.527.
+#   Works within BOTH paths: REV kept +Rs1,736/blocked -Rs646; TREND kept
+#   -Rs242/blocked -Rs1,869.
+#
+# CHAIN-SOURCED ONLY. SENSEX has chain ATM-IV on 2 minute-stamps in five months
+# (BSE gap) and falls back to India VIX, which carries no SENSEX-specific
+# information -- and is the one slice showing no effect (gap +Rs36 vs +Rs1,566
+# NIFTY / +Rs3,038 BANKNIFTY). That null is confirmatory, not a failure. SENSEX
+# stays ungated and therefore remains a natural untreated control arm.
+#
+# HONEST LIMITS: n=40 is modest; 28 of those 40 overlap the sample the 0.70
+# threshold was chosen on, so the holdout is the genuinely independent piece.
+# Predicts move SIZE, not direction -- the direction problem is untouched.
+# Trial ~20 in this search; not exempt from the multiple-testing discount.
+# Fails OPEN: no IV, no HV, or a VIX-sourced ratio -> no block.
+RV_IV_GATE_ENABLED = True
+RV_IV_MAX          = 0.70          # block entries at or above this ratio
+RV_IV_GATE_SRC     = ('chain',)    # only gate when ATM-IV came from the real chain
+
 # ─── Post-11 Scorer Thresholds ───────────────────────────────────────────────
 # Aggregate score below POST11_SCORE_SKIP_MIN → skip entry (quality too low).
 # No single component blocks — only the aggregate can gate.

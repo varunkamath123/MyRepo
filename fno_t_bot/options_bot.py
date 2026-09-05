@@ -2590,6 +2590,33 @@ class TradingBot:
         return self._risk_cap_today, self._max_lots_today
 
     def enter_trade(self, signal: dict, hv: float, lots: int = 1) -> None:
+        # ── RV/IV premium-richness gate (v1.9.3) ─────────────────────────────
+        # Placed at the very top, BEFORE any strike selection or order
+        # placement, so a block can never orphan a live order. The rv_iv value
+        # in the entry-quality snapshot below is computed after the order goes
+        # in and is logging-only -- gating there would be unsafe in live mode.
+        # See config.RV_IV_GATE_ENABLED for the evidence and for why blocking
+        # HIGH rv_iv is correct rather than inverted.
+        if getattr(config, 'RV_IV_GATE_ENABLED', False):
+            _iv_chain_g = signal.get('atm_iv')
+            _src_g = ('chain' if _iv_chain_g
+                      else ('vix' if getattr(self, '_last_vix', None) else None))
+            _iv_g  = _iv_chain_g or getattr(self, '_last_vix', None)
+            _rv_g  = ((hv * 100.0 / _iv_g)
+                      if (_iv_g and hv and _iv_g > 0) else None)
+            if (_rv_g is not None
+                    and _src_g in getattr(config, 'RV_IV_GATE_SRC', ('chain',))
+                    and _rv_g >= getattr(config, 'RV_IV_MAX', 0.70)):
+                self.logger.info(
+                    f"  [RV-IV GATE] {self.instrument} {signal.get('type')} "
+                    f"path={signal.get('path')} BLOCKED — rv_iv {_rv_g:.3f} >= "
+                    f"{getattr(config, 'RV_IV_MAX', 0.70)} "
+                    f"(HV={hv*100:.2f}% IV={_iv_g:.2f}% src={_src_g}) — realised "
+                    f"vol has already caught up to implied; forward-move "
+                    f"expectancy sits in the low band"
+                )
+                return
+
         underlying   = signal['price']
         _atm         = int(round(underlying / self.strike_gap) * self.strike_gap)
         _otm         = signal.get('otm_strikes', 0)   # 0=ATM, 1=1-strike OTM, 2=2-strike OTM
