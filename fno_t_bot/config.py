@@ -1579,6 +1579,28 @@ PATH_TREND_TRAIL_DIST      = TRAILING_DISTANCE
 # Predicts move SIZE, not direction -- the direction problem is untouched.
 # Trial ~20 in this search; not exempt from the multiple-testing discount.
 # Fails OPEN: no IV, no HV, or a VIX-sourced ratio -> no block.
+# ── PATH_MR: multi-day mean reversion (Sep 7 2026) — SHADOW, never trades ────
+# The only directional signal in this project that has not come back null.
+#   rho(5-day trend, 11:00->14:30 move) = -0.1807  p=0.0002  n=417 sessions
+#   (one observation per session; the earlier n=16,800 was overlapping windows)
+# Indices FADE their own multi-day move. Replicated on all three instruments in
+# the recent period (NIFTY -0.215, BANKNIFTY -0.273, SENSEX -0.349) with a
+# dose-response: edge over a coin flip rises with move size, -0.108 / +0.064 /
+# +0.019 / +0.108 / +0.309 ATR across |move| quintiles. Top decile alone:
+# n=42, 47.6% win, +0.348 ATR vs control -0.190, p=0.0445.
+#
+# SHADOW, deliberately. Three reasons:
+#  1. DSR FAILS -- 68.5% tertile, 59.3% top decile. Nominal significance at
+#     n=42 is precisely the regime that produced 3,072 dead variants.
+#  2. Regime-dependent, and we cannot yet tell if the regime lasts. SENSEX held
+#     constant: Jun'25-Jan'26 rho -0.052 (p=0.53, nothing) vs Jan'26-Sep'26
+#     rho -0.221 (p=0.0067). Rolling thirds strengthen monotonically.
+#  3. The live book is measuring the rv_iv gate; a second new path would
+#     confound that read. Paper mode makes shadow free.
+# PROMOTE ON: ~60-80 more logged sessions with the top-decile edge intact and
+# a DSR that clears. Not before.
+PATH_MR_SHADOW_ENABLED = True
+
 RV_IV_GATE_ENABLED = True
 RV_IV_MAX          = 0.70          # block entries at or above this ratio
 RV_IV_GATE_SRC     = ('chain',)    # only gate when ATM-IV came from the real chain

@@ -39,6 +39,7 @@ import breakout_scout
 import anticipation_scout
 import max_pain_trap
 import synthetic_futures
+import path_mr
 import near_miss_tracker
 import trade_probability
 from fyers_auth import FyersAuth
@@ -4836,6 +4837,16 @@ class TradingBot:
                 # POINTS (ATR-scaled), because a delta~0.85 contract would never
                 # reach the live stack's premium-percentage stop or target.
                 # Cannot touch the live position; failures are swallowed.
+                # PATH_MR shadow: logs the multi-day mean-reversion read once per
+                # session and NEVER trades. Kept out of the entry path entirely
+                # so it cannot confound the rv_iv gate currently under test.
+                if getattr(config, 'PATH_MR_SHADOW_ENABLED', False):
+                    try:
+                        path_mr.evaluate(bot=self, instrument=self.instrument,
+                                         df=df, now=now, logger=self.logger)
+                    except Exception as _mr_exc:
+                        self.logger.debug(f"  [PATH-MR] evaluate error: {_mr_exc}")
+
                 if getattr(config, 'SYNFUT_ENABLED', False):
                     try:
                         synthetic_futures.evaluate_bar(
