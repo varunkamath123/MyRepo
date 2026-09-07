@@ -1581,8 +1581,16 @@ PATH_TREND_TRAIL_DIST      = TRAILING_DISTANCE
 # Fails OPEN: no IV, no HV, or a VIX-sourced ratio -> no block.
 # ── PATH_MR: multi-day mean reversion (Sep 7 2026) — SHADOW, never trades ────
 # The only directional signal in this project that has not come back null.
-#   rho(5-day trend, 11:00->14:30 move) = -0.1807  p=0.0002  n=417 sessions
-#   (one observation per session; the earlier n=16,800 was overlapping windows)
+#   CORRECTED Sep 7 2026 on the FULL local dataset (n=876 balanced sessions):
+#     rho = -0.0721  p=0.033 pooled; NO instrument significant alone
+#     (NIFTY -0.071 p=0.23, BANKNIFTY -0.095 p=0.11, SENSEX -0.059 p=0.30)
+#   The earlier -0.1807/p=0.0002 was measured on the EC2 copy, which is missing
+#   ~14 months of NIFTY/BANKNIFTY history and therefore covers only the recent,
+#   stronger period. Tradeable top-decile rule on full data: n=88, 37.5% win,
+#   edge +0.031 ATR over a coin flip, p=0.4167, DSR 14.6% -- fails badly.
+#   What DID survive the correction: the effect strengthens over time even with
+#   balanced instruments -- T1 -0.005 (p=0.93), T2 -0.047 (p=0.42),
+#   T3 -0.207 (p=0.0004). Real, but not yet tradeable.
 # Indices FADE their own multi-day move. Replicated on all three instruments in
 # the recent period (NIFTY -0.215, BANKNIFTY -0.273, SENSEX -0.349) with a
 # dose-response: edge over a coin flip rises with move size, -0.108 / +0.064 /
