@@ -1522,7 +1522,23 @@ PATH_TREND_BODY_ATR_MIN  = 0.15     # resumption candle body >= this x ATR (filt
 # HONEST LIMIT: this makes TREND less bad, it does not make it good. The kept
 # cohort is still -0.15 ATR overall and -0.41 in the holdout. Loss reduction,
 # not edge creation. The 5x upper cap is NOT applied -- it rests on n=12.
-PATH_TREND_MIN_LEG_ATR   = 1.5
+# REVERTED 1.5 -> 1.0 (Sep 7 2026). The Sep 4 raise was justified on a
+# 197-signal replay run against the EC2 data copy, which is missing ~14 months
+# of NIFTY/BANKNIFTY history. Re-run on the FULL local dataset (n=521 signals,
+# balanced 171/165/185) the relationship vanishes entirely:
+#   floor  kept %right  mean ATR   dropped %right  mean ATR
+#    1.0    232  53.0%   -0.210      289   49.8%   -0.148
+#    1.5    171  53.2%   -0.249      350   50.3%   -0.140
+#    2.0    126  51.6%   -0.341      395   51.1%   -0.123
+#   rho(leg, outcome) = +0.0001  p=0.998   Mann-Whitney p=0.3132
+# The KEPT cohort is worse than the DROPPED cohort at every threshold. Leg size
+# does not predict outcome. Back to 1.0, the long-standing reasoned noise floor
+# ("bigger than one bar's typical range") -- which is not evidence-backed
+# either, but is the status quo rather than a change built on a sample artifact.
+# Live cost of the bad raise: Sep 7 BANKNIFTY PUT was blocked at 1.10-1.40xATR
+# for ~40 minutes and only fired at 2.36x, by which point the chase gate
+# (correctly) refused it.
+PATH_TREND_MIN_LEG_ATR   = 1.0
 PATH_TREND_OI_DRIFT_THRESH = 0.05   # PCR drift threshold (same magnitude as OI_PCR_DRIFT_THRESHOLD)
 PATH_TREND_OI_PCR_CALL_MAX = 1.05   # PCR above this contradicts a CALL continuation
 PATH_TREND_OI_PCR_PUT_MIN  = 0.95   # PCR below this contradicts a PUT continuation
