@@ -1623,6 +1623,36 @@ PATH_TREND_TRAIL_DIST      = TRAILING_DISTANCE
 #     confound that read. Paper mode makes shadow free.
 # PROMOTE ON: ~60-80 more logged sessions with the top-decile edge intact and
 # a DSR that clears. Not before.
+# --- Challenger: what is it actually testing? (rebuilt Sep 8 2026) ----------
+# It used to test STRIKE SELECTION (ATM vs OTM) and price everything with
+# Black-Scholes. Two problems made it worthless:
+#  1. The Champion moved to real LTPs on Aug 18 2026 and the Challenger did
+#     not. The books were then priced by different systems, so every
+#     "vs Champion" number was a pricing artefact. Sep 8 SENSEX is the clean
+#     case: identical strike, same minute, Champion -1.2% on the real quote,
+#     Challenger -62.5% on the model. Nothing about strikes was being measured.
+#  2. Strike selection is not where the losses are. Entry selection has no
+#     measurable edge (five independent methods) and the exit stack is already
+#     the best of 17 variants. Testing it harder cannot pay.
+#
+# It now tests the one structural finding with strong evidence behind it: that
+# we are a NET PREMIUM BUYER paying a median 34% volatility overpayment
+# (rv_iv < 1.0 on 90.7% of entries), on top of a straddle EV of -41.6% measured
+# over 4,566 observations -- i.e. the seller of that premium earns it.
+#
+# CHALLENGER = the same signal, same direction, same minute, same strike as the
+# Champion -- but as a VERTICAL DEBIT SPREAD instead of a naked long. The short
+# leg refunds part of the premium, so the A/B isolates STRUCTURE alone. Both
+# books now mark to real LTPs, so the comparison finally means something.
+# Costs are charged on both legs.
+#
+# WHAT WOULD SETTLE IT: if the spread's net P&L beats the naked long over ~30
+# paired trades, the vol overpayment is the dominant leak and the whole book
+# should change structure. If it does not, buying naked premium is defensible
+# and the leak is elsewhere. Either answer is worth more than a strike study.
+CHALLENGER_MODE        = 'SPREAD'   # 'SPREAD' | 'STRIKE' (legacy OTM study)
+CHALLENGER_SPREAD_GAPS = 2          # short leg this many strikes further OTM
+
 PATH_MR_SHADOW_ENABLED = True
 
 RV_IV_GATE_ENABLED = True

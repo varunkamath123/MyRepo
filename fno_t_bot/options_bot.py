@@ -2977,6 +2977,27 @@ class TradingBot:
             shared_state.get_sgx_context(), signal['type'], self.logger
         )
 
+    def _quote_option(self, strike: int, opt_type: str, underlying: float,
+                      hv: float) -> tuple:
+        """Real traded premium for one leg, Black-Scholes only as fallback.
+
+        Same policy the Champion has used since Aug 18 2026. Returns
+        (price, symbol, source) where source is 'LTP' or 'BS'.
+        """
+        T = config.DAYS_TO_EXPIRY / 365
+        px, sym, src = bs_price(opt_type, underlying, strike, T, hv), None, 'BS'
+        try:
+            from fyers_orders import build_option_symbol, get_next_expiry, get_ltp
+            sym = build_option_symbol(self.instrument, strike, opt_type,
+                                      get_next_expiry(self.instrument))
+            if self.fyers and sym:
+                ltp = get_ltp(self.fyers, sym)
+                if ltp and ltp > 0:
+                    px, src = float(ltp), 'LTP'
+        except Exception as exc:
+            self.logger.debug(f"  [CHALLENGER] quote failed {strike}{opt_type}: {exc}")
+        return px, sym, src
+
     def enter_challenger_trade(self, signal: dict, hv: float,
                                oc: dict, lots: int = 1) -> None:
         """
@@ -2988,15 +3009,49 @@ class TradingBot:
         """
         underlying   = signal['price']
         atm_strike   = int(round(underlying / self.strike_gap) * self.strike_gap)
-        ch_strike    = self.select_challenger_strike(signal['type'], underlying, oc)
         eff_lot_size = self.lot_size * lots
+        mode         = getattr(config, 'CHALLENGER_MODE', 'STRIKE')
 
-        T           = config.DAYS_TO_EXPIRY / 365
-        entry_price = bs_price(signal['type'], underlying, ch_strike, T, hv)
+        # Use the Champion's OWN strike so the A/B differs only in STRUCTURE.
+        _otm   = signal.get('otm_strikes', 0)
+        long_k = (atm_strike + _otm * self.strike_gap) if signal['type'] == 'CALL' \
+            else (atm_strike - _otm * self.strike_gap)
+
+        short_k = short_sym = None
+        if mode == 'SPREAD':
+            gaps    = max(int(getattr(config, 'CHALLENGER_SPREAD_GAPS', 2)), 1)
+            short_k = (long_k + gaps * self.strike_gap) if signal['type'] == 'CALL' \
+                else (long_k - gaps * self.strike_gap)
+            ch_strike = long_k
+        else:
+            ch_strike = self.select_challenger_strike(signal['type'], underlying, oc)
+            long_k    = ch_strike
+
+        long_px, long_sym, long_src = self._quote_option(
+            long_k, signal['type'], underlying, hv)
+
+        if mode == 'SPREAD':
+            short_px, short_sym, short_src = self._quote_option(
+                short_k, signal['type'], underlying, hv)
+            # A debit spread's short leg must be cheaper than its long leg. If a
+            # bad quote inverts that, the structure is meaningless -- skip rather
+            # than log a nonsense trade.
+            if short_px >= long_px:
+                self.logger.info(
+                    f"  [CHALLENGER] short leg ₹{short_px:.2f} >= long "
+                    f"₹{long_px:.2f} - bad quote, skipping shadow entry"
+                )
+                return
+            entry_price = long_px - short_px          # net debit
+            _src_tag    = f"{long_src}/{short_src}"
+        else:
+            short_px    = 0.0
+            entry_price = long_px
+            _src_tag    = long_src
 
         if entry_price < config.MIN_OPTION_PRICE:
             self.logger.info(
-                f"  [CHALLENGER] Option ₹{entry_price:.2f} < min "
+                f"  [CHALLENGER] net ₹{entry_price:.2f} < min "
                 f"₹{config.MIN_OPTION_PRICE}. Skipping shadow entry."
             )
             return
@@ -3011,19 +3066,40 @@ class TradingBot:
             'hv_at_entry'     : hv,
             'highest_pnl_pct' : 0.0,
             'atm_strike'      : atm_strike,   # Champion's strike — for comparison log
+            'mode'            : mode,
+            'long_strike'     : long_k,
+            'short_strike'    : short_k,
+            'long_symbol'     : long_sym,
+            'short_symbol'    : short_sym,
+            'long_entry'      : round(long_px, 2),
+            'short_entry'     : round(short_px, 2),
+            'px_src'          : _src_tag,
+            'width_pts'       : (abs(short_k - long_k) if short_k else None),
         }
         self.challenger_positions.append(position)
         self.challenger_trades_today += 1
 
-        delta_n  = (ch_strike - atm_strike) // self.strike_gap
-        ch_label = f"OTM{delta_n:+d}" if ch_strike != atm_strike else "ATM"
-        self.logger.info(
-            f"  [CHALLENGER] ENTRY {signal['type']:4s} | "
-            f"Strike: {ch_strike} ({ch_label} vs Champion ATM {atm_strike}) | "
-            f"Opt: ₹{entry_price:.2f} | "
-            f"MaxPain={oc.get('max_pain', '?')} | "
-            f"Trade #{self.challenger_trades_today}"
-        )
+        if mode == 'SPREAD':
+            _w  = abs(short_k - long_k)
+            _mx = _w - entry_price                     # max value at expiry
+            self.logger.info(
+                f"  [CHALLENGER] ENTRY {signal['type']:4s} SPREAD | "
+                f"long {long_k} ₹{long_px:.2f} / short {short_k} ₹{short_px:.2f} | "
+                f"net debit ₹{entry_price:.2f} vs Champion naked ₹{long_px:.2f} "
+                f"({100*(1-entry_price/long_px):.0f}% less premium at risk) | "
+                f"width {_w:.0f}pts max ₹{_mx:.2f} ({100*_mx/entry_price:.0f}%) | "
+                f"px={_src_tag} | Trade #{self.challenger_trades_today}"
+            )
+        else:
+            delta_n  = (ch_strike - atm_strike) // self.strike_gap
+            ch_label = f"OTM{delta_n:+d}" if ch_strike != atm_strike else "ATM"
+            self.logger.info(
+                f"  [CHALLENGER] ENTRY {signal['type']:4s} | "
+                f"Strike: {ch_strike} ({ch_label} vs Champion ATM {atm_strike}) | "
+                f"Opt: ₹{entry_price:.2f} | px={_src_tag} | "
+                f"MaxPain={oc.get('max_pain', '?')} | "
+                f"Trade #{self.challenger_trades_today}"
+            )
 
     # ── Exit Management ───────────────────────────────────────────────────────
 
@@ -3241,7 +3317,16 @@ class TradingBot:
                         if actual_price:
                             current_opt = actual_price  # use real fill price
 
-                costs   = round_trip_costs(pos['entry_price'], current_opt, pos['lot_size'])
+                # A spread pays costs on BOTH legs; charge the long and short
+                # premiums separately rather than on the net debit.
+                if pos.get('mode') == 'SPREAD' and pos.get('short_strike'):
+                    costs = (round_trip_costs(pos['long_entry'], current_opt,
+                                              pos['lot_size'])
+                             + round_trip_costs(pos['short_entry'], current_opt,
+                                                pos['lot_size']))
+                else:
+                    costs = round_trip_costs(pos['entry_price'], current_opt,
+                                             pos['lot_size'])
                 pnl_net = (current_opt - pos['entry_price']) * pos['lot_size'] - costs
 
                 self.capital   += pnl_net
@@ -3363,16 +3448,40 @@ class TradingBot:
                                force_close: bool = False) -> None:
         """
         Evaluate stops/targets for Challenger shadow positions each cycle.
-        Always uses BS pricing (no live orders). Logs [CHALLENGER] EXIT lines
-        with running P&L delta vs Champion for easy side-by-side comparison.
+
+        Marks to REAL traded premiums, Black-Scholes only as fallback. Until
+        Sep 8 2026 this always used BS while the Champion had moved to live
+        LTPs in August, so the two books were priced by different systems and
+        every "Challenger vs Champion" number was a pricing artefact rather
+        than a strategy result. The Sep 8 SENSEX pair is the clean example:
+        identical strike, same minute, Champion -1.2% on the real quote and
+        Challenger -62.5% on the model.
         """
         to_close = []
         for idx, pos in enumerate(self.challenger_positions):
             elapsed_days = (
                 datetime.now(IST) - pos['entry_time']
             ).total_seconds() / 86400
-            T_rem       = max(config.DAYS_TO_EXPIRY - elapsed_days, 0.01) / 365
-            current_opt = bs_price(pos['type'], current_price, pos['strike'], T_rem, hv)
+            T_rem = max(config.DAYS_TO_EXPIRY - elapsed_days, 0.01) / 365
+
+            def _mark(sym, strike):
+                """Live premium for one leg; BS on the same T_rem as fallback."""
+                if sym and self.fyers:
+                    try:
+                        from fyers_orders import get_ltp
+                        _l = get_ltp(self.fyers, sym)
+                        if _l and _l > 0:
+                            return float(_l)
+                    except Exception:
+                        pass
+                return bs_price(pos['type'], current_price, strike, T_rem, hv)
+
+            if pos.get('mode') == 'SPREAD' and pos.get('short_strike'):
+                current_opt = (_mark(pos.get('long_symbol'), pos['long_strike'])
+                               - _mark(pos.get('short_symbol'), pos['short_strike']))
+                current_opt = max(current_opt, 0.01)   # a debit spread cannot go < 0
+            else:
+                current_opt = _mark(pos.get('long_symbol'), pos['strike'])
 
             pnl_pct = (current_opt - pos['entry_price']) / pos['entry_price']
             if pnl_pct > pos['highest_pnl_pct']:
@@ -3406,6 +3515,13 @@ class TradingBot:
                     'type'        : pos['type'],
                     'strike'      : pos['strike'],
                     'atm_strike'  : pos['atm_strike'],
+                    'ch_mode'     : pos.get('mode'),
+                    'long_strike' : pos.get('long_strike'),
+                    'short_strike': pos.get('short_strike'),
+                    'long_entry'  : pos.get('long_entry'),
+                    'short_entry' : pos.get('short_entry'),
+                    'width_pts'   : pos.get('width_pts'),
+                    'px_src'      : pos.get('px_src'),
                     'entry_price' : round(pos['entry_price'], 2),
                     'exit_price'  : round(current_opt, 2),
                     'pnl_pct'     : round(pnl_pct * 100, 2),
