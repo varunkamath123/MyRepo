@@ -1781,4 +1781,11 @@ STRIKE_SELECTION = "atm"
 # 55% target, so transplanting the live stack would leave it with no working
 # stop. Parameters live in synthetic_futures.py, are pre-registered and frozen;
 # any later tuning must be counted as a new trial for Deflated Sharpe purposes.
-SYNFUT_ENABLED = True
+# DISABLED Sep 13 2026 (user decision). One trade in its whole life (-Rs2,270),
+# nothing since Sep 2, and the ADX/DI core it is built on is a coin flip:
+# re-tested on the full local dataset, n=717 signals, 36.8% right vs a
+# random-direction control at 36.1%, edge +0.025 ATR, p=0.3754. Its OI gate
+# (SKIP/REDUCE -> no trade) also blocks the cohort that historically performed
+# BETTER (REV+REDUCE is the single best cohort in the book at +Rs952/trade).
+# It generates no information and costs attention. Set True to revive.
+SYNFUT_ENABLED = False

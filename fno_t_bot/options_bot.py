@@ -2598,25 +2598,8 @@ class TradingBot:
         # in and is logging-only -- gating there would be unsafe in live mode.
         # See config.RV_IV_GATE_ENABLED for the evidence and for why blocking
         # HIGH rv_iv is correct rather than inverted.
-        if getattr(config, 'RV_IV_GATE_ENABLED', False):
-            _iv_chain_g = signal.get('atm_iv')
-            _src_g = ('chain' if _iv_chain_g
-                      else ('vix' if getattr(self, '_last_vix', None) else None))
-            _iv_g  = _iv_chain_g or getattr(self, '_last_vix', None)
-            _rv_g  = ((hv * 100.0 / _iv_g)
-                      if (_iv_g and hv and _iv_g > 0) else None)
-            if (_rv_g is not None
-                    and _src_g in getattr(config, 'RV_IV_GATE_SRC', ('chain',))
-                    and _rv_g >= getattr(config, 'RV_IV_MAX', 0.70)):
-                self.logger.info(
-                    f"  [RV-IV GATE] {self.instrument} {signal.get('type')} "
-                    f"path={signal.get('path')} BLOCKED — rv_iv {_rv_g:.3f} >= "
-                    f"{getattr(config, 'RV_IV_MAX', 0.70)} "
-                    f"(HV={hv*100:.2f}% IV={_iv_g:.2f}% src={_src_g}) — realised "
-                    f"vol has already caught up to implied; forward-move "
-                    f"expectancy sits in the low band"
-                )
-                return
+        if self._rv_iv_blocked(signal, hv):
+            return
 
         underlying   = signal['price']
         _atm         = int(round(underlying / self.strike_gap) * self.strike_gap)
@@ -2977,6 +2960,59 @@ class TradingBot:
             shared_state.get_sgx_context(), signal['type'], self.logger
         )
 
+    def _rv_iv_blocked(self, signal: dict, hv: float) -> bool:
+        """Shared RV/IV premium-richness gate. See config.RV_IV_GATE_ENABLED.
+
+        Called by BOTH enter_trade and enter_challenger_trade. Until Sep 13 2026
+        the gate lived only inside enter_trade, so a blocked signal still opened
+        a Challenger position -- the two books then differed in structure AND in
+        gating, and the structural A/B could not be read. Sep 10 NIFTY and
+        Sep 11 BANKNIFTY were both taken by the Challenger after the Champion
+        refused them.
+
+        Blocked signals are written to logs/rv_iv_blocked_*.jsonl so the
+        counterfactual ("what would the blocked trades have done?") is kept
+        deliberately rather than as a side effect of a bug -- it is the only
+        way this gate can ever be validated.
+        """
+        if not getattr(config, 'RV_IV_GATE_ENABLED', False):
+            return False
+        iv_chain = signal.get('atm_iv')
+        src = ('chain' if iv_chain
+               else ('vix' if getattr(self, '_last_vix', None) else None))
+        iv = iv_chain or getattr(self, '_last_vix', None)
+        rv = (hv * 100.0 / iv) if (iv and hv and iv > 0) else None
+        if (rv is None
+                or src not in getattr(config, 'RV_IV_GATE_SRC', ('chain',))
+                or rv < getattr(config, 'RV_IV_MAX', 0.70)):
+            return False
+        self.logger.info(
+            f"  [RV-IV GATE] {self.instrument} {signal.get('type')} "
+            f"path={signal.get('path')} BLOCKED \u2014 rv_iv {rv:.3f} >= "
+            f"{getattr(config, 'RV_IV_MAX', 0.70)} "
+            f"(HV={hv*100:.2f}% IV={iv:.2f}% src={src}) \u2014 realised vol has "
+            f"already caught up to implied; forward-move expectancy sits in "
+            f"the low band"
+        )
+        try:
+            import json as _json
+            _d = datetime.now(IST)
+            _p = os.path.join(config.LOG_DIRECTORY,
+                              f'rv_iv_blocked_{self.instrument}_'
+                              f'{_d.strftime("%Y-%m-%d")}.jsonl')
+            os.makedirs(config.LOG_DIRECTORY, exist_ok=True)
+            with open(_p, 'a', encoding='utf-8') as fh:
+                fh.write(_json.dumps(dict(
+                    instrument=self.instrument, time=_d.isoformat(),
+                    type=signal.get('type'), path=signal.get('path'),
+                    rv_iv=round(rv, 3), hv=round(hv * 100, 3), iv=round(iv, 3),
+                    src=src, index=signal.get('price'),
+                    adx=signal.get('adx'), chase_pos=signal.get('chase_pos'),
+                )) + '\n')
+        except Exception as exc:
+            self.logger.debug(f"  [RV-IV GATE] blocked-log write failed: {exc}")
+        return True
+
     def _quote_option(self, strike: int, opt_type: str, underlying: float,
                       hv: float) -> tuple:
         """Real traded premium for one leg, Black-Scholes only as fallback.
@@ -3007,6 +3043,10 @@ class TradingBot:
         BS pricing uses hv (same as Champion) with the selected strike, so P&L
         comparison is a clean A/B: same model, same IV, different strike K.
         """
+        # Same gate as the Champion, so the A/B isolates STRUCTURE alone.
+        if self._rv_iv_blocked(signal, hv):
+            return
+
         underlying   = signal['price']
         atm_strike   = int(round(underlying / self.strike_gap) * self.strike_gap)
         eff_lot_size = self.lot_size * lots

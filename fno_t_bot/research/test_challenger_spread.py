@@ -34,7 +34,10 @@ bot = TradingBot('NIFTY')
 bot.challenger_positions = []
 bot.challenger_trades_today = 0
 
-sig = {'price': 23800.0, 'type': 'CALL', 'atm_iv': 12.0, 'path': 'TEST',
+# atm_iv 20.0 with hv 0.10 -> rv_iv 0.50, which CLEARS the RV/IV gate. The
+# Challenger now shares that gate with the Champion (Sep 13 2026), so a signal
+# that the gate blocks opens nothing here either -- see the parity test below.
+sig = {'price': 23800.0, 'type': 'CALL', 'atm_iv': 20.0, 'path': 'TEST',
        'otm_strikes': 0, 'adx': 30.0}
 bot.enter_challenger_trade(sig, 0.10, {'max_pain': 23800}, lots=1)
 
@@ -68,7 +71,7 @@ if bot.challenger_positions:
 
 # PUT side: the short leg must go the other way
 bot.challenger_positions = []
-bot.enter_challenger_trade({'price': 23800.0, 'type': 'PUT', 'atm_iv': 12.0,
+bot.enter_challenger_trade({'price': 23800.0, 'type': 'PUT', 'atm_iv': 20.0,
                             'path': 'TEST', 'otm_strikes': 0, 'adx': 30.0},
                            0.10, {'max_pain': 23800}, lots=1)
 if bot.challenger_positions:
@@ -94,6 +97,15 @@ if bot.challenger_positions:
         bot.check_challenger_exits(24200.0, 0.10)   # deep ITM through both legs
         ck('deep-ITM rally resolves the spread (position closed or profitable)',
            len(bot.challenger_positions) == 0 or True)
+
+# GATE PARITY -- the whole point of the Sep 13 fix. A signal the Champion
+# refuses must not open a Challenger position, or the A/B measures structure
+# AND gating at once (which is what happened on Sep 10 and Sep 11).
+bot.challenger_positions = []
+blocked_sig = dict(sig, atm_iv=12.0)     # rv_iv 0.833 -> gate blocks
+bot.enter_challenger_trade(blocked_sig, 0.10, {'max_pain': 23800}, lots=1)
+ck('challenger RESPECTS the rv_iv gate', len(bot.challenger_positions) == 0,
+   f'{len(bot.challenger_positions)} positions opened on a blocked signal')
 
 # legacy mode still works
 config.CHALLENGER_MODE = 'STRIKE'
