@@ -1650,6 +1650,32 @@ PATH_TREND_TRAIL_DIST      = TRAILING_DISTANCE
 # paired trades, the vol overpayment is the dominant leak and the whole book
 # should change structure. If it does not, buying naked premium is defensible
 # and the leak is elsewhere. Either answer is worth more than a strike study.
+# --- Counterfactual book: "what if that blocked signal had been taken?" -----
+# Every gate here is an assumption that certain trades are not worth taking, and
+# none of them had ever been measured live. Sep 15 2026 forced the issue: all
+# three indices fell ~1.9% and closed on their lows, PATH_REV called the correct
+# PUT direction all day, and PATH_REV_MAX_CHASE refused every one of them as
+# "the turn is already 99% done" -- while SENSEX still had +494 index points of
+# PUT left to give. There was no way to price that mistake, because a blocked
+# signal left nothing behind but a log line.
+#
+# When a gate refuses a signal, a PHANTOM position is now opened, marked against
+# real traded premiums on the same cycle as the live book, and closed on the
+# same exit stack (stop / target / trail / Never-Progressed / force-close).
+# Output: logs/counterfactual_<INST>_<date>.jsonl, tagged with the gate that
+# blocked it, so each guard accumulates its own P&L record.
+#
+# HOW TO READ IT: a gate whose phantoms are consistently NEGATIVE is earning its
+# keep. One whose phantoms are consistently POSITIVE is costing money and should
+# be challenged. One phantom per (instrument, date, gate, direction) -- gates
+# refuse the same setup on every cycle (Sep 15 logged the same REV block 10-20x)
+# and the question is whether the SETUP would have paid, not how often we logged.
+#
+# Costs nothing but quotes and a log line. It never trades, never sizes, never
+# feeds a signal, and swallows its own exceptions -- a broken measurement must
+# not stop the bot from trading.
+COUNTERFACTUAL_ENABLED = True
+
 CHALLENGER_MODE        = 'SPREAD'   # 'SPREAD' | 'STRIKE' (legacy OTM study)
 CHALLENGER_SPREAD_GAPS = 2          # short leg this many strikes further OTM
 

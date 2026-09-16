@@ -40,6 +40,7 @@ import anticipation_scout
 import max_pain_trap
 import synthetic_futures
 import path_mr
+import counterfactual
 import near_miss_tracker
 import trade_probability
 from fyers_auth import FyersAuth
@@ -2749,6 +2750,9 @@ class TradingBot:
                     f"  [RISK-GATE] {self.instrument} {signal['type']}: 1-lot risk "
                     f"₹{_risk:,.0f} > cap ₹{_risk_cap:,.0f} — skipping trade"
                 )
+                counterfactual.record(self, signal['type'], float(underlying),
+                                      'RISK', '1-lot risk exceeds the per-trade cap', hv,
+                                      extra=dict(path=signal.get('path')))
                 return
         else:
             self.logger.warning(
@@ -3033,6 +3037,11 @@ class TradingBot:
                 )) + '\n')
         except Exception as exc:
             self.logger.debug(f"  [RV-IV GATE] blocked-log write failed: {exc}")
+        counterfactual.record(self, signal.get('type'), float(signal['price']),
+                              'RV_IV', f'rv_iv {rv:.3f} >= '
+                              f'{getattr(config, "RV_IV_MAX", 0.70)}', hv,
+                              extra=dict(rv_iv=round(rv, 3), src=src,
+                                         path=signal.get('path')))
         return True
 
     def _quote_option(self, strike: int, opt_type: str, underlying: float,
@@ -3791,6 +3800,15 @@ class TradingBot:
                             f"{_rev_chase:.3f} into the reversal > {_max_chase} "
                             f"— the turn is already {_rev_chase*100:.0f}% done, skipped"
                         )
+                        try:
+                            counterfactual.record(
+                                self, rev_dir, float(_px), 'REV_CHASE',
+                                f'rev chase {_rev_chase:.3f} > {_max_chase}',
+                                float(df['HV'].iloc[-1]),
+                                extra=dict(rev_chase=round(_rev_chase, 3),
+                                           path='REV'))
+                        except Exception:
+                            pass
                         return None
 
         # ── Score gate ────────────────────────────────────────────────────────
@@ -3963,6 +3981,14 @@ class TradingBot:
                     f"{leg_range:.1f}pts = {_leg_atr:.2f}xATR < {_min_leg_atr} "
                     f"— move too small to continue, skipped"
                 )
+                try:
+                    counterfactual.record(
+                        self, trend_dir, float(px), 'TREND_LEG',
+                        f'leg {_leg_atr:.2f}xATR < {_min_leg_atr}',
+                        float(df['HV'].iloc[-1]),
+                        extra=dict(leg_atr=round(_leg_atr, 2), path='TREND'))
+                except Exception:
+                    pass
                 return None
         retr = (((extreme - px) / leg_range) if trend_dir == 'CALL'
                 else ((px - extreme) / leg_range))
@@ -4159,6 +4185,7 @@ class TradingBot:
             self._trend_leg_extreme   = None
             self._trend_anchor        = None
             self._path_trend_fired    = False
+            counterfactual.reset_day(self)
 
             # ── BNF Monday-before-monthly-expiry skip ─────────────────────
             self._skip_bnf_today = self._is_monday_before_bnf_monthly_expiry(today)
@@ -4759,6 +4786,7 @@ class TradingBot:
                         hv            = float(df['HV'].iloc[-1])
                         self.check_exits(current_price, hv, force_close=True)
                         self.check_challenger_exits(current_price, hv, force_close=True)
+                        counterfactual.mark(self, current_price, hv, force_close=True)
 
                 # ── Consolidated daily loss circuit-breaker ────────────────
                 # Checks grand total across all instruments + bots (shared file).
@@ -4800,6 +4828,7 @@ class TradingBot:
                 # ── Check exits ───────────────────────────────────────────
                 self.check_exits(current_price, hv)
                 self.check_challenger_exits(current_price, hv)
+                counterfactual.mark(self, current_price, hv)
 
                 # ── Multi-timeframe context + option chain ────────────────
                 htf = self.get_htf_context()
@@ -6036,6 +6065,13 @@ class TradingBot:
                                                 f"{getattr(config, 'CHASE_GATE_MAX', 0.75)} "
                                                 f"after {_cg_after} (bought the extreme)"
                                             )
+                                            counterfactual.record(
+                                                self, signal['type'],
+                                                float(signal['price']), 'CHASE',
+                                                f'chase_pos {_cp} > '
+                                                f'{getattr(config, "CHASE_GATE_MAX", 0.93)}',
+                                                hv, extra=dict(chase_pos=_cp,
+                                                               path=_cgp))
                                             signal = None
                                         else:  # shadow
                                             self.logger.info(
