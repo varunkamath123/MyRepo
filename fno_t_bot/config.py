@@ -113,7 +113,22 @@ INSTRUMENT_STRATEGY = {
         # Tuesday PUT conditions: keep slightly elevated — gap-fill risk real on Tuesdays
         'tuesday_put_adx_min'   : 30,  # must be a clearly established downtrend (vs standard 25)
         'tuesday_put_di_spread' : 8,   # DI- must dominate convincingly (DI- minus DI+ ≥ 8)
-        'entry_start'   : '11:00',# Skip 9:15-10:59 (10:xx = 11% WR danger zone)
+        # WIDENED 11:00 -> 10:00 (Sep 16 2026, user direction + measurement).
+        # The old note here read "Skip 9:15-10:59 (10:xx = 11% WR danger zone)". Re-measured
+        # on the merged dataset (516 REV/TREND signals replayed with the window removed):
+        #   hour    n   %right  mean ATR  control   Sharpe
+        #   09:xx   35   17.1%   -0.515   -0.535   -0.478   <- genuinely bad, still excluded
+        #   10:xx  210   35.2%   +0.053   +0.014   +0.037   <- fine; better than 11:xx
+        #   11:xx  130   30.8%   -0.088   -0.089   -0.064   <- the WORST tradeable hour
+        #   12:xx  129   38.0%   +0.122   -0.108   +0.086
+        # The danger-zone claim was mis-aimed: 10:xx is not the problem, 09:xx is. Early
+        # (09:45-10:59) vs current (11:00-14:00) is p=0.7293 -- no significant difference
+        # either way, so this buys opportunity count, not a proven edge.
+        # CAVEAT: 09:xx rests on n=35, and in the early window only TREND fires (REV needs
+        # ADX to peak and wane first), so widening mainly admits more TREND -- our weakest
+        # path (-Rs4,208 live). Watch the counterfactual log and TREND's share.
+        # For 09:45 instead, change the three entry_start values below to '09:45'.
+        'entry_start'   : '10:00',
         'entry_end'     : '14:00',# 14:xx = 25% WR; too close to force-close — blocked
         'max_concurrent': 1,      # No pyramiding — signal quality already high at 72% WR
         # ── Per-instrument PATH-A exit parameters (override global PATH_A_*) ──
@@ -151,7 +166,7 @@ INSTRUMENT_STRATEGY = {
         # options (low gamma), making the 80% target hard to hit on weak moves.
         'tuesday_put_adx_min'   : 35,  # needs a genuinely strong bear trend for 8-day options
         'tuesday_put_di_spread' : 12,  # high DI dominance to justify low-gamma contract
-        'entry_start'   : '11:00',
+        'entry_start'   : '10:00',
         'entry_end'     : '14:00',# Cut from 14:45 → 14:00 (Apr 24 2026): 14:10 2-lot entry had only 20 min to EOD force-close (14:30). 56% WR stat pre-dates Strength=2 lot-doubling. 30-min minimum runway required.
         'max_concurrent': 1,      # Concurrent=2 not valid — causes cascading losses
         # ── Per-instrument PATH-A exit parameters (override global PATH_A_*) ──
@@ -188,7 +203,7 @@ INSTRUMENT_STRATEGY = {
         # Tuesday PUT conditions
         'tuesday_put_adx_min'   : 30,
         'tuesday_put_di_spread' : 8,
-        'entry_start'   : '11:00',# Aligned with NIFTY/BNF window (May 2026)
+        'entry_start'   : '10:00',
                                   # Note: PATH-A ORB fires on OR break independently of this
         'entry_end'     : '14:00',# 14:xx = 33% WR — blocked (consistent with NIFTY finding)
         'max_concurrent': 1,
