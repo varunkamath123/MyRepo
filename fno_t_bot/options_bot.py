@@ -260,6 +260,7 @@ class TradingBot:
         self._trend_leg_extreme   = None   # running extreme of the leg since qualification
         self._trend_anchor        = None   # OR level broken to trigger qualification
         self._path_trend_fired    = False  # one PATH_TREND entry per day
+        self._stale_count         = 0      # consecutive DATA-STALE cycles
         self._st15m             = None   # cached 15m SuperTrend (+1/-1) from get_htf_context
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -456,11 +457,32 @@ class TradingBot:
             # Stale data guard: latest bar must be from today
             latest_date = df.index[-1].date()
             if latest_date != today:
-                self.logger.error(
-                    f"[DATA-STALE] Latest bar is {latest_date}, expected {today}. "
-                    f"API may be returning cached/historical data. Skipping cycle."
-                )
+                # Sep 14 2026 was a market holiday: the feed legitimately had no
+                # bar for 'today', so this fired 749 times per instrument and
+                # logged 2,247 ERRORs on a day nothing was wrong -- which buries
+                # real errors. A genuine feed outage is indistinguishable for the
+                # first few cycles, so keep the first one loud and then fall back
+                # to an hourly reminder.
+                self._stale_count += 1
+                if self._stale_count == 1:
+                    self.logger.error(
+                        f"[DATA-STALE] Latest bar is {latest_date}, expected "
+                        f"{today}. API may be returning cached/historical data. "
+                        f"Skipping cycle."
+                    )
+                elif self._stale_count % 60 == 0:
+                    self.logger.info(
+                        f"[DATA-STALE] {self.instrument}: still on {latest_date} "
+                        f"after {self._stale_count} cycles — market holiday or a "
+                        f"genuine feed outage; not trading either way"
+                    )
+                else:
+                    self.logger.debug(
+                        f"[DATA-STALE] {self.instrument}: still {latest_date}"
+                    )
                 return None
+
+            self._stale_count = 0      # fresh data — clear the holiday/outage streak
 
             # Partial-bar guard: Fyers returns the currently-forming candle as the
             # last row. Bars are labelled by open-time; a bar that opened at T is
@@ -3043,10 +3065,10 @@ class TradingBot:
         BS pricing uses hv (same as Champion) with the selected strike, so P&L
         comparison is a clean A/B: same model, same IV, different strike K.
         """
-        # Same gate as the Champion, so the A/B isolates STRUCTURE alone.
-        if self._rv_iv_blocked(signal, hv):
-            return
-
+        # NOTE: no gate checks here. The caller only reaches this function when
+        # the Champion actually opened, so every Champion gate already applies.
+        # Re-checking RV/IV here (as it did between Sep 13-16) logged each block
+        # twice and wrote the counterfactual jsonl twice.
         underlying   = signal['price']
         atm_strike   = int(round(underlying / self.strike_gap) * self.strike_gap)
         eff_lot_size = self.lot_size * lots
@@ -6065,8 +6087,25 @@ class TradingBot:
                                     # entry, so a chase-blocked signal earlier in the
                                     # session does not silence the engine for the day.
                                     self._path_trend_fired = True
+                                # The Challenger must take a trade ONLY if the
+                                # Champion actually took it. Gating it on the
+                                # outcome (did a position appear?) inherits every
+                                # guard inside enter_trade automatically -- RV/IV,
+                                # RISK-GATE, min-premium, capital, and anything
+                                # added later. Checking gates one at a time does
+                                # not scale: RV/IV parity was fixed on Sep 13 and
+                                # RISK-GATE was found bypassing it on Sep 16.
+                                _n_before = len(self.positions)
                                 self.enter_trade(signal, hv, lots=_lots)
-                                self.enter_challenger_trade(signal, hv, oc, lots=_lots)
+                                if len(self.positions) > _n_before:
+                                    self.enter_challenger_trade(signal, hv, oc,
+                                                                lots=_lots)
+                                else:
+                                    self.logger.debug(
+                                        f"  [CHALLENGER] {self.instrument}: Champion "
+                                        f"did not open — Challenger stands down "
+                                        f"(A/B stays paired)"
+                                    )
 
                 # ── Path F: update any open sim position outside entry window ─
                 # (e.g. force-close at 14:30 even if can_enter is False)

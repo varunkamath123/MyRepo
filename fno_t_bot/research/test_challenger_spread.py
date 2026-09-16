@@ -98,14 +98,44 @@ if bot.challenger_positions:
         ck('deep-ITM rally resolves the spread (position closed or profitable)',
            len(bot.challenger_positions) == 0 or True)
 
-# GATE PARITY -- the whole point of the Sep 13 fix. A signal the Champion
-# refuses must not open a Challenger position, or the A/B measures structure
-# AND gating at once (which is what happened on Sep 10 and Sep 11).
+# GATE PARITY. Sep 13 put the RV/IV check inside enter_challenger_trade; Sep 16
+# moved it to the CALL SITE instead, because patching gate-by-gate did not scale
+# -- RISK-GATE was found bypassing the Challenger two days after RV/IV was fixed.
+# The contract under test is therefore the caller's: the Challenger runs only if
+# the Champion actually opened. That inherits every gate inside enter_trade.
+def call_site(signal, hv):
+    """Exactly the guard used in the scan loop."""
+    n_before = len(bot.positions)
+    try:
+        bot.enter_trade(signal, hv, lots=1)
+    except Exception:
+        pass
+    opened = len(bot.positions) > n_before
+    if opened:
+        bot.enter_challenger_trade(signal, hv, {'max_pain': 23800}, lots=1)
+    return opened
+
+bot.positions = []
 bot.challenger_positions = []
-blocked_sig = dict(sig, atm_iv=12.0)     # rv_iv 0.833 -> gate blocks
-bot.enter_challenger_trade(blocked_sig, 0.10, {'max_pain': 23800}, lots=1)
-ck('challenger RESPECTS the rv_iv gate', len(bot.challenger_positions) == 0,
-   f'{len(bot.challenger_positions)} positions opened on a blocked signal')
+bot.trades_today = 0
+blocked = dict(sig, atm_iv=12.0)         # rv_iv 0.833 -> Champion's gate blocks
+champ_opened = call_site(blocked, 0.10)
+ck('gate-blocked signal: Champion does not open', not champ_opened)
+ck('gate-blocked signal: Challenger stands down too',
+   len(bot.challenger_positions) == 0,
+   f'{len(bot.challenger_positions)} opened on a signal the Champion refused')
+
+bot.positions = []
+bot.challenger_positions = []
+bot.trades_today = 0
+ok_opened = call_site(sig, 0.10)         # rv_iv 0.50 -> clears the gate
+ck('allowed signal: Champion opens', ok_opened)
+ck('allowed signal: Challenger opens alongside (A/B stays paired)',
+   len(bot.challenger_positions) == 1,
+   f'{len(bot.challenger_positions)} challenger positions')
+bot.positions = []
+bot.challenger_positions = []
+bot.trades_today = 0
 
 # legacy mode still works
 config.CHALLENGER_MODE = 'STRIKE'
