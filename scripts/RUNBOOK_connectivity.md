@@ -27,10 +27,30 @@ Seen 2026-09-18 and at least once before. **The bot keeps trading through this**
 it runs on EC2 and does not depend on the home connection. Nothing is broken on
 the trading side; we are simply blind to it until IPv4 returns.
 
-AWS's own API sits on the same IPv4 path, so **SSM is not a workaround during the
-outage** — it has to be set up beforehand to help.
-
 Do not guess at results while blind. Wait, then pull the logs.
+
+### You are not actually cut off from AWS
+
+The *classic* endpoints (`ec2.ap-south-1.amazonaws.com`) are IPv4-only and will
+time out. The **dual-stack** endpoints answer over IPv6 and keep working.
+Verified 2026-09-20, two days into an outage:
+
+```
+ec2.ap-south-1.api.aws         HTTP 301 in 0.41s over IPv6   reachable
+ec2.ap-south-1.amazonaws.com   timeout after 12s             unreachable
+ssm.ap-south-1.api.aws         HTTP 400 in 0.63s over IPv6   reachable
+```
+
+So AWS work — including the IPv6 fix below and SSM setup — **can be done during
+an outage**, not only after it:
+
+```bash
+export AWS_USE_DUALSTACK_ENDPOINT=true
+aws sts get-caller-identity --region ap-south-1
+```
+
+GitHub, by contrast, publishes no AAAA record, so `git push` stays blocked until
+IPv4 returns. Commit locally and push later.
 
 ## 2. When the link returns
 

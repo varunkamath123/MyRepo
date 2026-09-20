@@ -6,10 +6,15 @@
 # WHY
 #   The host is IPv4-only. Twice now the ISP's IPv4 path has died one hop past
 #   223.178.56.1 while IPv6 stayed healthy (ping ::8888 = 0% loss, 10ms), which
-#   blinds us to the bot for a day or more at a time. AWS's own API sits on the
-#   same broken path, so SSM is not a workaround during an outage either.
+#   blinds us to the bot for a day or more at a time.
 #   IPv6 is additive: nothing here removes or changes any IPv4 setting, so the
 #   existing SSH route keeps working exactly as it does today.
+#
+#   CORRECTION (2026-09-20): an earlier version of this header claimed AWS was
+#   unreachable during an outage because its API shares the broken IPv4 path.
+#   That is only true of the CLASSIC endpoints. The dual-stack endpoints answer
+#   over IPv6 and were verified working mid-outage, which is why this script can
+#   now be run while IPv4 is still down. See the export below.
 #
 # SAFETY
 #   Read-only by default. It prints what it WOULD change and exits.
@@ -33,6 +38,20 @@
 # =============================================================================
 set -uo pipefail
 
+# ---------------------------------------------------------------------------
+# DUAL-STACK ENDPOINTS — this is what makes the script usable DURING an outage.
+# The classic endpoint ec2.<region>.amazonaws.com is IPv4-only, so while the
+# ISP's v4 path is down the AWS API is unreachable and we cannot fix the very
+# problem that is blocking us. AWS also publishes dual-stack endpoints at
+# <service>.<region>.api.aws which answer over IPv6.
+# Measured 2026-09-20, mid-outage:
+#   ec2.ap-south-1.api.aws        HTTP 301 in 0.41s over IPv6   reachable
+#   ec2.ap-south-1.amazonaws.com  timeout after 12s             unreachable
+#   ssm.ap-south-1.api.aws        HTTP 400 in 0.63s over IPv6   reachable
+# So: run this with dual-stack on and the chicken-and-egg disappears.
+# ---------------------------------------------------------------------------
+export AWS_USE_DUALSTACK_ENDPOINT=true
+
 HOST_IP="${HOST_IP:-3.108.16.113}"
 REGION="${AWS_REGION:-ap-south-1}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/fno-t-bot-new-key}"
@@ -48,10 +67,15 @@ step "0. preflight"
 command -v aws >/dev/null || { say "aws CLI not found — install it first"; exit 1; }
 if ! aws sts get-caller-identity --region "$REGION" >/dev/null 2>&1; then
   say "AWS credentials are not working. Run:  aws configure"
-  say "(this was already a known blocker for SSM)"
+  say ""
+  say "   This is the ONLY thing standing between you and a working fix --"
+  say "   AWS itself is reachable over IPv6 via the dual-stack endpoints even"
+  say "   while IPv4 is down (verified 2026-09-20 mid-outage). Configure the"
+  say "   credentials yourself (never paste keys into a chat) and re-run."
   exit 1
 fi
 say "   credentials OK, region $REGION, mode=$MODE"
+say "   endpoints: dual-stack (AWS_USE_DUALSTACK_ENDPOINT=true) -> works over IPv6"
 
 step "1. locate the instance by its public IPv4"
 INST_JSON=$(aws ec2 describe-instances --region "$REGION" \
