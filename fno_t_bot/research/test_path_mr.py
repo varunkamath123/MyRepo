@@ -43,6 +43,30 @@ cfg=config.PATH_MR_SHADOW_ENABLED
 config.PATH_MR_SHADOW_ENABLED=False; path_mr._fired.clear()
 ck('respects the disable flag', path_mr.evaluate(bot=bot,instrument='NIFTY',df=da,now=now,logger=None) is None)
 config.PATH_MR_SHADOW_ENABLED=cfg
+
+# --- REGRESSION (Sep 21 2026) -------------------------------------------
+# The live frame carries ~5 trading days but this engine needs 6. It used to
+# return None SILENTLY in that case, so it looked idle rather than broken and
+# went unnoticed from Sep 12 to Sep 21. The reference close must now come from
+# the daily CSV store whenever the frame is short.
+_fs = sorted(glob.glob(r'C:\quant_trading\data\nifty_5min\*.csv'))
+if len(_fs) >= 8:
+    _short = pd.concat([pd.read_csv(f, parse_dates=['ts'], index_col='ts')
+                        for f in _fs[-5:]]).sort_index()
+    _short = _short[~_short.index.duplicated(keep='first')]
+    _short = bot.add_indicators(_short)
+    _days = sorted({d.date() for d in _short.index})
+    ck('frame really is short (the production shape)',
+       len(_days) < path_mr.MR_LOOKBACK + 1, '%d days' % len(_days))
+    _ref = path_mr._ref_close_from_store('NIFTY', _days[-1])
+    ck('store fallback resolves the reference close', bool(_ref and _ref > 0), str(_ref))
+    path_mr._fired.clear()
+    _r = path_mr.evaluate(bot=bot, instrument='NIFTY', df=_short,
+                          now=datetime.combine(_days[-1], datetime.strptime('11:05','%H:%M').time()),
+                          logger=None)
+    ck('short frame no longer bails silently (a verdict is reached)',
+       ('NIFTY', _days[-1].strftime('%Y-%m-%d')) in path_mr._fired)
+
 import shutil; shutil.rmtree(path_mr.LOG_DIR,ignore_errors=True)
 print(f"\nRESULT: {P} passed, {F} failed")
 sys.exit(1 if F else 0)

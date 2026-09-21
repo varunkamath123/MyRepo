@@ -76,6 +76,50 @@ def _write(inst: str, rec: dict) -> None:
 _fired: dict = {}
 
 
+DATA_DIRS = {'NIFTY': 'nifty_5min', 'BANKNIFTY': 'banknifty_5min',
+             'SENSEX': 'sensex_5min'}
+
+
+def _ref_close_from_store(instrument: str, today) -> float | None:
+    """Close of the session MR_LOOKBACK trading days before `today`.
+
+    Reads the daily 5-min CSV store, which carries the full history, rather than
+    the live API frame, which carries about five trading days and is therefore
+    one short of what this engine needs.
+    """
+    try:
+        import glob
+        sub = DATA_DIRS.get(instrument)
+        if not sub:
+            return None
+        # Try every plausible root: the host layout, an explicit config value,
+        # and the local research checkout. Whichever holds the files wins.
+        roots = [getattr(config, 'DATA_ROOT', None),
+                 '/opt/trading_bot/data',
+                 os.path.join(os.path.dirname(os.path.dirname(
+                     os.path.abspath(__file__))), 'data'),
+                 r'C:\quant_trading\data']
+        files = []
+        for root in roots:
+            if not root:
+                continue
+            files = sorted(glob.glob(os.path.join(root, sub, '*.csv')))
+            if files:
+                break
+        if not files:
+            return None
+        stamp = today.strftime('%Y%m%d')
+        idx = [i for i, f in enumerate(files) if stamp in os.path.basename(f)]
+        cut = idx[0] if idx else len(files)           # today may not be written yet
+        if cut - MR_LOOKBACK < 0:
+            return None
+        import pandas as pd
+        ref = pd.read_csv(files[cut - MR_LOOKBACK], usecols=['Close'])
+        return float(ref['Close'].iloc[-1])
+    except Exception:
+        return None
+
+
 def evaluate(bot, instrument: str, df, now: datetime, logger=None) -> dict | None:
     """Log the PATH_MR read once per session. Returns the signal or None.
 
@@ -91,16 +135,18 @@ def evaluate(bot, instrument: str, df, now: datetime, logger=None) -> dict | Non
     if now.time() < dtime(hh, mm):
         return None
 
-    # prior N sessions' closes, from the frame the bot already holds
+    # Today's open/price/ATR come from the live frame; the REFERENCE close does
+    # not. get_index_data() fetches 7 CALENDAR days, which is usually only 5
+    # TRADING days -- one short of the 6 this needs. The original version simply
+    # returned None in that case, silently, so the engine looked idle rather than
+    # broken and went unnoticed from Sep 12 to Sep 21 2026. Never depend on the
+    # live frame for multi-day history again: fall back to the daily CSV store,
+    # which holds the full record, and say so out loud when neither works.
     try:
         days = sorted({d.date() for d in df.index})
-        if len(days) < MR_LOOKBACK + 1:
-            return None
         today = days[-1]
-        ref_day = days[-(MR_LOOKBACK + 1)]
-        ref_close = float(df[df.index.date == ref_day]['Close'].iloc[-1])
         todays = df[df.index.date == today]
-        if len(todays) < 2 or ref_close <= 0:
+        if len(todays) < 2:
             return None
         day_open = float(todays['Open'].iloc[0])
         px = float(todays['Close'].iloc[-1])
@@ -108,6 +154,25 @@ def evaluate(bot, instrument: str, df, now: datetime, logger=None) -> dict | Non
     except Exception:
         return None
     if atr <= 0:
+        return None
+
+    ref_close = None
+    if len(days) >= MR_LOOKBACK + 1:                 # fast path: already in frame
+        try:
+            ref_close = float(
+                df[df.index.date == days[-(MR_LOOKBACK + 1)]]['Close'].iloc[-1])
+        except Exception:
+            ref_close = None
+    if not ref_close or ref_close <= 0:               # fallback: the daily store
+        ref_close = _ref_close_from_store(instrument, today)
+    if not ref_close or ref_close <= 0:
+        if logger:
+            logger.warning(
+                f"  [PATH-MR shadow] {instrument}: cannot resolve the "
+                f"{MR_LOOKBACK}-day reference close (frame has {len(days)} "
+                f"trading days, store lookup failed) — no signal this session"
+            )
+        _fired[key] = True                            # do not retry all day
         return None
 
     trend_pct = (day_open - ref_close) / ref_close * 100.0
