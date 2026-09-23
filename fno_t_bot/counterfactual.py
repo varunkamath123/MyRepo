@@ -113,6 +113,27 @@ def record(bot, direction: str, index_px: float, gate: str, reason: str,
             pass
 
 
+
+def record_undirected(bot, index_px: float, gate: str, reason: str, hv: float,
+                      extra: dict | None = None) -> None:
+    """For gates that fire BEFORE any signal exists, so there is no direction.
+
+    VIX-GATE is the case: it sets can_enter=False before any path is evaluated,
+    so nothing says whether we would have gone long or short. Guessing a
+    direction (e.g. from the 15m SuperTrend) would invent a counterfactual the
+    bot never actually formed -- REV fades that trend and TREND follows it.
+
+    Instead record BOTH legs. The analysis then bounds the gate:
+      both legs negative -> the gate was right whichever way we would have gone
+      both positive      -> it cost us regardless
+      split              -> the outcome hinged on direction, which this gate
+                            was never deciding, so it says nothing either way
+    Cheap: two phantoms per instrument per day, deduped like any other.
+    """
+    for d in ('CALL', 'PUT'):
+        record(bot, d, index_px, gate, reason, hv,
+               extra=dict(extra or {}, undirected=True))
+
 def _exit_reason(pos, pnl_pct: float, minutes: float, force: bool) -> str | None:
     """The live exit stack, applied identically to phantoms."""
     if force:

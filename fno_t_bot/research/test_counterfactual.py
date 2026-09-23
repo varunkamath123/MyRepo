@@ -116,6 +116,33 @@ ck('no phantom once the runway is gone', len(getattr(bot, '_phantoms', [])) == 0
    f'{len(getattr(bot, "_phantoms", []))} opened past force-close')
 config.FORCE_CLOSE_TIME = _REAL_FC
 
+
+# --- UNDIRECTED GATES (Sep 23 2026) --------------------------------------
+config.FORCE_CLOSE_TIME = '23:59'   # runway guard again; restored below
+# VIX-GATE fires BEFORE any signal exists, so there is no direction to
+# simulate. Guessing one would invent a counterfactual the bot never formed.
+# record_undirected() logs BOTH legs so the analysis can bound the gate.
+CF.reset_day(bot)
+bot.positions = []
+CF.record_undirected(bot, 23800.0, 'VIX_LOW', 'VIX 10.4 < 11', 0.10,
+                     extra=dict(vix=10.4))
+ck('undirected gate records BOTH legs', len(bot._phantoms) == 2,
+   f'{len(bot._phantoms)} phantoms')
+if len(bot._phantoms) == 2:
+    dirs = sorted(q['type'] for q in bot._phantoms)
+    ck('one CALL and one PUT', dirs == ['CALL', 'PUT'], str(dirs))
+    ck('both tagged undirected',
+       all(q['extra'].get('undirected') for q in bot._phantoms))
+    ck('both carry the VIX reading',
+       all(q['extra'].get('vix') == 10.4 for q in bot._phantoms))
+ck('still never touches the real book', len(bot.positions) == 0)
+# and it must dedupe like any other gate -- VIX-GATE fired ~400x on Sep 23
+CF.record_undirected(bot, 23790.0, 'VIX_LOW', 'VIX 10.3 < 11', 0.10)
+CF.record_undirected(bot, 23780.0, 'VIX_LOW', 'VIX 10.4 < 11', 0.10)
+ck('dedupes the ~400 repeats into 2', len(bot._phantoms) == 2,
+   f'{len(bot._phantoms)} after 3 calls')
+config.FORCE_CLOSE_TIME = _REAL_FC
+
 import shutil
 shutil.rmtree(TMP, ignore_errors=True)
 print('=' * 72)

@@ -4932,6 +4932,10 @@ class TradingBot:
                                     f"(15m-ST={_st_str}) — holding entry."
                                 )
                                 can_enter = False
+                                counterfactual.record_undirected(
+                                    self, float(df['Close'].iloc[-1]), 'VIX_HIGH',
+                                    f'VIX {_vix_now:.1f} > {config.VIX_MAX}, HTF ambiguous',
+                                    hv, extra=dict(vix=round(float(_vix_now), 2)))
                         elif _vix_now < config.VIX_MIN:
                             self.logger.info(
                                 f"  [VIX-GATE] {self.instrument}: VIX={_vix_now:.1f} "
@@ -4939,6 +4943,15 @@ class TradingBot:
                                 f"Holding entry."
                             )
                             can_enter = False
+                            # Sep 23 2026: this gate blocked all three instruments
+                            # ~400 times in one session and we had no idea what it
+                            # cost -- it fires before any signal, so the ordinary
+                            # counterfactual had nothing to track. Record both legs
+                            # and let the analysis bound it.
+                            counterfactual.record_undirected(
+                                self, float(df['Close'].iloc[-1]), 'VIX_LOW',
+                                f'VIX {_vix_now:.1f} < {config.VIX_MIN}', hv,
+                                extra=dict(vix=round(float(_vix_now), 2)))
 
                 # ── Path F: Reversal Scout — independent of B/C/D/E trading limits ──
                 # PATH-F has its own capital (₹10k) and trade counter; it must run
