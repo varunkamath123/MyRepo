@@ -173,7 +173,18 @@ def synthesize(headlines_by_angle: dict[str, list[dict]]) -> dict:
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}],
     )
-    text = resp.content[0].text.strip()
+    # Concatenate every TEXT block, ignoring thinking/tool blocks. Newer models
+    # can return a ThinkingBlock first, and content[0].text then raises
+    # AttributeError: 'ThinkingBlock' object has no attribute 'text' -- which is
+    # what broke this job daily from Aug 13 2026.
+    text = "".join(
+        b.text for b in resp.content if getattr(b, "type", None) == "text"
+    ).strip()
+    if not text:
+        raise RuntimeError(
+            "Claude returned no text block (got: "
+            f"{[getattr(b, 'type', '?') for b in resp.content]})"
+        )
 
     # Strip markdown code fences if present
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())

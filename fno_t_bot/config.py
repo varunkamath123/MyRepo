@@ -113,7 +113,22 @@ INSTRUMENT_STRATEGY = {
         # Tuesday PUT conditions: keep slightly elevated — gap-fill risk real on Tuesdays
         'tuesday_put_adx_min'   : 30,  # must be a clearly established downtrend (vs standard 25)
         'tuesday_put_di_spread' : 8,   # DI- must dominate convincingly (DI- minus DI+ ≥ 8)
-        'entry_start'   : '11:00',# Skip 9:15-10:59 (10:xx = 11% WR danger zone)
+        # WIDENED 11:00 -> 10:00 (Sep 16 2026, user direction + measurement).
+        # The old note here read "Skip 9:15-10:59 (10:xx = 11% WR danger zone)". Re-measured
+        # on the merged dataset (516 REV/TREND signals replayed with the window removed):
+        #   hour    n   %right  mean ATR  control   Sharpe
+        #   09:xx   35   17.1%   -0.515   -0.535   -0.478   <- genuinely bad, still excluded
+        #   10:xx  210   35.2%   +0.053   +0.014   +0.037   <- fine; better than 11:xx
+        #   11:xx  130   30.8%   -0.088   -0.089   -0.064   <- the WORST tradeable hour
+        #   12:xx  129   38.0%   +0.122   -0.108   +0.086
+        # The danger-zone claim was mis-aimed: 10:xx is not the problem, 09:xx is. Early
+        # (09:45-10:59) vs current (11:00-14:00) is p=0.7293 -- no significant difference
+        # either way, so this buys opportunity count, not a proven edge.
+        # CAVEAT: 09:xx rests on n=35, and in the early window only TREND fires (REV needs
+        # ADX to peak and wane first), so widening mainly admits more TREND -- our weakest
+        # path (-Rs4,208 live). Watch the counterfactual log and TREND's share.
+        # For 09:45 instead, change the three entry_start values below to '09:45'.
+        'entry_start'   : '10:00',
         'entry_end'     : '14:00',# 14:xx = 25% WR; too close to force-close — blocked
         'max_concurrent': 1,      # No pyramiding — signal quality already high at 72% WR
         # ── Per-instrument PATH-A exit parameters (override global PATH_A_*) ──
@@ -151,7 +166,7 @@ INSTRUMENT_STRATEGY = {
         # options (low gamma), making the 80% target hard to hit on weak moves.
         'tuesday_put_adx_min'   : 35,  # needs a genuinely strong bear trend for 8-day options
         'tuesday_put_di_spread' : 12,  # high DI dominance to justify low-gamma contract
-        'entry_start'   : '11:00',
+        'entry_start'   : '10:00',
         'entry_end'     : '14:00',# Cut from 14:45 → 14:00 (Apr 24 2026): 14:10 2-lot entry had only 20 min to EOD force-close (14:30). 56% WR stat pre-dates Strength=2 lot-doubling. 30-min minimum runway required.
         'max_concurrent': 1,      # Concurrent=2 not valid — causes cascading losses
         # ── Per-instrument PATH-A exit parameters (override global PATH_A_*) ──
@@ -188,7 +203,7 @@ INSTRUMENT_STRATEGY = {
         # Tuesday PUT conditions
         'tuesday_put_adx_min'   : 30,
         'tuesday_put_di_spread' : 8,
-        'entry_start'   : '11:00',# Aligned with NIFTY/BNF window (May 2026)
+        'entry_start'   : '10:00',
                                   # Note: PATH-A ORB fires on OR break independently of this
         'entry_end'     : '14:00',# 14:xx = 33% WR — blocked (consistent with NIFTY finding)
         'max_concurrent': 1,
@@ -1433,6 +1448,15 @@ PATH_REV_MIN_DI_SPREAD_PEAK = 12      # morning DI spread peak ≥ this (real di
 # production evaluations, and to ZERO on SENSEX (BSE feed has no ATM-IV).
 # PATH_REV max score is now 4, which is also the highest ever recorded.
 PATH_REV_MAXPAIN_PROX_PCT   = 0.005   # within 0.5% of MaxPain → proximity bonus
+# Max fraction of the reversal that may already be complete at entry (Aug 19
+# 2026). REV fades an exhausted move, so it should enter NEAR that move's
+# extreme; the global chase gate (0.93) does not constrain a fade at all,
+# because for a fade the extreme is the GOOD end. Live entries, ranked:
+#   0.261 +Rs4,284 | 0.282 +Rs2,950 | 0.309 +Rs1,877 | 0.348 -Rs863 | 0.611 -Rs2,110
+# Monotone; 0.40 keeps the winning cluster and cuts the tail. Rupees before
+# Aug 18 are Black-Scholes-priced, so the RANKING is the evidence, not the
+# amounts. 0 disables.
+PATH_REV_MAX_CHASE          = 0.40
 PATH_REV_ADX_WANE_RATIO     = 0.85    # ADX < peak × this = momentum waning
 
 # ─── PATH_TREND: Trend-Continuation Pullback Entry ───────────────────────────
@@ -1490,6 +1514,46 @@ PATH_TREND_DI_WIDEN_BARS = 3
 # retr is still computed and logged on every fire for forward calibration.
 PATH_TREND_ADX_FLOOR     = 17       # trend invalidated if ADX drops below this during pullback
 PATH_TREND_BODY_ATR_MIN  = 0.15     # resumption candle body >= this x ATR (filters doji noise)
+# Minimum leg size, in ATR multiples (Aug 17 2026). TREND previously had NO
+# concept of how large the move it trades actually is. The Aug 17 BANKNIFTY
+# loser traded a 42.6-pt leg = 0.54xATR = 6.7% of the day's range, while the
+# index had already fallen 298pts from the open; it entered at 76% retrace with
+# ~10pts of room and lost Rs4,477. Logged qualification ratios were
+# 1.58/1.59/1.42/1.31 with that loser alone at 0.54 -- so 1.0 is a noise floor
+# ("bigger than one bar's typical range"), not a fitted value. 0 disables.
+# RAISED 1.0 -> 1.5 (Sep 4 2026) on a 197-signal replay of get_path_trend_signal
+# across every local session. 1.0 was a reasoned noise floor but had never been
+# measured; measured, it sits directly beneath the worst cohort in the sample.
+#     leg < 1.5 ATR   n=101   40.6% right   -1.00 ATR
+#     leg 1.5-5 ATR   n= 84   63.1% right   +0.20 ATR
+#     leg > 5   ATR   n= 12   41.7% right   -2.64 ATR
+# Mann-Whitney p=0.0003 for the 1.5-5 band vs the rest. NOT a cherry-picked
+# edge: every floor swept from 1.1 to 2.0 separates the same way (dropped
+# cohort worse at all 8), and it holds on a chronological holdout (at 1.5 the
+# second half keeps 66.0% right vs 28.6% for what it drops).
+# Retroactive effect on the 8 live TREND trades: blocks legs 1.04/1.16 (losses
+# -Rs3,261/-Rs1,462) and 1.18/1.00 (wins +Rs888/+Rs633) = +Rs3,202, taking
+# TREND from -Rs4,208 to -Rs1,006.
+# HONEST LIMIT: this makes TREND less bad, it does not make it good. The kept
+# cohort is still -0.15 ATR overall and -0.41 in the holdout. Loss reduction,
+# not edge creation. The 5x upper cap is NOT applied -- it rests on n=12.
+# REVERTED 1.5 -> 1.0 (Sep 7 2026). The Sep 4 raise was justified on a
+# 197-signal replay run against the EC2 data copy, which is missing ~14 months
+# of NIFTY/BANKNIFTY history. Re-run on the FULL local dataset (n=521 signals,
+# balanced 171/165/185) the relationship vanishes entirely:
+#   floor  kept %right  mean ATR   dropped %right  mean ATR
+#    1.0    232  53.0%   -0.210      289   49.8%   -0.148
+#    1.5    171  53.2%   -0.249      350   50.3%   -0.140
+#    2.0    126  51.6%   -0.341      395   51.1%   -0.123
+#   rho(leg, outcome) = +0.0001  p=0.998   Mann-Whitney p=0.3132
+# The KEPT cohort is worse than the DROPPED cohort at every threshold. Leg size
+# does not predict outcome. Back to 1.0, the long-standing reasoned noise floor
+# ("bigger than one bar's typical range") -- which is not evidence-backed
+# either, but is the status quo rather than a change built on a sample artifact.
+# Live cost of the bad raise: Sep 7 BANKNIFTY PUT was blocked at 1.10-1.40xATR
+# for ~40 minutes and only fired at 2.36x, by which point the chase gate
+# (correctly) refused it.
+PATH_TREND_MIN_LEG_ATR   = 1.0
 PATH_TREND_OI_DRIFT_THRESH = 0.05   # PCR drift threshold (same magnitude as OI_PCR_DRIFT_THRESHOLD)
 PATH_TREND_OI_PCR_CALL_MAX = 1.05   # PCR above this contradicts a CALL continuation
 PATH_TREND_OI_PCR_PUT_MIN  = 0.95   # PCR below this contradicts a PUT continuation
@@ -1502,6 +1566,139 @@ PATH_TREND_OI_PCR_PUT_MIN  = 0.95   # PCR below this contradicts a PUT continuat
 # worth watching, not yet enough evidence to change.
 PATH_TREND_TRAIL_ACT       = TRAILING_ACTIVATION
 PATH_TREND_TRAIL_DIST      = TRAILING_DISTANCE
+
+# ── RV/IV premium-richness gate (v1.9.3, Sep 4 2026) ─────────────────────────
+# The first candidate edge in this project to survive every control thrown at
+# it. Blocks entries where realised vol has ALREADY caught up to implied.
+#
+# READ THIS BEFORE "FIXING" THE DIRECTION OF THE TEST:
+# rv_iv > 1 reads as "cheap premium" in valuation terms, so blocking HIGH rv_iv
+# looks inverted. It is not. This ratio behaves as a FORECAST, not a valuation.
+# Low rv_iv -- the chain pricing more movement than has recently occurred --
+# precedes LARGER forward moves, and larger moves pay a long-premium book
+# because the 25% stop caps the downside while the move feeds the convex side.
+#
+# MECHANISM, independently powered (n=6,529 five-min-spaced observations):
+#   forward 60-min move by rv_iv quintile: 2.39 / 2.35 / 2.21 / 1.98 / 1.80 ATR
+#   rho(rv_iv, forward move) = -0.2269   p=4.9e-77   monotone across all five
+#   CONTROL -- is it just vol mean-reversion?
+#     rho(HV,    fwd) = -0.1910  p=1.1e-54   mean-reversion is real, and partial
+#     rho(IV,    fwd) = +0.0194  p=0.116     IV LEVEL predicts nothing at all
+#     rho(rv_iv, fwd) = -0.2269              the RATIO beats either alone
+#   Within HV quartiles rv_iv still predicts (q2 -0.13, q3 -0.29, q4 -0.08),
+#   vanishing only in the lowest-HV quartile. So IV adds information beyond
+#   trailing realised vol -- but only as a ratio, never as a level.
+#
+# LIVE BOOK, chain-sourced trades (n=40: 28 logged + 12 reconstructed from
+# journal ATM-IV; reconstruction validated at Pearson r=0.92, median relative
+# error 1.0%, same side of the gate 90% of the time):
+#   EVERY threshold 0.55-0.90 separates -- kept always positive, blocked always
+#   negative, 8/8. At 0.70: kept 18 @ 72.2% win +Rs1,066; blocked 22 @ 27.3%
+#   win -Rs1,201. Book -Rs7,240 -> +Rs19,191. Holdout (Aug 14-Sep 2) holds:
+#   kept +Rs1,193 vs blocked -Rs1,732. Mann-Whitney p=0.0011, rho -0.527.
+#   Works within BOTH paths: REV kept +Rs1,736/blocked -Rs646; TREND kept
+#   -Rs242/blocked -Rs1,869.
+#
+# CHAIN-SOURCED ONLY. SENSEX has chain ATM-IV on 2 minute-stamps in five months
+# (BSE gap) and falls back to India VIX, which carries no SENSEX-specific
+# information -- and is the one slice showing no effect (gap +Rs36 vs +Rs1,566
+# NIFTY / +Rs3,038 BANKNIFTY). That null is confirmatory, not a failure. SENSEX
+# stays ungated and therefore remains a natural untreated control arm.
+#
+# HONEST LIMITS: n=40 is modest; 28 of those 40 overlap the sample the 0.70
+# threshold was chosen on, so the holdout is the genuinely independent piece.
+# Predicts move SIZE, not direction -- the direction problem is untouched.
+# Trial ~20 in this search; not exempt from the multiple-testing discount.
+# Fails OPEN: no IV, no HV, or a VIX-sourced ratio -> no block.
+# ── PATH_MR: multi-day mean reversion (Sep 7 2026) — SHADOW, never trades ────
+# The only directional signal in this project that has not come back null.
+#   CORRECTED Sep 7 2026 on the FULL local dataset (n=876 balanced sessions):
+#     rho = -0.0721  p=0.033 pooled; NO instrument significant alone
+#     (NIFTY -0.071 p=0.23, BANKNIFTY -0.095 p=0.11, SENSEX -0.059 p=0.30)
+#   The earlier -0.1807/p=0.0002 was measured on the EC2 copy, which is missing
+#   ~14 months of NIFTY/BANKNIFTY history and therefore covers only the recent,
+#   stronger period. Tradeable top-decile rule on full data: n=88, 37.5% win,
+#   edge +0.031 ATR over a coin flip, p=0.4167, DSR 14.6% -- fails badly.
+#   What DID survive the correction: the effect strengthens over time even with
+#   balanced instruments -- T1 -0.005 (p=0.93), T2 -0.047 (p=0.42),
+#   T3 -0.207 (p=0.0004). Real, but not yet tradeable.
+# Indices FADE their own multi-day move. Replicated on all three instruments in
+# the recent period (NIFTY -0.215, BANKNIFTY -0.273, SENSEX -0.349) with a
+# dose-response: edge over a coin flip rises with move size, -0.108 / +0.064 /
+# +0.019 / +0.108 / +0.309 ATR across |move| quintiles. Top decile alone:
+# n=42, 47.6% win, +0.348 ATR vs control -0.190, p=0.0445.
+#
+# SHADOW, deliberately. Three reasons:
+#  1. DSR FAILS -- 68.5% tertile, 59.3% top decile. Nominal significance at
+#     n=42 is precisely the regime that produced 3,072 dead variants.
+#  2. Regime-dependent, and we cannot yet tell if the regime lasts. SENSEX held
+#     constant: Jun'25-Jan'26 rho -0.052 (p=0.53, nothing) vs Jan'26-Sep'26
+#     rho -0.221 (p=0.0067). Rolling thirds strengthen monotonically.
+#  3. The live book is measuring the rv_iv gate; a second new path would
+#     confound that read. Paper mode makes shadow free.
+# PROMOTE ON: ~60-80 more logged sessions with the top-decile edge intact and
+# a DSR that clears. Not before.
+# --- Challenger: what is it actually testing? (rebuilt Sep 8 2026) ----------
+# It used to test STRIKE SELECTION (ATM vs OTM) and price everything with
+# Black-Scholes. Two problems made it worthless:
+#  1. The Champion moved to real LTPs on Aug 18 2026 and the Challenger did
+#     not. The books were then priced by different systems, so every
+#     "vs Champion" number was a pricing artefact. Sep 8 SENSEX is the clean
+#     case: identical strike, same minute, Champion -1.2% on the real quote,
+#     Challenger -62.5% on the model. Nothing about strikes was being measured.
+#  2. Strike selection is not where the losses are. Entry selection has no
+#     measurable edge (five independent methods) and the exit stack is already
+#     the best of 17 variants. Testing it harder cannot pay.
+#
+# It now tests the one structural finding with strong evidence behind it: that
+# we are a NET PREMIUM BUYER paying a median 34% volatility overpayment
+# (rv_iv < 1.0 on 90.7% of entries), on top of a straddle EV of -41.6% measured
+# over 4,566 observations -- i.e. the seller of that premium earns it.
+#
+# CHALLENGER = the same signal, same direction, same minute, same strike as the
+# Champion -- but as a VERTICAL DEBIT SPREAD instead of a naked long. The short
+# leg refunds part of the premium, so the A/B isolates STRUCTURE alone. Both
+# books now mark to real LTPs, so the comparison finally means something.
+# Costs are charged on both legs.
+#
+# WHAT WOULD SETTLE IT: if the spread's net P&L beats the naked long over ~30
+# paired trades, the vol overpayment is the dominant leak and the whole book
+# should change structure. If it does not, buying naked premium is defensible
+# and the leak is elsewhere. Either answer is worth more than a strike study.
+# --- Counterfactual book: "what if that blocked signal had been taken?" -----
+# Every gate here is an assumption that certain trades are not worth taking, and
+# none of them had ever been measured live. Sep 15 2026 forced the issue: all
+# three indices fell ~1.9% and closed on their lows, PATH_REV called the correct
+# PUT direction all day, and PATH_REV_MAX_CHASE refused every one of them as
+# "the turn is already 99% done" -- while SENSEX still had +494 index points of
+# PUT left to give. There was no way to price that mistake, because a blocked
+# signal left nothing behind but a log line.
+#
+# When a gate refuses a signal, a PHANTOM position is now opened, marked against
+# real traded premiums on the same cycle as the live book, and closed on the
+# same exit stack (stop / target / trail / Never-Progressed / force-close).
+# Output: logs/counterfactual_<INST>_<date>.jsonl, tagged with the gate that
+# blocked it, so each guard accumulates its own P&L record.
+#
+# HOW TO READ IT: a gate whose phantoms are consistently NEGATIVE is earning its
+# keep. One whose phantoms are consistently POSITIVE is costing money and should
+# be challenged. One phantom per (instrument, date, gate, direction) -- gates
+# refuse the same setup on every cycle (Sep 15 logged the same REV block 10-20x)
+# and the question is whether the SETUP would have paid, not how often we logged.
+#
+# Costs nothing but quotes and a log line. It never trades, never sizes, never
+# feeds a signal, and swallows its own exceptions -- a broken measurement must
+# not stop the bot from trading.
+COUNTERFACTUAL_ENABLED = True
+
+CHALLENGER_MODE        = 'SPREAD'   # 'SPREAD' | 'STRIKE' (legacy OTM study)
+CHALLENGER_SPREAD_GAPS = 2          # short leg this many strikes further OTM
+
+PATH_MR_SHADOW_ENABLED = True
+
+RV_IV_GATE_ENABLED = True
+RV_IV_MAX          = 0.70          # block entries at or above this ratio
+RV_IV_GATE_SRC     = ('chain',)    # only gate when ATM-IV came from the real chain
 
 # ─── Post-11 Scorer Thresholds ───────────────────────────────────────────────
 # Aggregate score below POST11_SCORE_SKIP_MIN → skip entry (quality too low).
@@ -1611,3 +1808,25 @@ EMAIL_ADDRESS    = "your_email@example.com"
 # ─── Options Settings (legacy, used by bot.py) ────────────────────────────────
 OPTION_SYMBOL    = "NIFTY"
 STRIKE_SELECTION = "atm"
+
+# ─── PATH_SYNFUT — deep-ITM trend as a synthetic intraday future ─────────────
+# Added Sep 1 2026 on user spec: entry from OI levels + PCR + ADX (all three
+# required), trend-continuation only, deep-ITM strikes so the position tracks
+# the index ~1:1 rather than behaving like an option.
+#
+# Runs as an ISOLATED PAPER BOOK in parallel with the live strategy. It places
+# no orders and cannot affect the live position.
+#
+# Its exits are ATR-scaled INDEX POINTS, not premium percentages -- a delta~0.85
+# contract priced near intrinsic would essentially never reach a 25% stop or a
+# 55% target, so transplanting the live stack would leave it with no working
+# stop. Parameters live in synthetic_futures.py, are pre-registered and frozen;
+# any later tuning must be counted as a new trial for Deflated Sharpe purposes.
+# DISABLED Sep 13 2026 (user decision). One trade in its whole life (-Rs2,270),
+# nothing since Sep 2, and the ADX/DI core it is built on is a coin flip:
+# re-tested on the full local dataset, n=717 signals, 36.8% right vs a
+# random-direction control at 36.1%, edge +0.025 ATR, p=0.3754. Its OI gate
+# (SKIP/REDUCE -> no trade) also blocks the cohort that historically performed
+# BETTER (REV+REDUCE is the single best cohort in the book at +Rs952/trade).
+# It generates no information and costs attention. Set True to revive.
+SYNFUT_ENABLED = False

@@ -38,6 +38,9 @@ import reversal_scout
 import breakout_scout
 import anticipation_scout
 import max_pain_trap
+import synthetic_futures
+import path_mr
+import counterfactual
 import near_miss_tracker
 import trade_probability
 from fyers_auth import FyersAuth
@@ -258,6 +261,7 @@ class TradingBot:
         self._trend_leg_extreme   = None   # running extreme of the leg since qualification
         self._trend_anchor        = None   # OR level broken to trigger qualification
         self._path_trend_fired    = False  # one PATH_TREND entry per day
+        self._stale_count         = 0      # consecutive DATA-STALE cycles
         self._st15m             = None   # cached 15m SuperTrend (+1/-1) from get_htf_context
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -454,11 +458,32 @@ class TradingBot:
             # Stale data guard: latest bar must be from today
             latest_date = df.index[-1].date()
             if latest_date != today:
-                self.logger.error(
-                    f"[DATA-STALE] Latest bar is {latest_date}, expected {today}. "
-                    f"API may be returning cached/historical data. Skipping cycle."
-                )
+                # Sep 14 2026 was a market holiday: the feed legitimately had no
+                # bar for 'today', so this fired 749 times per instrument and
+                # logged 2,247 ERRORs on a day nothing was wrong -- which buries
+                # real errors. A genuine feed outage is indistinguishable for the
+                # first few cycles, so keep the first one loud and then fall back
+                # to an hourly reminder.
+                self._stale_count += 1
+                if self._stale_count == 1:
+                    self.logger.error(
+                        f"[DATA-STALE] Latest bar is {latest_date}, expected "
+                        f"{today}. API may be returning cached/historical data. "
+                        f"Skipping cycle."
+                    )
+                elif self._stale_count % 60 == 0:
+                    self.logger.info(
+                        f"[DATA-STALE] {self.instrument}: still on {latest_date} "
+                        f"after {self._stale_count} cycles — market holiday or a "
+                        f"genuine feed outage; not trading either way"
+                    )
+                else:
+                    self.logger.debug(
+                        f"[DATA-STALE] {self.instrument}: still {latest_date}"
+                    )
                 return None
+
+            self._stale_count = 0      # fresh data — clear the holiday/outage streak
 
             # Partial-bar guard: Fyers returns the currently-forming candle as the
             # last row. Bars are labelled by open-time; a bar that opened at T is
@@ -1673,8 +1698,9 @@ class TradingBot:
         pos = self.positions[0]
         elapsed_days = (datetime.now(IST) - pos['entry_time']).total_seconds() / 86400
 
-        # Current option price (live LTP or Black-Scholes)
-        if self.live and pos.get('option_symbol'):
+        # Current option price. Quote whenever a symbol exists (paper included,
+        # Aug 18) so this agrees with check_exits() and the checkpoint.
+        if pos.get('option_symbol'):
             from fyers_orders import get_ltp
             current_opt = get_ltp(self.fyers, pos['option_symbol'])
             if current_opt is None:
@@ -2588,6 +2614,16 @@ class TradingBot:
         return self._risk_cap_today, self._max_lots_today
 
     def enter_trade(self, signal: dict, hv: float, lots: int = 1) -> None:
+        # ── RV/IV premium-richness gate (v1.9.3) ─────────────────────────────
+        # Placed at the very top, BEFORE any strike selection or order
+        # placement, so a block can never orphan a live order. The rv_iv value
+        # in the entry-quality snapshot below is computed after the order goes
+        # in and is logging-only -- gating there would be unsafe in live mode.
+        # See config.RV_IV_GATE_ENABLED for the evidence and for why blocking
+        # HIGH rv_iv is correct rather than inverted.
+        if self._rv_iv_blocked(signal, hv):
+            return
+
         underlying   = signal['price']
         _atm         = int(round(underlying / self.strike_gap) * self.strike_gap)
         _otm         = signal.get('otm_strikes', 0)   # 0=ATM, 1=1-strike OTM, 2=2-strike OTM
@@ -2714,6 +2750,9 @@ class TradingBot:
                     f"  [RISK-GATE] {self.instrument} {signal['type']}: 1-lot risk "
                     f"₹{_risk:,.0f} > cap ₹{_risk_cap:,.0f} — skipping trade"
                 )
+                counterfactual.record(self, signal['type'], float(underlying),
+                                      'RISK', '1-lot risk exceeds the per-trade cap', hv,
+                                      extra=dict(path=signal.get('path')))
                 return
         else:
             self.logger.warning(
@@ -2741,15 +2780,59 @@ class TradingBot:
                     f"({_stop_pct*100:.0f}% below entry ₹{entry_price:.2f})"
                 )
         else:
-            # ── PAPER: Black-Scholes simulation ──────────────────────────────
-            T           = config.DAYS_TO_EXPIRY / 365
-            entry_price = bs_price(signal['type'], underlying, strike, T, hv)
+            # ── PAPER: real quoted premium, Black-Scholes only as fallback ────
+            # Aug 18 2026. Paper used to price everything with bs_price() and a
+            # rolling HV, and set option_symbol=None so exits had nothing to
+            # quote either. That made paper P&L a model artefact, not a
+            # simulation of trading: on Aug 18 BANKNIFTY the index moved -10.8
+            # pts (-0.019%) while the modelled premium fell 38.26% -- an
+            # impossible move for a real 7-DTE option, caused purely by HV
+            # shifting as bars entered and left the 30-bar window. It stopped
+            # out a position that then ran +104.8 index points our way.
+            # The bot holds a live Fyers session even in paper mode, so quote
+            # the real contract. BS remains the fallback when the quote fails,
+            # and is tagged so distorted fills stay identifiable in the log.
+            T             = config.DAYS_TO_EXPIRY / 365
+            _bs_price_est = bs_price(signal['type'], underlying, strike, T, hv)
+            entry_price   = None
+            option_symbol = None
+            _px_src       = 'BS'
+            try:
+                from fyers_orders import build_option_symbol, get_next_expiry, get_ltp
+                _expiry       = get_next_expiry(self.instrument)
+                option_symbol = build_option_symbol(
+                    self.instrument, strike, signal['type'], _expiry
+                )
+                if self.fyers and option_symbol:
+                    _ltp = get_ltp(self.fyers, option_symbol)
+                    if _ltp and _ltp > 0:
+                        entry_price = float(_ltp)
+                        _px_src     = 'LTP'
+            except Exception as _q_err:
+                self.logger.warning(
+                    f"  [PAPER-QUOTE] {self.instrument}: real quote unavailable "
+                    f"({_q_err}) — falling back to Black-Scholes"
+                )
+            if entry_price is None:
+                entry_price = _bs_price_est
+                self.logger.warning(
+                    f"  [PAPER-QUOTE] {self.instrument}: no LTP for "
+                    f"{option_symbol or 'symbol?'} — using BS ₹{entry_price:.2f} "
+                    f"(this trade's P&L is model-priced, not market-priced)"
+                )
+            else:
+                _dev = ((entry_price - _bs_price_est) / _bs_price_est * 100
+                        if _bs_price_est > 0 else 0.0)
+                self.logger.info(
+                    f"  [PAPER-QUOTE] {self.instrument} {option_symbol}: "
+                    f"LTP ₹{entry_price:.2f} (BS said ₹{_bs_price_est:.2f}, "
+                    f"{_dev:+.1f}%)"
+                )
             if entry_price < config.MIN_OPTION_PRICE:
                 self.logger.info(
                     f"Option price ₹{entry_price:.2f} < min ₹{config.MIN_OPTION_PRICE}, skipping."
                 )
                 return
-            option_symbol = None
             sl_order_id   = None
             sl_trigger    = 0.0
 
@@ -2851,6 +2934,19 @@ class TradingBot:
             'spread_pct'       : _spread_pct,     # bid-ask spread % of premium at entry (live)
             'slippage_pct'     : _slip_pct,       # fill vs LTP % (live)
             'vix_at_entry'     : getattr(self, '_last_vix', None),
+            # Entry-quality telemetry (Aug 18). These were added to the signal
+            # dict but never copied here or into the JSONL writer, so they
+            # logged as None on every trade -- the values existed only in the
+            # text log line. Both hops are required.
+            'trend_leg_pts'    : signal.get('trend_leg_pts'),
+            'trend_leg_atr'    : signal.get('trend_leg_atr'),
+            'session_move_pct' : signal.get('session_move_pct'),
+            'session_rng_atr'  : signal.get('session_rng_atr'),
+            'rev_score'        : signal.get('rev_score'),
+            'rev_mp_dist'      : signal.get('rev_mp_dist'),
+            'rev_di_spread'    : signal.get('rev_di_spread'),
+            'rev_di_peak'      : signal.get('rev_di_peak'),
+            'rev_adx_ratio'    : signal.get('rev_adx_ratio'),
         }
         self.positions.append(position)
         self.trades_today += 1
@@ -2890,6 +2986,85 @@ class TradingBot:
             shared_state.get_sgx_context(), signal['type'], self.logger
         )
 
+    def _rv_iv_blocked(self, signal: dict, hv: float) -> bool:
+        """Shared RV/IV premium-richness gate. See config.RV_IV_GATE_ENABLED.
+
+        Called by BOTH enter_trade and enter_challenger_trade. Until Sep 13 2026
+        the gate lived only inside enter_trade, so a blocked signal still opened
+        a Challenger position -- the two books then differed in structure AND in
+        gating, and the structural A/B could not be read. Sep 10 NIFTY and
+        Sep 11 BANKNIFTY were both taken by the Challenger after the Champion
+        refused them.
+
+        Blocked signals are written to logs/rv_iv_blocked_*.jsonl so the
+        counterfactual ("what would the blocked trades have done?") is kept
+        deliberately rather than as a side effect of a bug -- it is the only
+        way this gate can ever be validated.
+        """
+        if not getattr(config, 'RV_IV_GATE_ENABLED', False):
+            return False
+        iv_chain = signal.get('atm_iv')
+        src = ('chain' if iv_chain
+               else ('vix' if getattr(self, '_last_vix', None) else None))
+        iv = iv_chain or getattr(self, '_last_vix', None)
+        rv = (hv * 100.0 / iv) if (iv and hv and iv > 0) else None
+        if (rv is None
+                or src not in getattr(config, 'RV_IV_GATE_SRC', ('chain',))
+                or rv < getattr(config, 'RV_IV_MAX', 0.70)):
+            return False
+        self.logger.info(
+            f"  [RV-IV GATE] {self.instrument} {signal.get('type')} "
+            f"path={signal.get('path')} BLOCKED \u2014 rv_iv {rv:.3f} >= "
+            f"{getattr(config, 'RV_IV_MAX', 0.70)} "
+            f"(HV={hv*100:.2f}% IV={iv:.2f}% src={src}) \u2014 realised vol has "
+            f"already caught up to implied; forward-move expectancy sits in "
+            f"the low band"
+        )
+        try:
+            import json as _json
+            _d = datetime.now(IST)
+            _p = os.path.join(config.LOG_DIRECTORY,
+                              f'rv_iv_blocked_{self.instrument}_'
+                              f'{_d.strftime("%Y-%m-%d")}.jsonl')
+            os.makedirs(config.LOG_DIRECTORY, exist_ok=True)
+            with open(_p, 'a', encoding='utf-8') as fh:
+                fh.write(_json.dumps(dict(
+                    instrument=self.instrument, time=_d.isoformat(),
+                    type=signal.get('type'), path=signal.get('path'),
+                    rv_iv=round(rv, 3), hv=round(hv * 100, 3), iv=round(iv, 3),
+                    src=src, index=signal.get('price'),
+                    adx=signal.get('adx'), chase_pos=signal.get('chase_pos'),
+                )) + '\n')
+        except Exception as exc:
+            self.logger.debug(f"  [RV-IV GATE] blocked-log write failed: {exc}")
+        counterfactual.record(self, signal.get('type'), float(signal['price']),
+                              'RV_IV', f'rv_iv {rv:.3f} >= '
+                              f'{getattr(config, "RV_IV_MAX", 0.70)}', hv,
+                              extra=dict(rv_iv=round(rv, 3), src=src,
+                                         path=signal.get('path')))
+        return True
+
+    def _quote_option(self, strike: int, opt_type: str, underlying: float,
+                      hv: float) -> tuple:
+        """Real traded premium for one leg, Black-Scholes only as fallback.
+
+        Same policy the Champion has used since Aug 18 2026. Returns
+        (price, symbol, source) where source is 'LTP' or 'BS'.
+        """
+        T = config.DAYS_TO_EXPIRY / 365
+        px, sym, src = bs_price(opt_type, underlying, strike, T, hv), None, 'BS'
+        try:
+            from fyers_orders import build_option_symbol, get_next_expiry, get_ltp
+            sym = build_option_symbol(self.instrument, strike, opt_type,
+                                      get_next_expiry(self.instrument))
+            if self.fyers and sym:
+                ltp = get_ltp(self.fyers, sym)
+                if ltp and ltp > 0:
+                    px, src = float(ltp), 'LTP'
+        except Exception as exc:
+            self.logger.debug(f"  [CHALLENGER] quote failed {strike}{opt_type}: {exc}")
+        return px, sym, src
+
     def enter_challenger_trade(self, signal: dict, hv: float,
                                oc: dict, lots: int = 1) -> None:
         """
@@ -2899,17 +3074,55 @@ class TradingBot:
         BS pricing uses hv (same as Champion) with the selected strike, so P&L
         comparison is a clean A/B: same model, same IV, different strike K.
         """
+        # NOTE: no gate checks here. The caller only reaches this function when
+        # the Champion actually opened, so every Champion gate already applies.
+        # Re-checking RV/IV here (as it did between Sep 13-16) logged each block
+        # twice and wrote the counterfactual jsonl twice.
         underlying   = signal['price']
         atm_strike   = int(round(underlying / self.strike_gap) * self.strike_gap)
-        ch_strike    = self.select_challenger_strike(signal['type'], underlying, oc)
         eff_lot_size = self.lot_size * lots
+        mode         = getattr(config, 'CHALLENGER_MODE', 'STRIKE')
 
-        T           = config.DAYS_TO_EXPIRY / 365
-        entry_price = bs_price(signal['type'], underlying, ch_strike, T, hv)
+        # Use the Champion's OWN strike so the A/B differs only in STRUCTURE.
+        _otm   = signal.get('otm_strikes', 0)
+        long_k = (atm_strike + _otm * self.strike_gap) if signal['type'] == 'CALL' \
+            else (atm_strike - _otm * self.strike_gap)
+
+        short_k = short_sym = None
+        if mode == 'SPREAD':
+            gaps    = max(int(getattr(config, 'CHALLENGER_SPREAD_GAPS', 2)), 1)
+            short_k = (long_k + gaps * self.strike_gap) if signal['type'] == 'CALL' \
+                else (long_k - gaps * self.strike_gap)
+            ch_strike = long_k
+        else:
+            ch_strike = self.select_challenger_strike(signal['type'], underlying, oc)
+            long_k    = ch_strike
+
+        long_px, long_sym, long_src = self._quote_option(
+            long_k, signal['type'], underlying, hv)
+
+        if mode == 'SPREAD':
+            short_px, short_sym, short_src = self._quote_option(
+                short_k, signal['type'], underlying, hv)
+            # A debit spread's short leg must be cheaper than its long leg. If a
+            # bad quote inverts that, the structure is meaningless -- skip rather
+            # than log a nonsense trade.
+            if short_px >= long_px:
+                self.logger.info(
+                    f"  [CHALLENGER] short leg ₹{short_px:.2f} >= long "
+                    f"₹{long_px:.2f} - bad quote, skipping shadow entry"
+                )
+                return
+            entry_price = long_px - short_px          # net debit
+            _src_tag    = f"{long_src}/{short_src}"
+        else:
+            short_px    = 0.0
+            entry_price = long_px
+            _src_tag    = long_src
 
         if entry_price < config.MIN_OPTION_PRICE:
             self.logger.info(
-                f"  [CHALLENGER] Option ₹{entry_price:.2f} < min "
+                f"  [CHALLENGER] net ₹{entry_price:.2f} < min "
                 f"₹{config.MIN_OPTION_PRICE}. Skipping shadow entry."
             )
             return
@@ -2924,19 +3137,40 @@ class TradingBot:
             'hv_at_entry'     : hv,
             'highest_pnl_pct' : 0.0,
             'atm_strike'      : atm_strike,   # Champion's strike — for comparison log
+            'mode'            : mode,
+            'long_strike'     : long_k,
+            'short_strike'    : short_k,
+            'long_symbol'     : long_sym,
+            'short_symbol'    : short_sym,
+            'long_entry'      : round(long_px, 2),
+            'short_entry'     : round(short_px, 2),
+            'px_src'          : _src_tag,
+            'width_pts'       : (abs(short_k - long_k) if short_k else None),
         }
         self.challenger_positions.append(position)
         self.challenger_trades_today += 1
 
-        delta_n  = (ch_strike - atm_strike) // self.strike_gap
-        ch_label = f"OTM{delta_n:+d}" if ch_strike != atm_strike else "ATM"
-        self.logger.info(
-            f"  [CHALLENGER] ENTRY {signal['type']:4s} | "
-            f"Strike: {ch_strike} ({ch_label} vs Champion ATM {atm_strike}) | "
-            f"Opt: ₹{entry_price:.2f} | "
-            f"MaxPain={oc.get('max_pain', '?')} | "
-            f"Trade #{self.challenger_trades_today}"
-        )
+        if mode == 'SPREAD':
+            _w  = abs(short_k - long_k)
+            _mx = _w - entry_price                     # max value at expiry
+            self.logger.info(
+                f"  [CHALLENGER] ENTRY {signal['type']:4s} SPREAD | "
+                f"long {long_k} ₹{long_px:.2f} / short {short_k} ₹{short_px:.2f} | "
+                f"net debit ₹{entry_price:.2f} vs Champion naked ₹{long_px:.2f} "
+                f"({100*(1-entry_price/long_px):.0f}% less premium at risk) | "
+                f"width {_w:.0f}pts max ₹{_mx:.2f} ({100*_mx/entry_price:.0f}%) | "
+                f"px={_src_tag} | Trade #{self.challenger_trades_today}"
+            )
+        else:
+            delta_n  = (ch_strike - atm_strike) // self.strike_gap
+            ch_label = f"OTM{delta_n:+d}" if ch_strike != atm_strike else "ATM"
+            self.logger.info(
+                f"  [CHALLENGER] ENTRY {signal['type']:4s} | "
+                f"Strike: {ch_strike} ({ch_label} vs Champion ATM {atm_strike}) | "
+                f"Opt: ₹{entry_price:.2f} | px={_src_tag} | "
+                f"MaxPain={oc.get('max_pain', '?')} | "
+                f"Trade #{self.challenger_trades_today}"
+            )
 
     # ── Exit Management ───────────────────────────────────────────────────────
 
@@ -2963,8 +3197,11 @@ class TradingBot:
                     self.fyers, sl_order_id
                 )
 
-            if self.live and pos.get('option_symbol'):
-                # Live: get actual option LTP for P&L calculation
+            # Quote the real contract whenever we HAVE one -- paper positions
+            # now carry an option_symbol too (Aug 18), so paper marks to market
+            # exactly like live instead of drifting with modelled HV.
+            if pos.get('option_symbol'):
+                # get actual option LTP for P&L calculation
                 from fyers_orders import get_ltp
                 # If exchange already stopped us out, use that fill price directly
                 if _sl_triggered and _sl_fill_price > 0:
@@ -3151,7 +3388,16 @@ class TradingBot:
                         if actual_price:
                             current_opt = actual_price  # use real fill price
 
-                costs   = round_trip_costs(pos['entry_price'], current_opt, pos['lot_size'])
+                # A spread pays costs on BOTH legs; charge the long and short
+                # premiums separately rather than on the net debit.
+                if pos.get('mode') == 'SPREAD' and pos.get('short_strike'):
+                    costs = (round_trip_costs(pos['long_entry'], current_opt,
+                                              pos['lot_size'])
+                             + round_trip_costs(pos['short_entry'], current_opt,
+                                                pos['lot_size']))
+                else:
+                    costs = round_trip_costs(pos['entry_price'], current_opt,
+                                             pos['lot_size'])
                 pnl_net = (current_opt - pos['entry_price']) * pos['lot_size'] - costs
 
                 self.capital   += pnl_net
@@ -3209,6 +3455,15 @@ class TradingBot:
                     'spread_pct'       : pos.get('spread_pct'),
                     'slippage_pct'     : pos.get('slippage_pct'),
                     'vix_at_entry'     : pos.get('vix_at_entry'),
+                    'trend_leg_pts'    : pos.get('trend_leg_pts'),
+                    'trend_leg_atr'    : pos.get('trend_leg_atr'),
+                    'session_move_pct' : pos.get('session_move_pct'),
+                    'session_rng_atr'  : pos.get('session_rng_atr'),
+                    'rev_score'        : pos.get('rev_score'),
+                    'rev_mp_dist'      : pos.get('rev_mp_dist'),
+                    'rev_di_spread'    : pos.get('rev_di_spread'),
+                    'rev_di_peak'      : pos.get('rev_di_peak'),
+                    'rev_adx_ratio'    : pos.get('rev_adx_ratio'),
                 })
                 self._save_trade_log()
                 self._compute_rolling_quality()   # re-evaluate quality after each closed trade
@@ -3264,16 +3519,40 @@ class TradingBot:
                                force_close: bool = False) -> None:
         """
         Evaluate stops/targets for Challenger shadow positions each cycle.
-        Always uses BS pricing (no live orders). Logs [CHALLENGER] EXIT lines
-        with running P&L delta vs Champion for easy side-by-side comparison.
+
+        Marks to REAL traded premiums, Black-Scholes only as fallback. Until
+        Sep 8 2026 this always used BS while the Champion had moved to live
+        LTPs in August, so the two books were priced by different systems and
+        every "Challenger vs Champion" number was a pricing artefact rather
+        than a strategy result. The Sep 8 SENSEX pair is the clean example:
+        identical strike, same minute, Champion -1.2% on the real quote and
+        Challenger -62.5% on the model.
         """
         to_close = []
         for idx, pos in enumerate(self.challenger_positions):
             elapsed_days = (
                 datetime.now(IST) - pos['entry_time']
             ).total_seconds() / 86400
-            T_rem       = max(config.DAYS_TO_EXPIRY - elapsed_days, 0.01) / 365
-            current_opt = bs_price(pos['type'], current_price, pos['strike'], T_rem, hv)
+            T_rem = max(config.DAYS_TO_EXPIRY - elapsed_days, 0.01) / 365
+
+            def _mark(sym, strike):
+                """Live premium for one leg; BS on the same T_rem as fallback."""
+                if sym and self.fyers:
+                    try:
+                        from fyers_orders import get_ltp
+                        _l = get_ltp(self.fyers, sym)
+                        if _l and _l > 0:
+                            return float(_l)
+                    except Exception:
+                        pass
+                return bs_price(pos['type'], current_price, strike, T_rem, hv)
+
+            if pos.get('mode') == 'SPREAD' and pos.get('short_strike'):
+                current_opt = (_mark(pos.get('long_symbol'), pos['long_strike'])
+                               - _mark(pos.get('short_symbol'), pos['short_strike']))
+                current_opt = max(current_opt, 0.01)   # a debit spread cannot go < 0
+            else:
+                current_opt = _mark(pos.get('long_symbol'), pos['strike'])
 
             pnl_pct = (current_opt - pos['entry_price']) / pos['entry_price']
             if pnl_pct > pos['highest_pnl_pct']:
@@ -3307,6 +3586,13 @@ class TradingBot:
                     'type'        : pos['type'],
                     'strike'      : pos['strike'],
                     'atm_strike'  : pos['atm_strike'],
+                    'ch_mode'     : pos.get('mode'),
+                    'long_strike' : pos.get('long_strike'),
+                    'short_strike': pos.get('short_strike'),
+                    'long_entry'  : pos.get('long_entry'),
+                    'short_entry' : pos.get('short_entry'),
+                    'width_pts'   : pos.get('width_pts'),
+                    'px_src'      : pos.get('px_src'),
                     'entry_price' : round(pos['entry_price'], 2),
                     'exit_price'  : round(current_opt, 2),
                     'pnl_pct'     : round(pnl_pct * 100, 2),
@@ -3481,6 +3767,50 @@ class TradingBot:
                 f'(={_adx/self._morning_adx_peak*100:.0f}% of peak) ✓'
             )
 
+        # ── Reversal-entry location gate (Aug 19 2026) ───────────────────────
+        # REV fades an exhausted move, so by construction it should enter NEAR
+        # the extreme of that move. The global chase gate (0.93) is no
+        # constraint here -- it only stops buying the literal extreme, which for
+        # a fade is the GOOD end.
+        #
+        # Aug 19 BANKNIFTY is the case: morning fell 57,356.8 -> 57,001.8
+        # (-355 pts), bounced 209 pts, and REV bought the CALL at 57,210.7 --
+        # 59% of the reversal already done. It then rolled over 196 pts and
+        # Never-Progressed cut it for -Rs2,110. That is not fading an exhausted
+        # move, it is buying the middle of one already underway.
+        #
+        # chase_pos for a CALL = position in the day's range (0 = at the low,
+        # the ideal fade entry); for a PUT it is mirrored. Live entries:
+        #   0.261 +Rs4,284 | 0.282 +Rs2,950 | 0.309 +Rs1,877
+        #   0.348   -Rs863 | 0.611 -Rs2,110
+        # Monotone. 0.40 keeps the whole winning cluster and cuts the tail.
+        # NOTE the P&L above except the last two is Black-Scholes-priced
+        # (pre Aug 18 fix), so treat the RANKING as the signal, not the rupees.
+        _max_chase = getattr(config, 'PATH_REV_MAX_CHASE', 0.40)
+        if _max_chase > 0:
+            _td_rev = df[df.index.date == df.index[-1].date()]
+            if len(_td_rev) > 0:
+                _d_hi = float(_td_rev['High'].max()); _d_lo = float(_td_rev['Low'].min())
+                if _d_hi > _d_lo:
+                    _rp = (_px - _d_lo) / (_d_hi - _d_lo)
+                    _rev_chase = _rp if rev_dir == 'CALL' else (1.0 - _rp)
+                    if _rev_chase > _max_chase:
+                        self.logger.info(
+                            f"  [PATH-REV] {self.instrument} {rev_dir}: entry "
+                            f"{_rev_chase:.3f} into the reversal > {_max_chase} "
+                            f"— the turn is already {_rev_chase*100:.0f}% done, skipped"
+                        )
+                        try:
+                            counterfactual.record(
+                                self, rev_dir, float(_px), 'REV_CHASE',
+                                f'rev chase {_rev_chase:.3f} > {_max_chase}',
+                                float(df['HV'].iloc[-1]),
+                                extra=dict(rev_chase=round(_rev_chase, 3),
+                                           path='REV'))
+                        except Exception:
+                            pass
+                        return None
+
         # ── Score gate ────────────────────────────────────────────────────────
         _min_score = getattr(config, 'PATH_REV_MIN_SCORE', 3)
         _reason_str = ' | '.join(reasons) if reasons else 'no conditions met'
@@ -3627,6 +3957,39 @@ class TradingBot:
         leg_range = (extreme - anchor) if trend_dir == 'CALL' else (anchor - extreme)
         if leg_range <= 0:
             return None
+
+        # ── Minimum leg size (Aug 17 2026) ───────────────────────────────────
+        # TREND had NO concept of how big the move it is trading actually is --
+        # it would qualify on a leg of any magnitude. Aug 17 BANKNIFTY is the
+        # case: it traded a 42.6-point leg (0.54 x ATR, 6.7% of the day's range)
+        # while the index had already fallen 298 points from the open, entered
+        # at 76% retrace with ~10 points of room left, and lost Rs4,477.
+        #
+        # Requiring the leg to exceed one ATR is a noise floor, not a fitted
+        # parameter: a move smaller than a single bar's typical range is not a
+        # trend to continue. Across every logged qualification the ratios were
+        # 1.58 / 1.59 / 1.42 / 1.31 and the Aug 17 loser alone at 0.54 -- so a
+        # 1.0 floor removes that outlier and touches nothing else.
+        # Fails OPEN if ATR is unavailable (production loads 3 days, so ATR is
+        # warm from the first bar; a single-day frame would not be).
+        _min_leg_atr = getattr(config, 'PATH_TREND_MIN_LEG_ATR', 1.0)
+        if _min_leg_atr > 0 and atr > 0:
+            _leg_atr = leg_range / atr
+            if _leg_atr < _min_leg_atr:
+                self.logger.info(
+                    f"  [PATH-TREND] {self.instrument} {trend_dir}: leg "
+                    f"{leg_range:.1f}pts = {_leg_atr:.2f}xATR < {_min_leg_atr} "
+                    f"— move too small to continue, skipped"
+                )
+                try:
+                    counterfactual.record(
+                        self, trend_dir, float(px), 'TREND_LEG',
+                        f'leg {_leg_atr:.2f}xATR < {_min_leg_atr}',
+                        float(df['HV'].iloc[-1]),
+                        extra=dict(leg_atr=round(_leg_atr, 2), path='TREND'))
+                except Exception:
+                    pass
+                return None
         retr = (((extreme - px) / leg_range) if trend_dir == 'CALL'
                 else ((px - extreme) / leg_range))
 
@@ -3697,9 +4060,22 @@ class TradingBot:
             return None
 
         _oi_str = ', '.join(_oi_reasons) if _oi_reasons else 'no OI data'
+        # Session-move context — how far the index has ALREADY travelled today,
+        # which the engine was previously blind to. Logged (not gated) so a
+        # threshold can be set on evidence rather than intuition.
+        _sess = df[df.index.date == df.index[-1].date()]
+        _s_open = float(_sess['Open'].iloc[0]) if len(_sess) else px
+        _s_hi   = float(_sess['High'].max()) if len(_sess) else px
+        _s_lo   = float(_sess['Low'].min())  if len(_sess) else px
+        _moved_pct = ((px - _s_open) / _s_open * 100) if _s_open else 0.0
+        _rng_atr   = ((_s_hi - _s_lo) / atr) if atr > 0 else 0.0
+        _leg_atr_v = (leg_range / atr) if atr > 0 else 0.0
+
         self.logger.info(
             f"  [PATH-TREND] {self.instrument} {trend_dir} FIRE @ {now.strftime('%H:%M')} "
             f"| qualified {self._trend_qual_time} | retrace={retr*100:.0f}% "
+            f"| leg={leg_range:.0f}pts ({_leg_atr_v:.2f}xATR) "
+            f"| session moved {_moved_pct:+.2f}% from open, range={_rng_atr:.1f}xATR "
             f"| ADX {adx_prev:.1f}→{adx:.1f} | {_oi_str}"
         )
 
@@ -3712,6 +4088,10 @@ class TradingBot:
             'path'       : 'TREND',
             'otm_strikes': 0,
             'otm_reason' : f'Trend pullback {retr*100:.0f}% | {_oi_str}',
+            'trend_leg_pts'   : round(leg_range, 1),
+            'trend_leg_atr'   : round(_leg_atr_v, 2),
+            'session_move_pct': round(_moved_pct, 3),
+            'session_rng_atr' : round(_rng_atr, 2),
             'gap_type'   : self._gap_type,
             'dynamic_or' : False,
         }
@@ -3805,6 +4185,7 @@ class TradingBot:
             self._trend_leg_extreme   = None
             self._trend_anchor        = None
             self._path_trend_fired    = False
+            counterfactual.reset_day(self)
 
             # ── BNF Monday-before-monthly-expiry skip ─────────────────────
             self._skip_bnf_today = self._is_monday_before_bnf_monthly_expiry(today)
@@ -4272,7 +4653,12 @@ class TradingBot:
                             _min_profit = getattr(config, 'PATH_A_MIN_PROFIT_TO_HOLD', 0.15)
 
                         # Compute current P&L % for this position
-                        if self.live and pos.get('option_symbol'):
+                        # Same rule as check_exits(): quote whenever a symbol
+                        # exists. Left on `self.live` this would price paper
+                        # positions with BS while exits used real quotes, so the
+                        # checkpoint and the exit stack would disagree about the
+                        # P&L of the same position at the same instant.
+                        if pos.get('option_symbol'):
                             from fyers_orders import get_ltp
                             _opt_ltp = get_ltp(self.fyers, pos['option_symbol'])
                             _cur_opt = _opt_ltp if _opt_ltp else pos['entry_price']
@@ -4400,6 +4786,7 @@ class TradingBot:
                         hv            = float(df['HV'].iloc[-1])
                         self.check_exits(current_price, hv, force_close=True)
                         self.check_challenger_exits(current_price, hv, force_close=True)
+                        counterfactual.mark(self, current_price, hv, force_close=True)
 
                 # ── Consolidated daily loss circuit-breaker ────────────────
                 # Checks grand total across all instruments + bots (shared file).
@@ -4441,6 +4828,7 @@ class TradingBot:
                 # ── Check exits ───────────────────────────────────────────
                 self.check_exits(current_price, hv)
                 self.check_challenger_exits(current_price, hv)
+                counterfactual.mark(self, current_price, hv)
 
                 # ── Multi-timeframe context + option chain ────────────────
                 htf = self.get_htf_context()
@@ -4544,6 +4932,10 @@ class TradingBot:
                                     f"(15m-ST={_st_str}) — holding entry."
                                 )
                                 can_enter = False
+                                counterfactual.record_undirected(
+                                    self, float(df['Close'].iloc[-1]), 'VIX_HIGH',
+                                    f'VIX {_vix_now:.1f} > {config.VIX_MAX}, HTF ambiguous',
+                                    hv, extra=dict(vix=round(float(_vix_now), 2)))
                         elif _vix_now < config.VIX_MIN:
                             self.logger.info(
                                 f"  [VIX-GATE] {self.instrument}: VIX={_vix_now:.1f} "
@@ -4551,6 +4943,15 @@ class TradingBot:
                                 f"Holding entry."
                             )
                             can_enter = False
+                            # Sep 23 2026: this gate blocked all three instruments
+                            # ~400 times in one session and we had no idea what it
+                            # cost -- it fires before any signal, so the ordinary
+                            # counterfactual had nothing to track. Record both legs
+                            # and let the analysis bound it.
+                            counterfactual.record_undirected(
+                                self, float(df['Close'].iloc[-1]), 'VIX_LOW',
+                                f'VIX {_vix_now:.1f} < {config.VIX_MIN}', hv,
+                                extra=dict(vix=round(float(_vix_now), 2)))
 
                 # ── Path F: Reversal Scout — independent of B/C/D/E trading limits ──
                 # PATH-F has its own capital (₹10k) and trade counter; it must run
@@ -4649,6 +5050,35 @@ class TradingBot:
                         self.logger.warning(
                             f"  [MP-TRAP] evaluate_bar error: {_mp_exc}"
                         )
+
+                # ── PATH_SYNFUT (Sep 1 2026) — deep-ITM trend, synthetic future
+                # Isolated paper book running in parallel with the live strategy.
+                # Entry needs OI levels + PCR + ADX to agree; exits are in INDEX
+                # POINTS (ATR-scaled), because a delta~0.85 contract would never
+                # reach the live stack's premium-percentage stop or target.
+                # Cannot touch the live position; failures are swallowed.
+                # PATH_MR shadow: logs the multi-day mean-reversion read once per
+                # session and NEVER trades. Kept out of the entry path entirely
+                # so it cannot confound the rv_iv gate currently under test.
+                if getattr(config, 'PATH_MR_SHADOW_ENABLED', False):
+                    try:
+                        path_mr.evaluate(bot=self, instrument=self.instrument,
+                                         df=df, now=now, logger=self.logger)
+                    except Exception as _mr_exc:
+                        self.logger.debug(f"  [PATH-MR] evaluate error: {_mr_exc}")
+
+                if getattr(config, 'SYNFUT_ENABLED', False):
+                    try:
+                        synthetic_futures.evaluate_bar(
+                            bot        = self,
+                            instrument = self.instrument,
+                            df         = df,
+                            oc         = oc,
+                            now        = now,
+                            logger     = self.logger,
+                        )
+                    except Exception as _sf_exc:
+                        self.logger.debug(f"  [SYNFUT] evaluate_bar error: {_sf_exc}")
 
                 # Log exactly why entry is blocked (once per new bar to avoid spam)
                 if not can_enter:
@@ -5648,6 +6078,13 @@ class TradingBot:
                                                 f"{getattr(config, 'CHASE_GATE_MAX', 0.75)} "
                                                 f"after {_cg_after} (bought the extreme)"
                                             )
+                                            counterfactual.record(
+                                                self, signal['type'],
+                                                float(signal['price']), 'CHASE',
+                                                f'chase_pos {_cp} > '
+                                                f'{getattr(config, "CHASE_GATE_MAX", 0.93)}',
+                                                hv, extra=dict(chase_pos=_cp,
+                                                               path=_cgp))
                                             signal = None
                                         else:  # shadow
                                             self.logger.info(
@@ -5699,8 +6136,25 @@ class TradingBot:
                                     # entry, so a chase-blocked signal earlier in the
                                     # session does not silence the engine for the day.
                                     self._path_trend_fired = True
+                                # The Challenger must take a trade ONLY if the
+                                # Champion actually took it. Gating it on the
+                                # outcome (did a position appear?) inherits every
+                                # guard inside enter_trade automatically -- RV/IV,
+                                # RISK-GATE, min-premium, capital, and anything
+                                # added later. Checking gates one at a time does
+                                # not scale: RV/IV parity was fixed on Sep 13 and
+                                # RISK-GATE was found bypassing it on Sep 16.
+                                _n_before = len(self.positions)
                                 self.enter_trade(signal, hv, lots=_lots)
-                                self.enter_challenger_trade(signal, hv, oc, lots=_lots)
+                                if len(self.positions) > _n_before:
+                                    self.enter_challenger_trade(signal, hv, oc,
+                                                                lots=_lots)
+                                else:
+                                    self.logger.debug(
+                                        f"  [CHALLENGER] {self.instrument}: Champion "
+                                        f"did not open — Challenger stands down "
+                                        f"(A/B stays paired)"
+                                    )
 
                 # ── Path F: update any open sim position outside entry window ─
                 # (e.g. force-close at 14:30 even if can_enter is False)
