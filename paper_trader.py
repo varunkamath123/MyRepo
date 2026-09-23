@@ -46,6 +46,16 @@ CONFIDENCE_DECAY — profit-gated, never realizes a loss:
   by the existing stop/trail/reversal/ST-flip/news checks instead — the
   stop-loss remains the sole loss-cutting mechanism.
 
+  Known gap this profit-gate creates: a position underwater from day one
+  (e.g. the Aug 27 - Sep 9 2026 NIFTY trade) gets zero benefit from
+  CONFIDENCE_DECAY regardless of what Kronos's daily conviction actually
+  does, since in_profit is false the whole way. Position.entry_confidence
+  and the per-day "Signal check" log line (added after that trade) exist so
+  this is now checkable going forward -- whether conviction was fading
+  and blocked, or genuinely held steady while only price moved -- instead
+  of being invisible, which it was for that trade (confidence/direction
+  were computed daily but only ever logged on the day an exit fired).
+
 Predicted target / risk:reward (instrumentation, not yet a gate):
   score_forecast() in core/candle_patterns.py already computes a price
   target, stop level, and risk:reward from Kronos's own predicted candles on
@@ -145,6 +155,7 @@ class Position:
     trail_stop:    float
     predicted_target:      float = 0.0   # Kronos's predicted close at entry, for later calibration
     predicted_risk_reward: float = 0.0   # Kronos's predicted R:R at entry
+    entry_confidence:      float = 0.0   # Kronos confidence at entry -- baseline for decay tracking
 
 @dataclass
 class PaperState:
@@ -344,6 +355,19 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
         direction, confidence, _, _, _ = get_signal(df, force_fallback=False)
         st = supertrend(df)
 
+        # Log the daily read unconditionally (not just when an exit fires) --
+        # previously this was computed every day but only ever surfaced on
+        # the day an exit condition returned, so a trade that spent 13 days
+        # underwater (profit-gate blocking CONFIDENCE_DECAY the whole time)
+        # left no record of whether Kronos's conviction was actually fading.
+        if direction == pos.direction:
+            conf_delta_str = f"{(confidence - pos.entry_confidence) * 100:+.0f}pp vs entry"
+        else:
+            conf_delta_str = f"direction differs from entry ({pos.direction})"
+        log.info("[%s] Signal check: %s conf=%.0f%%  (%s)  pnl=%s",
+                 instrument, direction, confidence * 100, conf_delta_str,
+                 "profit" if in_profit else "loss")
+
         if EXIT_ON_KRONOS_REVERSAL:
             opp = "SHORT" if pos.direction == "LONG" else "LONG"
             if direction == opp and confidence >= p["kronos_rev_conf_min"]:
@@ -470,6 +494,7 @@ def cmd_daily_run(instruments: list[str]):
             trail_stop=0.0,
             predicted_target=price_target,
             predicted_risk_reward=risk_reward,
+            entry_confidence=confidence,
         )
         log.info("[%s] ENTRY %s @ %.1f  conf=%.0f%%  lot=%d  R:R=%.2f  "
                  "predicted_tgt=%.1f  predicted_profit=INR %+.0f  (same-day close)",
