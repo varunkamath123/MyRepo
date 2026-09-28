@@ -92,9 +92,21 @@ def build_option_symbol(instrument: str, strike: int,
         exp_str = expiry.strftime('%y%b').upper()   # e.g. 26APR
     else:
         # Weekly compact format: YY + single-char month + DD
-        _MONTH_CHAR = {10: 'A', 11: 'B', 12: 'C'}
+        # Jan-Sep are the digits 1-9; Oct/Nov/Dec need a letter.
+        #
+        # BUG FIXED Sep 28 2026. This mapped {10:'A', 11:'B', 12:'C'} -- simply
+        # continuing the alphabet past 9. Fyers uses the FIRST LETTER of the
+        # month: O / N / D. Every NIFTY and SENSEX weekly quote silently failed
+        # from Sep 24 (the day expiry first rolled into October) and fell back
+        # to Black-Scholes, which this project has measured at 41-123% error.
+        # Evidence: NSE:NIFTY2690823800CE (Sep, '9') resolved fine, while
+        # NSE:NIFTY26A0622850CE (Oct, 'A') returned no LTP. BANKNIFTY was
+        # unaffected -- it is monthly-only and takes the YYMMM branch above.
+        # Left unfixed this would have mispriced every weekly trade through the
+        # whole of Q4, and recurred every Q4 after.
+        _MONTH_CHAR = {10: 'O', 11: 'N', 12: 'D'}
         m_char  = _MONTH_CHAR.get(expiry.month, str(expiry.month))
-        exp_str = expiry.strftime('%y') + m_char + expiry.strftime('%d')  # e.g. 26413
+        exp_str = expiry.strftime('%y') + m_char + expiry.strftime('%d')  # e.g. 26O06
 
     return f"{prefix}{exp_str}{strike}{opt_type}"
 
@@ -106,6 +118,27 @@ def atm_strike(instrument: str, underlying_price: float) -> int:
 
 
 # ─── Market Data ─────────────────────────────────────────────────────────────
+
+_ALT_MONTH_CHAR = {'O': 'A', 'N': 'B', 'D': 'C'}   # our old (wrong) convention
+
+
+def alt_month_symbol(symbol: str) -> str | None:
+    """The same contract under the OTHER Oct/Nov/Dec convention, or None.
+
+    We believe Fyers wants O/N/D, but that was asserted from the shape of
+    working September symbols rather than tested against the API. Rather than
+    bet the pricing of every Q4 weekly on that belief, get_ltp tries the
+    alternate spelling before falling back to Black-Scholes, and says loudly in
+    the log which one resolved. If O/N/D turns out to be wrong, this keeps real
+    pricing working and tells us so, instead of silently mispricing for months.
+    """
+    import re
+    m = re.match(r'^([A-Z]+:[A-Z]+)(\d{2})([OND])(\d{2})(\d+)(CE|PE)$', symbol)
+    if not m:
+        return None
+    pre, yy, mc, dd, strike, cp = m.groups()
+    return f"{pre}{yy}{_ALT_MONTH_CHAR[mc]}{dd}{strike}{cp}"
+
 
 def get_ltp(fyers, symbol: str, retries: int = 2) -> float | None:
     """Fetch Last Traded Price for a symbol.
@@ -129,6 +162,20 @@ def get_ltp(fyers, symbol: str, retries: int = 2) -> float | None:
                 # Valid transport, no price key → per-symbol error (e.g. bad
                 # contract). Retrying cannot help.
                 logger.warning(f"No LTP key in {symbol} quote. Available: {list(v.keys())}")
+                _alt = alt_month_symbol(symbol)
+                if _alt:
+                    logger.warning(
+                        f"  [SYMBOL] {symbol} had no price — retrying the other "
+                        f"Oct/Nov/Dec convention: {_alt}"
+                    )
+                    _v = get_ltp(fyers, _alt, retries=0)
+                    if _v:
+                        logger.error(
+                            f"  [SYMBOL] {_alt} RESOLVED and {symbol} did not — "
+                            f"the month-char convention in build_option_symbol is "
+                            f"backwards. Fix _MONTH_CHAR."
+                        )
+                        return _v
                 return None
             # Transport-level error: retry only rate-limit style failures
             _msg = str(resp.get('message', '')).lower()
