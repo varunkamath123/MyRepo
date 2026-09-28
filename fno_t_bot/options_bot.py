@@ -41,6 +41,7 @@ import max_pain_trap
 import synthetic_futures
 import path_mr
 import counterfactual
+import confidence
 import near_miss_tracker
 import trade_probability
 from fyers_auth import FyersAuth
@@ -3519,6 +3520,14 @@ class TradingBot:
                 })
                 self._save_trade_log()
                 self._compute_rolling_quality()   # re-evaluate quality after each closed trade
+
+                # Publish the confidence score on every close. P&L alone cannot
+                # separate skill from one lucky session -- this is what turns the
+                # number into evidence, and tracking it per-close means it moves
+                # with the book instead of being recomputed by hand. Writes to
+                # logs/confidence_history.jsonl so the TREND is visible, which
+                # matters more than any single reading.
+                confidence.publish(self, trigger='champion close')
 
                 # ── Learner: record actual outcome ────────────────────────
                 try:
