@@ -1689,6 +1689,24 @@ PATH_TREND_TRAIL_DIST      = TRAILING_DISTANCE
 # Costs nothing but quotes and a log line. It never trades, never sizes, never
 # feeds a signal, and swallows its own exceptions -- a broken measurement must
 # not stop the bot from trading.
+# --- Paper mode: real quotes only (Sep 28 2026) -----------------------------
+# When the broker has no quote, the bot used to price the option with
+# Black-Scholes and book the trade anyway. BS mis-prices real premiums here by a
+# measured 41-123%; the Aug 18 BANKNIFTY case had the index move -10.8 points
+# (-0.019%) while the MODEL premium fell 38.26%, stopping out a position that
+# then ran +104.8 points the right way. No real option behaves like that.
+#
+# The damage is that those rows are indistinguishable from real ones in the
+# record. The Sep 24-28 weekly-symbol bug put 7 of the first 17 counterfactual
+# phantoms into the book as fiction, which inflated the RISK gate to a bogus
+# -Rs12,682 and pushed PATH_REV's ADX effect from p=0.0701 to p=0.0319 -- both
+# caught only by filtering them out by hand afterwards.
+#
+# In PAPER there is no real fill to miss, so skipping costs nothing and keeps
+# every number trustworthy. LIVE is unaffected: a live order returns a real fill
+# price and never reaches this branch. Set False to restore the old behaviour.
+PAPER_REQUIRE_REAL_LTP = True
+
 COUNTERFACTUAL_ENABLED = True
 
 CHALLENGER_MODE        = 'SPREAD'   # 'SPREAD' | 'STRIKE' (legacy OTM study)

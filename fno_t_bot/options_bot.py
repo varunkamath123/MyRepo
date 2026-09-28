@@ -2814,6 +2814,34 @@ class TradingBot:
                     f"({_q_err}) — falling back to Black-Scholes"
                 )
             if entry_price is None:
+                # PAPER MODE: a trade we cannot price with a real quote is not
+                # data, it is noise. Black-Scholes mis-prices real premiums here
+                # by a measured 41-123%, and the Aug 18 BANKNIFTY case is the
+                # proof: the index moved -10.8 points (-0.019%) while the MODEL
+                # premium fell 38.26% and stopped out a position that then ran
+                # +104.8 points our way. No real option does that.
+                #
+                # Those fabricated rows then enter the record indistinguishable
+                # from real ones. The Sep 24-28 symbol bug put 7 of 17
+                # counterfactual phantoms and several live trades into the book
+                # as fiction, and they inflated the apparent value of the RISK
+                # gate (-Rs12,682 from a single modelled block) and of the ADX
+                # effect in PATH_REV (p=0.0319 contaminated vs 0.0701 clean)
+                # until they were filtered out by hand.
+                #
+                # Skipping costs nothing in paper -- there is no real fill to
+                # miss -- and keeps every number in the record trustworthy.
+                # LIVE mode is unaffected: a live order returns a real fill
+                # price, so this branch is paper-only by construction.
+                if getattr(config, 'PAPER_REQUIRE_REAL_LTP', True):
+                    self.logger.warning(
+                        f"  [PAPER-QUOTE] {self.instrument}: no LTP for "
+                        f"{option_symbol or 'symbol?'} — SKIPPING the trade "
+                        f"rather than booking a Black-Scholes fiction. "
+                        f"(BS would have said ₹{_bs_price_est:.2f}.) "
+                        f"Set PAPER_REQUIRE_REAL_LTP=False to book it anyway."
+                    )
+                    return
                 entry_price = _bs_price_est
                 self.logger.warning(
                     f"  [PAPER-QUOTE] {self.instrument}: no LTP for "

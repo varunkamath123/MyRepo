@@ -13,6 +13,12 @@ import config
 import counterfactual as CF
 from options_bot import TradingBot, IST
 
+# No broker session in a unit test, so every quote falls back to Black-Scholes.
+# Production now REFUSES to book a BS-priced paper trade or track a BS phantom
+# (PAPER_REQUIRE_REAL_LTP) -- correct there, wrong here, because these tests are
+# about structure and bookkeeping rather than pricing. Opt out explicitly.
+config.PAPER_REQUIRE_REAL_LTP = False
+
 P = F = 0
 
 
@@ -141,6 +147,24 @@ CF.record_undirected(bot, 23790.0, 'VIX_LOW', 'VIX 10.3 < 11', 0.10)
 CF.record_undirected(bot, 23780.0, 'VIX_LOW', 'VIX 10.4 < 11', 0.10)
 ck('dedupes the ~400 repeats into 2', len(bot._phantoms) == 2,
    f'{len(bot._phantoms)} after 3 calls')
+config.FORCE_CLOSE_TIME = _REAL_FC
+
+
+# --- REAL-QUOTE GUARD (Sep 28 2026) --------------------------------------
+# A Black-Scholes phantom is a fiction used to judge a gate -- worse than no
+# phantom. 7 of the first 17 were BS-priced and made the RISK gate look like it
+# had saved Rs12,682 when it had saved nothing measurable.
+config.FORCE_CLOSE_TIME = '23:59'
+config.PAPER_REQUIRE_REAL_LTP = True
+CF.reset_day(bot)
+CF.record(bot, 'PUT', 23800.0, 'RV_IV', 'guard test', 0.10)
+ck('refuses to track a BS-priced phantom', len(getattr(bot, '_phantoms', [])) == 0,
+   f'{len(getattr(bot, "_phantoms", []))} BS phantoms tracked')
+config.PAPER_REQUIRE_REAL_LTP = False
+CF.reset_day(bot)
+CF.record(bot, 'PUT', 23800.0, 'RV_IV', 'guard test', 0.10)
+ck('and tracks it again when the guard is off', len(bot._phantoms) == 1,
+   f'{len(bot._phantoms)} phantoms')
 config.FORCE_CLOSE_TIME = _REAL_FC
 
 import shutil
