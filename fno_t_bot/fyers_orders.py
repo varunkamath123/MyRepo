@@ -111,6 +111,36 @@ def build_option_symbol(instrument: str, strike: int,
     return f"{prefix}{exp_str}{strike}{opt_type}"
 
 
+
+def resolve_quotable_option(fyers, instrument: str, ideal_strike: int,
+                            option_type: str, expiry, max_steps: int = 2):
+    """Nearest strike the broker will actually quote.
+
+    A contract that will not quote means one of two things: we asked for the
+    wrong string, or that strike is not listed. Fabricating a Black-Scholes
+    price hides both; skipping the trade throws away a real opportunity for
+    what is usually a one-strike problem. So walk outward from the ideal strike
+    and take the first real quote.
+
+    Returns (ltp, symbol, strike, steps_away) or (None, None, None, tried_list).
+
+    A total failure is itself diagnostic: if NO strike within max_steps quotes,
+    the strike is not the problem -- the EXPIRY almost certainly is. The caller
+    logs that distinctly, because the two need different fixes.
+    """
+    gap = config.INSTRUMENTS[instrument]['strike_gap']
+    tried = []
+    for step in range(0, max_steps + 1):
+        cands = [ideal_strike] if step == 0 else [ideal_strike + step * gap,
+                                                  ideal_strike - step * gap]
+        for k in cands:
+            sym = build_option_symbol(instrument, int(k), option_type, expiry)
+            tried.append(sym)
+            ltp = get_ltp(fyers, sym, retries=0)
+            if ltp and ltp > 0:
+                return float(ltp), sym, int(k), step
+    return None, None, None, tried
+
 def atm_strike(instrument: str, underlying_price: float) -> int:
     """Round underlying price to nearest ATM strike for the instrument."""
     gap = config.INSTRUMENTS[instrument]['strike_gap']

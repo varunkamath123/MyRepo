@@ -29,6 +29,50 @@ def ck(name, got, want):
         print(f'  FAIL  {name}\n          got  {got}\n          want {want}')
 
 
+
+# --- STRIKE WALK (Sep 28 2026) -------------------------------------------
+# A contract that will not quote is usually a one-strike problem, not a reason
+# to fabricate a Black-Scholes price or drop the trade. resolve_quotable_option
+# walks outward from the ideal strike; a dead NEIGHBOURHOOD means the expiry is
+# wrong, which is a different bug and must be reported differently.
+from fyers_orders import resolve_quotable_option
+import config as _cfg
+
+
+class _FakeFyers:
+    """Quotes only the strikes it was told about."""
+    def __init__(self, live):
+        self.live = set(live)
+        self.asked = []
+
+    def quotes(self, req):
+        sym = req['symbols']
+        self.asked.append(sym)
+        if sym in self.live:
+            return {'s': 'ok', 'd': [{'v': {'lp': 123.45}}]}
+        return {'s': 'ok', 'd': [{'v': {}}]}        # valid transport, no price
+
+
+_exp = date(2026, 10, 6)
+_ideal = 22850
+
+# exact strike available -> take it, zero steps
+_f = _FakeFyers([build_option_symbol('NIFTY', 22850, 'PUT', _exp)])
+_ltp, _sym, _k, _step = resolve_quotable_option(_f, 'NIFTY', _ideal, 'PUT', _exp)
+ck('exact strike quotes -> used, 0 steps', (_k, _step), (22850, 0))
+
+# exact dead, one strike up alive -> walk one
+_f = _FakeFyers([build_option_symbol('NIFTY', 22900, 'PUT', _exp)])
+_ltp, _sym, _k, _step = resolve_quotable_option(_f, 'NIFTY', _ideal, 'PUT', _exp)
+ck('dead strike -> walks to the next one', (_k, _step), (22900, 1))
+
+# whole neighbourhood dead -> no price, and the caller can tell
+_f = _FakeFyers([])
+_ltp, _sym, _k, _tried = resolve_quotable_option(_f, 'NIFTY', _ideal, 'PUT', _exp)
+ck('dead neighbourhood -> no price returned', _ltp, None)
+ck('dead neighbourhood -> tried 5 strikes (expiry is the suspect)',
+   len(_tried), 5)
+
 print('=' * 74)
 print('OPTION SYMBOL — Oct/Nov/Dec weekly month code')
 print('=' * 74)

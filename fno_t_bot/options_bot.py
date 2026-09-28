@@ -2798,16 +2798,40 @@ class TradingBot:
             option_symbol = None
             _px_src       = 'BS'
             try:
-                from fyers_orders import build_option_symbol, get_next_expiry, get_ltp
+                from fyers_orders import (build_option_symbol, get_next_expiry,
+                                          get_ltp, resolve_quotable_option)
                 _expiry       = get_next_expiry(self.instrument)
                 option_symbol = build_option_symbol(
                     self.instrument, strike, signal['type'], _expiry
                 )
                 if self.fyers and option_symbol:
-                    _ltp = get_ltp(self.fyers, option_symbol)
-                    if _ltp and _ltp > 0:
-                        entry_price = float(_ltp)
-                        _px_src     = 'LTP'
+                    # Walk to the nearest strike the broker will actually quote
+                    # rather than fabricating a price or dropping the trade. A
+                    # dead strike is usually a one-strike problem; a dead
+                    # NEIGHBOURHOOD means the expiry is wrong, which is a
+                    # different bug and gets its own message below.
+                    _ltp, _sym, _k, _step = resolve_quotable_option(
+                        self.fyers, self.instrument, strike,
+                        signal['type'], _expiry)
+                    if _ltp:
+                        entry_price   = float(_ltp)
+                        _px_src       = 'LTP'
+                        option_symbol = _sym
+                        if _step:
+                            self.logger.info(
+                                f"  [STRIKE-WALK] {self.instrument}: {strike} "
+                                f"had no quote — moved {_step} strike(s) to {_k} "
+                                f"@ ₹{_ltp:.2f}. Real price kept."
+                            )
+                            strike = _k
+                    else:
+                        self.logger.error(
+                            f"  [STRIKE-WALK] {self.instrument}: NO strike within "
+                            f"2 gaps of {strike} returned a quote for expiry "
+                            f"{_expiry}. That is not a strike problem — the "
+                            f"EXPIRY is almost certainly wrong. Tried: "
+                            f"{_sym if _sym else _step}"
+                        )
             except Exception as _q_err:
                 self.logger.warning(
                     f"  [PAPER-QUOTE] {self.instrument}: real quote unavailable "
