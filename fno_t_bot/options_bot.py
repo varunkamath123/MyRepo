@@ -41,6 +41,7 @@ import max_pain_trap
 import synthetic_futures
 import path_mr
 import counterfactual
+import confidence
 import near_miss_tracker
 import trade_probability
 from fyers_auth import FyersAuth
@@ -2798,22 +2799,74 @@ class TradingBot:
             option_symbol = None
             _px_src       = 'BS'
             try:
-                from fyers_orders import build_option_symbol, get_next_expiry, get_ltp
+                from fyers_orders import (build_option_symbol, get_next_expiry,
+                                          get_ltp, resolve_quotable_option)
                 _expiry       = get_next_expiry(self.instrument)
                 option_symbol = build_option_symbol(
                     self.instrument, strike, signal['type'], _expiry
                 )
                 if self.fyers and option_symbol:
-                    _ltp = get_ltp(self.fyers, option_symbol)
-                    if _ltp and _ltp > 0:
-                        entry_price = float(_ltp)
-                        _px_src     = 'LTP'
+                    # Walk to the nearest strike the broker will actually quote
+                    # rather than fabricating a price or dropping the trade. A
+                    # dead strike is usually a one-strike problem; a dead
+                    # NEIGHBOURHOOD means the expiry is wrong, which is a
+                    # different bug and gets its own message below.
+                    _ltp, _sym, _k, _step = resolve_quotable_option(
+                        self.fyers, self.instrument, strike,
+                        signal['type'], _expiry)
+                    if _ltp:
+                        entry_price   = float(_ltp)
+                        _px_src       = 'LTP'
+                        option_symbol = _sym
+                        if _step:
+                            self.logger.info(
+                                f"  [STRIKE-WALK] {self.instrument}: {strike} "
+                                f"had no quote — moved {_step} strike(s) to {_k} "
+                                f"@ ₹{_ltp:.2f}. Real price kept."
+                            )
+                            strike = _k
+                    else:
+                        self.logger.error(
+                            f"  [STRIKE-WALK] {self.instrument}: NO strike within "
+                            f"2 gaps of {strike} returned a quote for expiry "
+                            f"{_expiry}. That is not a strike problem — the "
+                            f"EXPIRY is almost certainly wrong. Tried: "
+                            f"{_sym if _sym else _step}"
+                        )
             except Exception as _q_err:
                 self.logger.warning(
                     f"  [PAPER-QUOTE] {self.instrument}: real quote unavailable "
                     f"({_q_err}) — falling back to Black-Scholes"
                 )
             if entry_price is None:
+                # PAPER MODE: a trade we cannot price with a real quote is not
+                # data, it is noise. Black-Scholes mis-prices real premiums here
+                # by a measured 41-123%, and the Aug 18 BANKNIFTY case is the
+                # proof: the index moved -10.8 points (-0.019%) while the MODEL
+                # premium fell 38.26% and stopped out a position that then ran
+                # +104.8 points our way. No real option does that.
+                #
+                # Those fabricated rows then enter the record indistinguishable
+                # from real ones. The Sep 24-28 symbol bug put 7 of 17
+                # counterfactual phantoms and several live trades into the book
+                # as fiction, and they inflated the apparent value of the RISK
+                # gate (-Rs12,682 from a single modelled block) and of the ADX
+                # effect in PATH_REV (p=0.0319 contaminated vs 0.0701 clean)
+                # until they were filtered out by hand.
+                #
+                # Skipping costs nothing in paper -- there is no real fill to
+                # miss -- and keeps every number in the record trustworthy.
+                # LIVE mode is unaffected: a live order returns a real fill
+                # price, so this branch is paper-only by construction.
+                if getattr(config, 'PAPER_REQUIRE_REAL_LTP', True):
+                    self.logger.warning(
+                        f"  [PAPER-QUOTE] {self.instrument}: no LTP for "
+                        f"{option_symbol or 'symbol?'} — SKIPPING the trade "
+                        f"rather than booking a Black-Scholes fiction. "
+                        f"(BS would have said ₹{_bs_price_est:.2f}.) "
+                        f"Set PAPER_REQUIRE_REAL_LTP=False to book it anyway."
+                    )
+                    return
                 entry_price = _bs_price_est
                 self.logger.warning(
                     f"  [PAPER-QUOTE] {self.instrument}: no LTP for "
@@ -3467,6 +3520,14 @@ class TradingBot:
                 })
                 self._save_trade_log()
                 self._compute_rolling_quality()   # re-evaluate quality after each closed trade
+
+                # Publish the confidence score on every close. P&L alone cannot
+                # separate skill from one lucky session -- this is what turns the
+                # number into evidence, and tracking it per-close means it moves
+                # with the book instead of being recomputed by hand. Writes to
+                # logs/confidence_history.jsonl so the TREND is visible, which
+                # matters more than any single reading.
+                confidence.publish(self, trigger='champion close')
 
                 # ── Learner: record actual outcome ────────────────────────
                 try:

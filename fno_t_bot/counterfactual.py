@@ -93,6 +93,18 @@ def record(bot, direction: str, index_px: float, gate: str, reason: str,
         px, sym, src = bot._quote_option(strike, direction, index_px, hv)
         if not px or px < getattr(config, 'MIN_OPTION_PRICE', 1.0):
             return
+        # Hold phantoms to the same standard as real trades. A Black-Scholes
+        # phantom is a fiction used to judge a gate, which is worse than having
+        # no phantom at all: 7 of the first 17 were BS-priced and they made the
+        # RISK gate look like it had saved Rs12,682 when it had saved nothing
+        # measurable. Skip rather than mislead.
+        if src != 'LTP' and getattr(config, 'PAPER_REQUIRE_REAL_LTP', True):
+            bot.logger.info(
+                f"  [COUNTERFACTUAL] {bot.instrument} {direction} blocked by "
+                f"{gate} — no real quote for {strike}, not tracking "
+                f"(a BS phantom would only mislead)"
+            )
+            return
 
         bot._phantom_seen.add(key)
         bot._phantoms.append(dict(

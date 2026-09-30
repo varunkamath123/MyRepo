@@ -12,6 +12,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from options_bot import TradingBot
 
+# No broker session in a unit test, so every quote falls back to Black-Scholes.
+# Production now REFUSES to book a BS-priced paper trade or track a BS phantom
+# (PAPER_REQUIRE_REAL_LTP) -- correct there, wrong here, because these tests are
+# about structure and bookkeeping rather than pricing. Opt out explicitly.
+config.PAPER_REQUIRE_REAL_LTP = False
+
 P = F = 0
 
 
