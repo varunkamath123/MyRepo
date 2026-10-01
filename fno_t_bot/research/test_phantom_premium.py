@@ -11,7 +11,7 @@ Quotes are stubbed, never Black-Scholes: production requires four real LTPs,
 and a test that silently accepted modelled prices would not be testing the
 guard that matters.
 """
-import io, json, glob, os, sys, logging
+import io, json, glob, os, sys, logging, tempfile
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,7 +31,10 @@ def ck(name, cond, detail=''):
         print(f'  FAIL  {name}  {detail}')
 
 
-TMP = os.path.join(os.environ.get('TEMP', '.'), 'pprem_test')
+# tempfile.gettempdir() rather than $TEMP: the latter is Windows-only, so on
+# EC2 it fell back to '.' -- which ec2-user cannot write -- and the suite died
+# before asserting anything. Tests have to run where the bot runs.
+TMP = os.path.join(tempfile.gettempdir(), 'pprem_test')
 os.makedirs(TMP, exist_ok=True)
 for f in glob.glob(os.path.join(TMP, '*.jsonl')):
     os.remove(f)
