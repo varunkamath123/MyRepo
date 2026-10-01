@@ -1705,6 +1705,36 @@ PATH_TREND_TRAIL_DIST      = TRAILING_DISTANCE
 # In PAPER there is no real fill to miss, so skipping costs nothing and keeps
 # every number trustworthy. LIVE is unaffected: a live order returns a real fill
 # price and never reaches this branch. Set False to restore the old behaviour.
+# --- Phantom SHORT-premium book (Oct 2 2026) --------------------------------
+# A MEASUREMENT, not a strategy. Opens one direction-neutral, defined-risk
+# short iron butterfly per instrument per session, marks it on real quotes,
+# and logs the result. Nothing is ordered and nothing touches the champion
+# book or capital.
+#
+# Why: four independent findings say we are on the wrong SIDE of premium, not
+# merely the wrong direction --
+#   VRP (implied > realised, buyers pay it); straddle EV -41.6% over 4,566
+#   obs; 90.7% of entries buy vol the index never delivers; and the Oct 1 2026
+#   study showing the median 10:00->14:30 window reaches only a 0.31-0.36%
+#   best-case excursion against a 0.51% median break-even requirement -- so
+#   even a perfect direction oracle leaves 70-75% of entries unable to pay.
+# None of that can be backtested: Fyers delists expired contracts, so the only
+# honest validation is forward, on real quotes. That is what this collects.
+#
+# Short iron fly (sell ATM straddle, buy wings) because its breakevens sit
+# exactly at the premium charged, making its P&L a direct test of the finding
+# above; because it needs no directional edge, which we do not have; and
+# because the wings bound the loss, which matters at Rs26,000 capital.
+PHANTOM_PREMIUM_ENABLED  = True
+PHANTOM_PREM_TIME        = '10:00'   # same moment the live entry window opens
+PHANTOM_PREM_WING_GAPS   = 2         # wings this many strikes out (defines risk)
+PHANTOM_PREM_LOTS        = 1
+PHANTOM_PREM_STOP        = 1.00      # close at a loss equal to the credit
+PHANTOM_PREM_TARGET      = 0.50      # take half the credit
+# Reviewed after ~30 sessions per instrument. Do NOT promote to live on a
+# positive read alone -- it must clear the same confidence bar as everything
+# else (significance, both chronological halves, concentration).
+
 PAPER_REQUIRE_REAL_LTP = True
 
 COUNTERFACTUAL_ENABLED = True

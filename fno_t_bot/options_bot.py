@@ -41,6 +41,7 @@ import max_pain_trap
 import synthetic_futures
 import path_mr
 import counterfactual
+import phantom_premium
 import confidence
 import near_miss_tracker
 import trade_probability
@@ -4247,6 +4248,7 @@ class TradingBot:
             self._trend_anchor        = None
             self._path_trend_fired    = False
             counterfactual.reset_day(self)
+            phantom_premium.reset_day(self)
 
             # ── BNF Monday-before-monthly-expiry skip ─────────────────────
             self._skip_bnf_today = self._is_monday_before_bnf_monthly_expiry(today)
@@ -4848,6 +4850,7 @@ class TradingBot:
                         self.check_exits(current_price, hv, force_close=True)
                         self.check_challenger_exits(current_price, hv, force_close=True)
                         counterfactual.mark(self, current_price, hv, force_close=True)
+                        phantom_premium.mark(self, current_price, hv, force_close=True)
 
                 # ── Consolidated daily loss circuit-breaker ────────────────
                 # Checks grand total across all instruments + bots (shared file).
@@ -4890,6 +4893,10 @@ class TradingBot:
                 self.check_exits(current_price, hv)
                 self.check_challenger_exits(current_price, hv)
                 counterfactual.mark(self, current_price, hv)
+                # Phantom short-premium book: mark first, then open if
+                # today's structure has not been attempted yet.
+                phantom_premium.mark(self, current_price, hv)
+                phantom_premium.open_book(self, current_price, hv)
 
                 # ── Multi-timeframe context + option chain ────────────────
                 htf = self.get_htf_context()
