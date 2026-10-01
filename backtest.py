@@ -60,6 +60,16 @@ EXIT_ON_SUPERTREND_FLIP  = True
 #        weak entries and tighten stop slightly.
 # BANKNIFTY: PF 1.97 / Sharpe 4.32 — keep working params, earlier trail activate.
 # SENSEX: no backtest data yet; start conservative, same as NIFTY.
+#
+# supertrend_period/multiplier: the shared (10, 3.0) default was checked against
+# 3 years of real data after the system failed to short a real NIFTY decline
+# (Aug27-Sep30 2026) and turned out to have been structurally incapable of ever
+# reading BEAR before the ratcheting-logic fix (see supertrend()). Once fixed,
+# (10, 3.0) tests well for NIFTY (PF 2.41, SHORTs contributing +89k of +134k
+# total) but produces heavy ST_FLIP whipsaw on BANKNIFTY (PF 0.41, LONGs
+# losing -114k). Widening BANKNIFTY's multiplier to 4.0 roughly halves flip
+# count (29->15 over 3y) and brings it to breakeven (PF 1.00, +415) -- not yet
+# a validated edge on its own, but a clear fix from broken to neutral.
 INSTRUMENT_PARAMS = {
     "NIFTY": {
         "stop_loss_pct":       0.025,   # 2.5%: tighter stop, smaller losses
@@ -67,6 +77,8 @@ INSTRUMENT_PARAMS = {
         "trail_distance_pct":  0.025,   # 2.5%
         "kronos_conf_min":     0.55,    # higher bar: only high-conviction entries
         "kronos_rev_conf_min": 0.50,
+        "supertrend_period":   10,
+        "supertrend_multiplier": 3.0,   # validated: PF 2.41, Sharpe 4.72 (3y real-Kronos)
     },
     "BANKNIFTY": {
         "stop_loss_pct":       0.030,   # 3%: BNF moves bigger, needs room
@@ -74,6 +86,8 @@ INSTRUMENT_PARAMS = {
         "trail_distance_pct":  0.025,   # 2.5%
         "kronos_conf_min":     0.45,    # keep as-is (PF 1.97 already)
         "kronos_rev_conf_min": 0.45,
+        "supertrend_period":   10,
+        "supertrend_multiplier": 4.0,   # wider than NIFTY: reduces ST_FLIP whipsaw, PF 0.41->1.00
     },
     "SENSEX": {
         "stop_loss_pct":       0.025,   # conservative until we have backtest
@@ -81,6 +95,8 @@ INSTRUMENT_PARAMS = {
         "trail_distance_pct":  0.025,
         "kronos_conf_min":     0.55,
         "kronos_rev_conf_min": 0.50,
+        "supertrend_period":   10,
+        "supertrend_multiplier": 3.0,   # no backtest data yet; mirrors NIFTY default
     },
 }
 _DEFAULT_PARAMS = INSTRUMENT_PARAMS["NIFTY"]  # fallback for unknown instruments
@@ -272,6 +288,8 @@ def backtest_instrument(
     trail_distance_pct  = p["trail_distance_pct"]
     kronos_conf_min     = p["kronos_conf_min"]
     kronos_rev_conf_min = p["kronos_rev_conf_min"]
+    st_period           = p["supertrend_period"]
+    st_multiplier       = p["supertrend_multiplier"]
 
     trades: list[Trade] = []
 
@@ -341,7 +359,7 @@ def backtest_instrument(
 
             # Signal-based exits (use cached signal)
             try:
-                st = supertrend(ctx)
+                st = supertrend(ctx, period=st_period, multiplier=st_multiplier)
 
                 if EXIT_ON_KRONOS_REVERSAL:
                     opp = "SHORT" if pos.direction == "LONG" else "LONG"
@@ -373,7 +391,7 @@ def backtest_instrument(
             if confidence < kronos_conf_min or direction == "NEUTRAL":
                 continue
 
-            st = supertrend(ctx)
+            st = supertrend(ctx, period=st_period, multiplier=st_multiplier)
             if direction == "LONG"  and st != "BULL":
                 continue
             if direction == "SHORT" and st != "BEAR":

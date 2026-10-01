@@ -348,7 +348,7 @@ def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float, floa
                  instrument, confidence * 100, p["kronos_conf_min"] * 100)
         return "NEUTRAL", 0.0, 0.0, 0.0, None
 
-    st = supertrend(ctx)
+    st = supertrend(ctx, period=p["supertrend_period"], multiplier=p["supertrend_multiplier"])
     if direction == "LONG" and st != "BULL":
         log.info("[%s] Gate FAIL: SuperTrend %s not aligned with LONG", instrument, st)
         return "NEUTRAL", 0.0, 0.0, 0.0, None
@@ -424,7 +424,7 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
     # Signal exits
     try:
         direction, confidence, _, _, _ = get_signal(df, force_fallback=False)
-        st = supertrend(df)
+        st = supertrend(df, period=p["supertrend_period"], multiplier=p["supertrend_multiplier"])
 
         # Log the daily read unconditionally (not just when an exit fires) --
         # previously this was computed every day but only ever surfaced on
