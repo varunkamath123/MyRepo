@@ -25,6 +25,17 @@ MiroFish news gate:
   a strongly opposing news lean vetoes an otherwise-qualified Kronos entry.
   Missing/stale MiroFish data does not block entries (gate is skipped, logged).
 
+MiroFish shadow trades (shadow_state.json / shadow_trades.jsonl):
+  When MiroFish is the ONLY gate that blocks an otherwise-qualified signal,
+  a shadow Position opens at the same live price and is tracked under the
+  exact same stop/trail/reversal/decay rules a real trade would follow --
+  just outside the real one-slot-at-a-time capital constraint, so it never
+  touches paper_state.json, capital, or realised_pnl. This answers "would
+  MiroFish's veto have cost us money" with real forward data instead of
+  guessing. Costs one extra Kronos call/day on days a real position already
+  sits elsewhere, since shadow evaluation isn't gated by the real slot.
+  See --status for shadow P&L alongside real P&L.
+
 Morning news-exit scan (--morning-scan):
   Closes the ~24h blind spot where an open position's only qualitative check
   is the prior close-time run. Run mirofish_swarm.py again pre-market
@@ -193,6 +204,49 @@ def _save_state(state: PaperState):
     Path(STATE_FILE).write_text(json.dumps(raw, indent=2))
 
 
+# ── MiroFish shadow trades ──────────────────────────────────────────────────
+# Tracks what WOULD have happened if a MiroFish veto hadn't blocked an entry
+# that every other gate had already qualified. Reuses Position/check_exit
+# unchanged -- a shadow trade obeys the exact same stop/trail/reversal/decay
+# rules a real trade would, just outside the real one-slot-at-a-time capital
+# constraint (it doesn't touch paper_state.json, capital, or realised_pnl).
+
+SHADOW_STATE_FILE  = Path(__file__).parent / "shadow_state.json"
+SHADOW_TRADES_LOG  = Path(__file__).parent / "shadow_trades.jsonl"
+
+@dataclass
+class ShadowState:
+    positions:    dict[str, Position]   # instrument -> Position (reused as-is)
+    realised_pnl: float
+    trade_count:  int
+
+
+def _load_shadow_state() -> ShadowState:
+    if SHADOW_STATE_FILE.exists():
+        raw = json.loads(SHADOW_STATE_FILE.read_text())
+        positions = {k: Position(**v) for k, v in raw.get("positions", {}).items()}
+        return ShadowState(
+            positions=positions,
+            realised_pnl=raw.get("realised_pnl", 0.0),
+            trade_count=raw.get("trade_count", 0),
+        )
+    return ShadowState(positions={}, realised_pnl=0.0, trade_count=0)
+
+
+def _save_shadow_state(state: ShadowState):
+    raw = {
+        "realised_pnl": state.realised_pnl,
+        "trade_count":  state.trade_count,
+        "positions":    {k: asdict(v) for k, v in state.positions.items()},
+    }
+    SHADOW_STATE_FILE.write_text(json.dumps(raw, indent=2))
+
+
+def _log_shadow_trade(record: dict):
+    with open(SHADOW_TRADES_LOG, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
 # ── Data access: complete daily context + live entry price ────────────────────
 
 def get_context(instrument: str, bars: int = 150) -> pd.DataFrame:
@@ -259,14 +313,21 @@ def _log_trade(record: dict):
 
 # ── Signal evaluation ─────────────────────────────────────────────────────────
 
-def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float, float, float]:
+def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float, float, float, Optional[dict]]:
     """
     Evaluate the full entry gate chain on complete daily context `df`.
-    Returns (direction, confidence, risk_reward, price_target);
+    Returns (direction, confidence, risk_reward, price_target, miro_block);
     direction is NEUTRAL if any gate fails (risk_reward/price_target are 0.0
     in that case). risk_reward/price_target come from Kronos's own predicted
     candles (see backtest.get_signal) -- logged for every qualified entry as
     a checkable prediction, not yet used as a gate (see module docstring).
+
+    miro_block is None unless the MiroFish gate was the SPECIFIC reason this
+    call returned NEUTRAL (every earlier gate passed) -- in that case it's a
+    dict with the direction/confidence/risk_reward/price_target the trade
+    would have had, plus the MiroFish score/reasons that vetoed it. This
+    side channel exists only to seed a shadow trade (see cmd_daily_run) that
+    tracks what would have happened had MiroFish not blocked the entry.
     """
     p = INSTRUMENT_PARAMS.get(instrument, _DEFAULT_PARAMS)
     ctx = df.copy()
@@ -274,26 +335,26 @@ def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float, floa
     adx = compute_adx(ctx)
     if adx < MIN_ADX:
         log.info("[%s] Gate FAIL: ADX %.1f < %d (ranging market)", instrument, adx, MIN_ADX)
-        return "NEUTRAL", 0.0, 0.0, 0.0
+        return "NEUTRAL", 0.0, 0.0, 0.0, None
 
     direction, confidence, source, risk_reward, price_target = get_signal(ctx, force_fallback=False)
     log.info("[%s] Kronos: %s conf=%.0f%% src=%s adx=%.1f R:R=%.2f tgt=%.1f",
              instrument, direction, confidence * 100, source, adx, risk_reward, price_target)
 
     if direction == "NEUTRAL":
-        return "NEUTRAL", 0.0, 0.0, 0.0
+        return "NEUTRAL", 0.0, 0.0, 0.0, None
     if confidence < p["kronos_conf_min"]:
         log.info("[%s] Gate FAIL: confidence %.0f%% < %.0f%%",
                  instrument, confidence * 100, p["kronos_conf_min"] * 100)
-        return "NEUTRAL", 0.0, 0.0, 0.0
+        return "NEUTRAL", 0.0, 0.0, 0.0, None
 
-    st = supertrend(ctx)
+    st = supertrend(ctx, period=p["supertrend_period"], multiplier=p["supertrend_multiplier"])
     if direction == "LONG" and st != "BULL":
         log.info("[%s] Gate FAIL: SuperTrend %s not aligned with LONG", instrument, st)
-        return "NEUTRAL", 0.0, 0.0, 0.0
+        return "NEUTRAL", 0.0, 0.0, 0.0, None
     if direction == "SHORT" and st != "BEAR":
         log.info("[%s] Gate FAIL: SuperTrend %s not aligned with SHORT", instrument, st)
-        return "NEUTRAL", 0.0, 0.0, 0.0
+        return "NEUTRAL", 0.0, 0.0, 0.0, None
 
     mf = get_mirofish(instrument)
     if mf is not None:
@@ -301,17 +362,27 @@ def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float, floa
         if direction == "LONG" and mf_score < MIROFISH_BEARISH_VETO:
             log.info("[%s] Gate FAIL: MiroFish bearish (score=%.2f) vetoes LONG — %s",
                      instrument, mf_score, "; ".join(mf.get("reasons", [])[:2]))
-            return "NEUTRAL", 0.0, 0.0, 0.0
+            miro_block = {
+                "direction": direction, "confidence": confidence,
+                "risk_reward": risk_reward, "price_target": price_target,
+                "mirofish_score": mf_score, "mirofish_reasons": mf.get("reasons", []),
+            }
+            return "NEUTRAL", 0.0, 0.0, 0.0, miro_block
         if direction == "SHORT" and mf_score > MIROFISH_BULLISH_VETO:
             log.info("[%s] Gate FAIL: MiroFish bullish (score=%.2f) vetoes SHORT — %s",
                      instrument, mf_score, "; ".join(mf.get("reasons", [])[:2]))
-            return "NEUTRAL", 0.0, 0.0, 0.0
+            miro_block = {
+                "direction": direction, "confidence": confidence,
+                "risk_reward": risk_reward, "price_target": price_target,
+                "mirofish_score": mf_score, "mirofish_reasons": mf.get("reasons", []),
+            }
+            return "NEUTRAL", 0.0, 0.0, 0.0, miro_block
         log.info("[%s] MiroFish %s (score=%.2f) does not contradict %s",
                  instrument, mf.get("lean"), mf_score, direction)
 
     log.info("[%s] Gate PASS: %s conf=%.0f%% adx=%.1f st=%s R:R=%.2f tgt=%.1f — entry qualified",
              instrument, direction, confidence * 100, adx, st, risk_reward, price_target)
-    return direction, confidence, risk_reward, price_target
+    return direction, confidence, risk_reward, price_target, None
 
 
 # ── Exit check ────────────────────────────────────────────────────────────────
@@ -353,7 +424,7 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
     # Signal exits
     try:
         direction, confidence, _, _, _ = get_signal(df, force_fallback=False)
-        st = supertrend(df)
+        st = supertrend(df, period=p["supertrend_period"], multiplier=p["supertrend_multiplier"])
 
         # Log the daily read unconditionally (not just when an exit fires) --
         # previously this was computed every day but only ever surfaced on
@@ -394,13 +465,44 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
 
 # ── Main commands ─────────────────────────────────────────────────────────────
 
+def _close_position_record(inst: str, pos: Position, reason: str, price: float,
+                           today: str) -> tuple[float, dict]:
+    """Shared close-out math for a real or shadow Position. Returns (pnl_inr, log_record)."""
+    pts = (price - pos.entry_price) if pos.direction == "LONG" else (pos.entry_price - price)
+    pnl = pts * pos.lot_size
+    predicted_profit_inr = None
+    if pos.predicted_target:
+        pred_pts = ((pos.predicted_target - pos.entry_price) if pos.direction == "LONG"
+                   else (pos.entry_price - pos.predicted_target))
+        predicted_profit_inr = pred_pts * pos.lot_size
+    record = {
+        "event":                "EXIT",
+        "instrument":           inst,
+        "direction":            pos.direction,
+        "entry_date":           pos.entry_date,
+        "entry_price":          pos.entry_price,
+        "exit_date":            today,
+        "exit_price":           price,
+        "exit_reason":          reason,
+        "pnl_pts":              pts,
+        "pnl_inr":              pnl,
+        "lot_size":             pos.lot_size,
+        "predicted_target":     pos.predicted_target,
+        "predicted_profit_inr": predicted_profit_inr,
+    }
+    return pnl, record
+
+
 def cmd_daily_run(instruments: list[str]):
     """
     Single daily run near market close (~15:20 IST).
-    PASS 1 closes any exits at the live price; PASS 2 enters new signals
-    at the live price the same day.
+    PASS 1 closes any real exits at the live price; PASS 2 evaluates entries
+    -- taking a real position when the slot is free, or opening a MiroFish
+    shadow trade when MiroFish was the only gate that blocked an otherwise-
+    qualified signal.
     """
     state = _load_state()
+    shadow_state = _load_shadow_state()
     today = date.today().isoformat()
 
     # Fetch context + live price once per instrument
@@ -417,104 +519,137 @@ def cmd_daily_run(instruments: list[str]):
         except Exception as e:
             log.error("[%s] Data fetch failed: %s — skipping", inst, e)
 
-    # ── PASS 1: exits ──────────────────────────────────────────────────────
+    # ── PASS 1: real exits ──────────────────────────────────────────────────
     for inst in list(state.positions.keys()):
         if inst not in ctx:
             continue
         pos    = state.positions[inst]
         price  = px[inst]
         reason = check_exit(inst, pos, ctx[inst], price)
-        pts = ((price - pos.entry_price) if pos.direction == "LONG"
-               else (pos.entry_price - price))
         if reason:
-            pnl = pts * pos.lot_size
+            pnl, record = _close_position_record(inst, pos, reason, price, today)
             state.realised_pnl += pnl
             state.trade_count  += 1
-
-            # Calibration check: how did Kronos's entry-time prediction compare
-            # to what actually happened? Logged only, not used for anything yet.
-            predicted_profit_inr = None
-            if pos.predicted_target:
-                pred_pts = ((pos.predicted_target - pos.entry_price) if pos.direction == "LONG"
-                           else (pos.entry_price - pos.predicted_target))
-                predicted_profit_inr = pred_pts * pos.lot_size
-
             log.info("[%s] EXIT %s @ %.1f  reason=%s  PnL INR %+.0f  "
                      "(predicted INR %s)  [held from %s]",
                      inst, pos.direction, price, reason, pnl,
-                     f"{predicted_profit_inr:+.0f}" if predicted_profit_inr is not None else "n/a",
+                     f"{record['predicted_profit_inr']:+.0f}" if record['predicted_profit_inr'] is not None else "n/a",
                      pos.entry_date)
-            _log_trade({
-                "event":                "EXIT",
-                "instrument":           inst,
-                "direction":            pos.direction,
-                "entry_date":           pos.entry_date,
-                "entry_price":          pos.entry_price,
-                "exit_date":            today,
-                "exit_price":           price,
-                "exit_reason":          reason,
-                "pnl_pts":              pts,
-                "pnl_inr":              pnl,
-                "lot_size":             pos.lot_size,
-                "predicted_target":     pos.predicted_target,
-                "predicted_profit_inr": predicted_profit_inr,
-            })
+            _log_trade(record)
             del state.positions[inst]
         else:
+            pts = ((price - pos.entry_price) if pos.direction == "LONG"
+                   else (pos.entry_price - price))
             log.info("[%s] HOLD %s  entry=%.1f  live=%.1f  unrealised INR %+.0f",
                      inst, pos.direction, pos.entry_price, price, pts * pos.lot_size)
 
-    # ── PASS 2: entries (max one open position across all instruments) ─────
+    # ── PASS 1b: MiroFish shadow exits (same rules, no real capital at stake) ─
+    for inst in list(shadow_state.positions.keys()):
+        if inst not in ctx:
+            continue
+        pos    = shadow_state.positions[inst]
+        price  = px[inst]
+        reason = check_exit(inst, pos, ctx[inst], price)
+        if reason:
+            pnl, record = _close_position_record(inst, pos, reason, price, today)
+            shadow_state.realised_pnl += pnl
+            shadow_state.trade_count  += 1
+            log.info("[SHADOW][%s] EXIT %s @ %.1f  reason=%s  PnL INR %+.0f  [held from %s]",
+                     inst, pos.direction, price, reason, pnl, pos.entry_date)
+            _log_shadow_trade(record)
+            del shadow_state.positions[inst]
+        else:
+            pts = ((price - pos.entry_price) if pos.direction == "LONG"
+                   else (pos.entry_price - price))
+            log.info("[SHADOW][%s] HOLD %s  entry=%.1f  live=%.1f  unrealised INR %+.0f",
+                     inst, pos.direction, pos.entry_price, price, pts * pos.lot_size)
+
+    # ── PASS 2: entries -- real (slot-gated) or MiroFish shadow (not) ───────
+    # Every instrument without an open real OR shadow position gets evaluated
+    # regardless of whether another instrument holds the real slot -- this is
+    # the one extra Kronos call/day the shadow tracking costs, spent so we
+    # can see what MiroFish blocks even on days a real position sits elsewhere.
     for inst in instruments:
         if inst not in ctx:
             continue
-        if inst in state.positions:
-            continue
-        if len(state.positions) >= 1:
-            log.info("[%s] A position is already open — one at a time, skipping entry", inst)
+        if inst in state.positions or inst in shadow_state.positions:
             continue
 
-        direction, confidence, risk_reward, price_target = evaluate_signal(inst, ctx[inst])
-        if direction == "NEUTRAL":
-            continue
-
+        real_slot_free = len(state.positions) == 0
+        direction, confidence, risk_reward, price_target, miro_block = evaluate_signal(inst, ctx[inst])
         price = px[inst]
         lot   = LOT_SIZES.get(inst, 1)
-        predicted_pts = ((price_target - price) if direction == "LONG"
-                         else (price - price_target))
-        predicted_profit_inr = predicted_pts * lot
-        state.positions[inst] = Position(
-            instrument=inst,
-            direction=direction,
-            entry_date=today,
-            entry_price=price,
-            lot_size=lot,
-            hwm=price,
-            trail_active=False,
-            trail_stop=0.0,
-            predicted_target=price_target,
-            predicted_risk_reward=risk_reward,
-            entry_confidence=confidence,
-        )
-        log.info("[%s] ENTRY %s @ %.1f  conf=%.0f%%  lot=%d  R:R=%.2f  "
-                 "predicted_tgt=%.1f  predicted_profit=INR %+.0f  (same-day close)",
-                 inst, direction, price, confidence * 100, lot,
-                 risk_reward, price_target, predicted_profit_inr)
-        _log_trade({
-            "event":                 "ENTRY",
-            "instrument":            inst,
-            "direction":             direction,
-            "entry_date":            today,
-            "entry_price":           price,
-            "confidence":            confidence,
-            "lot_size":              lot,
-            "predicted_risk_reward": risk_reward,
-            "predicted_target":      price_target,
-            "predicted_profit_inr":  predicted_profit_inr,
-        })
+
+        if direction != "NEUTRAL":
+            if not real_slot_free:
+                log.info("[%s] Signal qualified but another position is already open "
+                         "— one at a time, skipping real entry", inst)
+                continue
+
+            predicted_pts = ((price_target - price) if direction == "LONG"
+                             else (price - price_target))
+            predicted_profit_inr = predicted_pts * lot
+            state.positions[inst] = Position(
+                instrument=inst, direction=direction, entry_date=today,
+                entry_price=price, lot_size=lot, hwm=price,
+                trail_active=False, trail_stop=0.0,
+                predicted_target=price_target, predicted_risk_reward=risk_reward,
+                entry_confidence=confidence,
+            )
+            log.info("[%s] ENTRY %s @ %.1f  conf=%.0f%%  lot=%d  R:R=%.2f  "
+                     "predicted_tgt=%.1f  predicted_profit=INR %+.0f  (same-day close)",
+                     inst, direction, price, confidence * 100, lot,
+                     risk_reward, price_target, predicted_profit_inr)
+            _log_trade({
+                "event":                 "ENTRY",
+                "instrument":            inst,
+                "direction":             direction,
+                "entry_date":            today,
+                "entry_price":           price,
+                "confidence":            confidence,
+                "lot_size":              lot,
+                "predicted_risk_reward": risk_reward,
+                "predicted_target":      price_target,
+                "predicted_profit_inr":  predicted_profit_inr,
+            })
+
+        elif miro_block is not None:
+            mb_direction = miro_block["direction"]
+            predicted_pts = ((miro_block["price_target"] - price) if mb_direction == "LONG"
+                             else (price - miro_block["price_target"]))
+            predicted_profit_inr = predicted_pts * lot
+            shadow_state.positions[inst] = Position(
+                instrument=inst, direction=mb_direction, entry_date=today,
+                entry_price=price, lot_size=lot, hwm=price,
+                trail_active=False, trail_stop=0.0,
+                predicted_target=miro_block["price_target"],
+                predicted_risk_reward=miro_block["risk_reward"],
+                entry_confidence=miro_block["confidence"],
+            )
+            log.info("[SHADOW][%s] ENTRY %s @ %.1f  conf=%.0f%%  lot=%d  "
+                     "blocked_by=MiroFish(score=%.2f: %s)  predicted_profit=INR %+.0f",
+                     inst, mb_direction, price, miro_block["confidence"] * 100, lot,
+                     miro_block["mirofish_score"], "; ".join(miro_block["mirofish_reasons"][:2]),
+                     predicted_profit_inr)
+            _log_shadow_trade({
+                "event":                 "ENTRY",
+                "instrument":            inst,
+                "direction":             mb_direction,
+                "entry_date":            today,
+                "entry_price":           price,
+                "confidence":            miro_block["confidence"],
+                "lot_size":              lot,
+                "predicted_risk_reward": miro_block["risk_reward"],
+                "predicted_target":      miro_block["price_target"],
+                "predicted_profit_inr":  predicted_profit_inr,
+                "mirofish_score":        miro_block["mirofish_score"],
+                "mirofish_reasons":      miro_block["mirofish_reasons"],
+            })
 
     _save_state(state)
+    _save_shadow_state(shadow_state)
     print_status(state)
+    print_shadow_status(shadow_state)
 
 
 def cmd_morning_scan():
@@ -599,8 +734,26 @@ def print_status(state: PaperState):
     print(sep)
 
 
+def print_shadow_status(shadow_state: ShadowState):
+    sep = "=" * 60
+    print(f"\n{sep}")
+    print(f"  MIROFISH SHADOW STATUS  (what if the veto hadn't blocked it)")
+    print(f"  Shadow P&L   : INR {shadow_state.realised_pnl:+,.0f}  ({shadow_state.trade_count} trades closed)")
+    print(sep)
+
+    if shadow_state.positions:
+        print("  OPEN SHADOW POSITIONS:")
+        for inst, pos in shadow_state.positions.items():
+            print(f"    {inst:<10} {pos.direction}  entry={pos.entry_price:.1f}  "
+                  f"date={pos.entry_date}  lot={pos.lot_size}")
+    else:
+        print("  No open shadow positions.")
+    print(sep)
+
+
 def cmd_status():
     print_status(_load_state())
+    print_shadow_status(_load_shadow_state())
 
 
 def cmd_reset():

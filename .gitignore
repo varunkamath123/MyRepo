@@ -21,6 +21,7 @@ breeze_keys.json
 *.log
 *.html
 paper_state.json
+shadow_state.json
 mirofish_scores.json
 fyersApi.log
 fyersRequests.log
