@@ -128,7 +128,16 @@ INSTRUMENT_STRATEGY = {
         # ADX to peak and wane first), so widening mainly admits more TREND -- our weakest
         # path (-Rs4,208 live). Watch the counterfactual log and TREND's share.
         # For 09:45 instead, change the three entry_start values below to '09:45'.
-        'entry_start'   : '10:00',
+        # WIDENED 10:00 -> 09:45 (Oct 2 2026, user direction). PATH_REV_START and
+        # PATH_TREND_START were ALREADY 09:45 -- the global 10:00 was blocking
+        # signals the engines were willing to take. Buys +11% more windows and
+        # +2.3pp payability. NOTE THE TENSION with the 09:xx row above (n=35,
+        # 17.1% right): that measures whether entries WIN, this measures whether
+        # the window can MOVE enough. Both can be true -- the window travels far
+        # enough and the engines still call it wrong. The caveat above stands:
+        # early fires are mostly TREND, our weakest path. Revert this line to
+        # '10:00' (leaving FORCE_CLOSE_TIME at 15:00) if TREND's share climbs.
+        'entry_start'   : '09:45',
         'entry_end'     : '14:00',# 14:xx = 25% WR; too close to force-close — blocked
         'max_concurrent': 1,      # No pyramiding — signal quality already high at 72% WR
         # ── Per-instrument PATH-A exit parameters (override global PATH_A_*) ──
@@ -166,7 +175,16 @@ INSTRUMENT_STRATEGY = {
         # options (low gamma), making the 80% target hard to hit on weak moves.
         'tuesday_put_adx_min'   : 35,  # needs a genuinely strong bear trend for 8-day options
         'tuesday_put_di_spread' : 12,  # high DI dominance to justify low-gamma contract
-        'entry_start'   : '10:00',
+        # WIDENED 10:00 -> 09:45 (Oct 2 2026, user direction). PATH_REV_START and
+        # PATH_TREND_START were ALREADY 09:45 -- the global 10:00 was blocking
+        # signals the engines were willing to take. Buys +11% more windows and
+        # +2.3pp payability. NOTE THE TENSION with the 09:xx row above (n=35,
+        # 17.1% right): that measures whether entries WIN, this measures whether
+        # the window can MOVE enough. Both can be true -- the window travels far
+        # enough and the engines still call it wrong. The caveat above stands:
+        # early fires are mostly TREND, our weakest path. Revert this line to
+        # '10:00' (leaving FORCE_CLOSE_TIME at 15:00) if TREND's share climbs.
+        'entry_start'   : '09:45',
         'entry_end'     : '14:00',# Cut from 14:45 → 14:00 (Apr 24 2026): 14:10 2-lot entry had only 20 min to EOD force-close (14:30). 56% WR stat pre-dates Strength=2 lot-doubling. 30-min minimum runway required.
         'max_concurrent': 1,      # Concurrent=2 not valid — causes cascading losses
         # ── Per-instrument PATH-A exit parameters (override global PATH_A_*) ──
@@ -203,7 +221,16 @@ INSTRUMENT_STRATEGY = {
         # Tuesday PUT conditions
         'tuesday_put_adx_min'   : 30,
         'tuesday_put_di_spread' : 8,
-        'entry_start'   : '10:00',
+        # WIDENED 10:00 -> 09:45 (Oct 2 2026, user direction). PATH_REV_START and
+        # PATH_TREND_START were ALREADY 09:45 -- the global 10:00 was blocking
+        # signals the engines were willing to take. Buys +11% more windows and
+        # +2.3pp payability. NOTE THE TENSION with the 09:xx row above (n=35,
+        # 17.1% right): that measures whether entries WIN, this measures whether
+        # the window can MOVE enough. Both can be true -- the window travels far
+        # enough and the engines still call it wrong. The caveat above stands:
+        # early fires are mostly TREND, our weakest path. Revert this line to
+        # '10:00' (leaving FORCE_CLOSE_TIME at 15:00) if TREND's share climbs.
+        'entry_start'   : '09:45',
                                   # Note: PATH-A ORB fires on OR break independently of this
         'entry_end'     : '14:00',# 14:xx = 33% WR — blocked (consistent with NIFTY finding)
         'max_concurrent': 1,
@@ -386,7 +413,22 @@ AVOID_LUNCH_HOURS   = False
 LUNCH_START         = "12:30"
 LUNCH_END           = "13:30"
 INTRADAY_FORCE_CLOSE = True
-FORCE_CLOSE_TIME     = "14:30"      # Exit 60min before close (was 15:10) — reduce drift
+# WIDENED 14:30 -> 15:00 (Oct 2 2026). Runway, not signal quality, is the
+# dominant variable in this book. Measured over 412/409/409 complete sessions,
+# holding to 15:00 instead of 14:30 (entry unchanged at 10:00) lifts the share
+# of windows that can ever cover an ATM option's break-even:
+#     NIFTY     20.8% -> 26.8%      BANKNIFTY 27.5% -> 34.3%
+#     SENSEX    20.8% -> 26.6%
+# and with entry also moved to 09:45: 29.1% / 36.7% / 28.9%. That is a ~40%
+# increase in payable windows -- a larger effect than ANY entry signal tested
+# (direction is ~50% across 12 methods; the best captured +0.010% against a
+# 0.51% median break-even).
+# 15:15 would be better still (31.1/39.6/31.8) but 15:00 keeps a 30-minute
+# buffer to the 15:30 close, before end-of-day spread widening.
+# NO overnight exposure is created: every position still closes same-day.
+# The previous 14:30 was set to "reduce drift" on the old long-premium engines
+# and was never revisited after the payability finding.
+FORCE_CLOSE_TIME     = "15:00"      # same-day close, 30min before the bell
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
 MAX_DAILY_LOSS           = 8000    # PRIMARY gate: stop trading when per-instrument P&L < -₹8,000
