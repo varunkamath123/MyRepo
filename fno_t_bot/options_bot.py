@@ -4893,6 +4893,9 @@ class TradingBot:
                 self.check_exits(current_price, hv)
                 self.check_challenger_exits(current_price, hv)
                 counterfactual.mark(self, current_price, hv)
+                # Index closes for phantom_premium's divergence measure (the
+                # bot keeps no df on self; this is the only place it is in scope)
+                self._idx_closes = df['Close']
                 # Phantom short-premium book: mark first, then open if
                 # today's structure has not been attempted yet.
                 phantom_premium.mark(self, current_price, hv)
@@ -4902,6 +4905,10 @@ class TradingBot:
                 htf = self.get_htf_context()
                 self._st15m = htf.get('supertrend_15m')  # cache for get_path_a_signal late gate
                 oc  = self.get_option_chain_context(current_price)
+                # Cached for phantom_premium's rv_iv, which runs earlier in
+                # the bar than the chain fetch. One bar stale at worst, and
+                # it is a logged conditioning field, not a gate.
+                self._last_atm_iv = oc.get('atm_iv')
                 st_label = {1: 'BULL', -1: 'BEAR'}.get(
                     htf.get('supertrend_15m'), '?')
                 _iv_skew_str = (f"{oc['iv_skew']:+.1f}%" if oc.get('iv_skew') is not None else '?')

@@ -200,5 +200,70 @@ PP.reset_day(b)
 ck('reset_day clears the open structure', b._pprem_open is None)
 ck('reset_day re-arms the daily attempt', b._pprem_done is False)
 
+print('\n--- magnitude context (rv_iv + divergence) ---')
+config.PHANTOM_PREM_CONTEXT = True
+config.PHANTOM_PREM_CONTEXT_STOCKS = False      # no broker session in a unit test
+
+b = FakeBot(fly()); b._last_atm_iv = 12.5       # chain IV, in percent
+PP.open_book(b, 22510.0, 0.0875)                # hv as a fraction, like df['HV']
+ck('rv_iv = hv*100/iv (identical formula to the live gate)',
+   b._pprem_open is not None and
+   abs(b._pprem_open['ctx']['rv_iv'] - round(0.0875 * 100 / 12.5, 3)) < 1e-9,
+   b._pprem_open['ctx'] if b._pprem_open else None)
+ck('rv_iv_src = chain when chain IV is present',
+   b._pprem_open['ctx']['rv_iv_src'] == 'chain')
+
+b = FakeBot(fly()); b._last_atm_iv = None; b._last_vix = 14.0
+PP.open_book(b, 22510.0, 0.0875)
+ck('falls back to VIX and records the source',
+   b._pprem_open['ctx']['rv_iv_src'] == 'vix' and
+   abs(b._pprem_open['ctx']['rv_iv'] - round(0.0875 * 100 / 14.0, 3)) < 1e-9)
+
+b = FakeBot(fly())                               # neither IV available
+PP.open_book(b, 22510.0, 0.0875)
+ck('rv_iv is None rather than guessed when no IV exists',
+   b._pprem_open['ctx']['rv_iv'] is None and
+   b._pprem_open['ctx']['rv_iv_src'] is None)
+
+b = FakeBot(fly()); b._last_atm_iv = 12.5
+PP.open_book(b, 22510.0, 0.0875)
+ck('divergence is None when constituent fetching is off',
+   b._pprem_open['ctx']['divergence'] is None)
+
+
+class Hostile(FakeBot):
+    @property
+    def _last_atm_iv(self):
+        raise RuntimeError('boom')
+
+
+b = Hostile(fly())
+PP.open_book(b, 22510.0, 0.0875)
+ck('a raising context does NOT stop the structure opening', b._pprem_open is not None)
+ck('and the field stays None rather than partial',
+   b._pprem_open['ctx']['rv_iv'] is None)
+
+for _f in glob.glob(os.path.join(TMP, '*.jsonl')):
+    os.remove(_f)
+b = FakeBot(fly()); b._last_atm_iv = 12.5
+PP.open_book(b, 22510.0, 0.0875)
+b.quotes = fly(straddle=100.0, wing=50.0)
+PP.mark(b, 22505.0, 0.0875)
+r = rows()
+ck('context reaches the closed row',
+   len(r) == 1 and {'rv_iv', 'rv_iv_src', 'divergence'} <= set(r[0]),
+   list(r[0].keys()) if r else 'no row')
+if r:
+    ck('logged rv_iv matches what was captured at entry',
+       abs(r[0]['rv_iv'] - round(0.0875 * 100 / 12.5, 3)) < 1e-9, r[0]['rv_iv'])
+
+config.PHANTOM_PREM_CONTEXT = False
+b = FakeBot(fly()); b._last_atm_iv = 12.5
+PP.open_book(b, 22510.0, 0.0875)
+ck('PHANTOM_PREM_CONTEXT=False leaves every field None',
+   all(v is None for v in b._pprem_open['ctx'].values()))
+config.PHANTOM_PREM_CONTEXT = True
+
+
 print(f'\n{P} passed, {F} failed')
 sys.exit(1 if F else 0)

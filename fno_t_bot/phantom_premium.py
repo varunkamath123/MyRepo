@@ -105,6 +105,85 @@ def _net_cost(px: dict) -> float:
             - (px[('long', 'CALL')] + px[('long', 'PUT')]))
 
 
+
+def _rv_iv(bot, hv):
+    """Same construction as options_bot._rv_iv_blocked: hv*100 / iv_pct."""
+    iv = getattr(bot, '_last_atm_iv', None)
+    src = 'chain' if iv else ('vix' if getattr(bot, '_last_vix', None) else None)
+    iv = iv or getattr(bot, '_last_vix', None)
+    if not iv or not hv or iv <= 0:
+        return None, None
+    return round(hv * 100.0 / iv, 3), src
+
+
+def _divergence(bot, index_px):
+    """Weighted top-10 basket 30-min return minus the index's own.
+
+    Measures whether the heavyweights have moved further than the index has.
+    It does NOT call direction (rho +0.012, p=0.63) but it does flag that a
+    bigger move is coming (payability 22.7% -> 40.4% when |value| > 0.1%).
+
+    Best-effort and cached once per session: 10 history calls a day, not per
+    bar. Any failure returns None rather than guessing -- a fabricated context
+    field would quietly corrupt the very comparison this exists to enable.
+    """
+    if not getattr(config, 'PHANTOM_PREM_CONTEXT_STOCKS', False) or not bot.fyers:
+        return None, None
+    W = getattr(config, 'PHANTOM_PREM_TOP10_WEIGHTS', {}) or {}
+    if not W:
+        return None, None
+    today = datetime.now(IST).strftime('%Y-%m-%d')
+    cache = getattr(bot, '_pprem_stk_cache', None)
+    if not cache or cache.get('day') != today:
+        cache = {'day': today, 'data': {}}
+        for sym in W:
+            try:
+                r = bot.fyers.history({'symbol': sym, 'resolution': '5',
+                                       'date_format': '1', 'range_from': today,
+                                       'range_to': today, 'cont_flag': '1'})
+                if r.get('s') == 'ok' and r.get('candles'):
+                    cache['data'][sym] = [c[4] for c in r['candles']]   # closes
+            except Exception:
+                pass
+        bot._pprem_stk_cache = cache
+    closes = cache.get('data') or {}
+    if len(closes) < 7:
+        return None, len(closes)
+    wsum = wret = 0.0
+    for sym, w in W.items():
+        c = closes.get(sym)
+        if not c or len(c) < 7:
+            continue
+        wsum += w
+        wret += w * ((c[-1] - c[-7]) / c[-7] * 100.0)
+    if wsum <= 0:
+        return None, len(closes)
+    try:
+        bars = getattr(bot, '_idx_closes', None)
+        idx_r = ((index_px - float(bars.iloc[-7])) / float(bars.iloc[-7]) * 100.0
+                 ) if bars is not None and len(bars) >= 7 else None
+    except Exception:
+        idx_r = None
+    if idx_r is None:
+        return None, len(closes)
+    return round(wret / wsum - idx_r, 4), len(closes)
+
+
+def _context(bot, index_px, hv):
+    """Magnitude context at entry. Never raises; missing fields stay None."""
+    out = dict(rv_iv=None, rv_iv_src=None, divergence=None, n_constituents=None)
+    if not getattr(config, 'PHANTOM_PREM_CONTEXT', False):
+        return out
+    try:
+        out['rv_iv'], out['rv_iv_src'] = _rv_iv(bot, hv)
+    except Exception:
+        pass
+    try:
+        out['divergence'], out['n_constituents'] = _divergence(bot, index_px)
+    except Exception:
+        pass
+    return out
+
 def open_book(bot, index_px: float, hv: float) -> None:
     """Open the day's structure once, at or after PHANTOM_PREM_TIME."""
     try:
@@ -144,6 +223,7 @@ def open_book(bot, index_px: float, hv: float) -> None:
             symbols={f'{r}_{t}': sym[(r, t)] for r, t, _ in legs},
             peak_pnl=0.0, trough_pnl=0.0,
             max_loss=(width - credit) * qty,
+            ctx=_context(bot, index_px, hv),
         )
         bot.logger.info(
             f"  [PHANTOM-PREM] {bot.instrument}: SHORT iron fly {atm} +/-{width}"
@@ -225,6 +305,7 @@ def mark(bot, index_px: float, hv: float, force_close: bool = False) -> None:
             costs=round(costs, 2), pnl_net=round(pnl_net, 2),
             exit_reason=reason, px_src='LTP' if px else 'intrinsic-settle',
             entry_px=pos['entry_px'], strikes=pos['strikes'],
+            **(pos.get('ctx') or {}),
         ))
         verdict = "KEPT" if pnl_net > 0 else "LOST"
         bot.logger.info(
@@ -244,3 +325,4 @@ def mark(bot, index_px: float, hv: float, force_close: bool = False) -> None:
 def reset_day(bot) -> None:
     bot._pprem_open = None
     bot._pprem_done = False
+    bot._pprem_stk_cache = None
