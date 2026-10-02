@@ -1705,6 +1705,59 @@ PATH_TREND_TRAIL_DIST      = TRAILING_DISTANCE
 # In PAPER there is no real fill to miss, so skipping costs nothing and keeps
 # every number trustworthy. LIVE is unaffected: a live order returns a real fill
 # price and never reaches this branch. Set False to restore the old behaviour.
+# --- Phantom SHORT-premium book (Oct 2 2026) --------------------------------
+# A MEASUREMENT, not a strategy. Opens one direction-neutral, defined-risk
+# short iron butterfly per instrument per session, marks it on real quotes,
+# and logs the result. Nothing is ordered and nothing touches the champion
+# book or capital.
+#
+# Why: four independent findings say we are on the wrong SIDE of premium, not
+# merely the wrong direction --
+#   VRP (implied > realised, buyers pay it); straddle EV -41.6% over 4,566
+#   obs; 90.7% of entries buy vol the index never delivers; and the Oct 1 2026
+#   study showing the median 10:00->14:30 window reaches only a 0.31-0.36%
+#   best-case excursion against a 0.51% median break-even requirement -- so
+#   even a perfect direction oracle leaves 70-75% of entries unable to pay.
+# None of that can be backtested: Fyers delists expired contracts, so the only
+# honest validation is forward, on real quotes. That is what this collects.
+#
+# Short iron fly (sell ATM straddle, buy wings) because its breakevens sit
+# exactly at the premium charged, making its P&L a direct test of the finding
+# above; because it needs no directional edge, which we do not have; and
+# because the wings bound the loss, which matters at Rs26,000 capital.
+# Magnitude context logged on each phantom-premium structure (Oct 2 2026).
+# Direction is ~50% across 12 tested methods; MAGNITUDE is predictable, and
+# these are the two signals that showed it on real data:
+#   rv_iv       realised/implied -- payability rises monotonically 9.6% -> 40.4%
+#               across quintiles (rho +0.325, p=2.6e-28, n=1,090)
+#   divergence  weighted top-10 basket 30m return minus index 30m return --
+#               payability 22.7% -> 40.4% when |divergence| > 0.1%
+#               (rho +0.104, p<0.001, n=1,614)
+# NEITHER predicts direction (rho -0.091 and +0.012). They are logged, never
+# gated, until the phantom book has the sample to judge them.
+# NOTE unresolved: this rv_iv measurement gives rho +0.325 (HIGH rv_iv -> bigger
+# moves) while the recorded project finding behind RV_IV_MAX is rho -0.2269.
+# Same construction (hv*100/iv), opposite sign. Do not touch RV_IV_MAX until
+# the forward windows and outcome definitions are reconciled.
+PHANTOM_PREM_CONTEXT          = True
+PHANTOM_PREM_CONTEXT_STOCKS   = True    # False skips the 10 constituent fetches
+PHANTOM_PREM_TOP10_WEIGHTS    = {
+    'NSE:HDFCBANK-EQ': 13.0, 'NSE:RELIANCE-EQ': 9.0, 'NSE:ICICIBANK-EQ': 8.0,
+    'NSE:INFY-EQ': 6.0, 'NSE:BHARTIARTL-EQ': 5.0, 'NSE:TCS-EQ': 4.0,
+    'NSE:ITC-EQ': 4.0, 'NSE:LT-EQ': 4.0, 'NSE:AXISBANK-EQ': 3.0,
+    'NSE:SBIN-EQ': 3.0,
+}
+
+PHANTOM_PREMIUM_ENABLED  = True
+PHANTOM_PREM_TIME        = '10:00'   # same moment the live entry window opens
+PHANTOM_PREM_WING_GAPS   = 2         # wings this many strikes out (defines risk)
+PHANTOM_PREM_LOTS        = 1
+PHANTOM_PREM_STOP        = 1.00      # close at a loss equal to the credit
+PHANTOM_PREM_TARGET      = 0.50      # take half the credit
+# Reviewed after ~30 sessions per instrument. Do NOT promote to live on a
+# positive read alone -- it must clear the same confidence bar as everything
+# else (significance, both chronological halves, concentration).
+
 PAPER_REQUIRE_REAL_LTP = True
 
 COUNTERFACTUAL_ENABLED = True
