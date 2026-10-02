@@ -42,6 +42,7 @@ import synthetic_futures
 import path_mr
 import counterfactual
 import phantom_premium
+import oi_levels
 import confidence
 import near_miss_tracker
 import trade_probability
@@ -2629,6 +2630,16 @@ class TradingBot:
         underlying   = signal['price']
         _atm         = int(round(underlying / self.strike_gap) * self.strike_gap)
         _otm         = signal.get('otm_strikes', 0)   # 0=ATM, 1=1-strike OTM, 2=2-strike OTM
+        # ITM/ATM only: a higher-delta contract needs less index travel to
+        # break even, and only 23-31% of windows travel far enough as it is.
+        _cap = int(getattr(config, 'MAX_OTM_STRIKES', 2))
+        if _otm > _cap:
+            self.logger.info(
+                f"  [STRIKE] {self.instrument}: OTM {_otm} clamped to {_cap} "
+                f"(MAX_OTM_STRIKES) \u2014 OTM raises the move needed to break even"
+            )
+            _otm = _cap
+            signal['otm_strikes'] = _cap
         # OTM: CALL → higher strike (further from money), PUT → lower strike
         if signal['type'] == 'CALL':
             strike = _atm + _otm * self.strike_gap
@@ -4249,6 +4260,7 @@ class TradingBot:
             self._path_trend_fired    = False
             counterfactual.reset_day(self)
             phantom_premium.reset_day(self)
+            oi_levels.reset_day(self)
 
             # ── BNF Monday-before-monthly-expiry skip ─────────────────────
             self._skip_bnf_today = self._is_monday_before_bnf_monthly_expiry(today)
@@ -4909,6 +4921,8 @@ class TradingBot:
                 # the bar than the chain fetch. One bar stale at worst, and
                 # it is a logged conditioning field, not a gate.
                 self._last_atm_iv = oc.get('atm_iv')
+                # Dynamic OI/PCR levels -- logged for evaluation, not traded on
+                oi_levels.update(self, oc, current_price)
                 st_label = {1: 'BULL', -1: 'BEAR'}.get(
                     htf.get('supertrend_15m'), '?')
                 _iv_skew_str = (f"{oc['iv_skew']:+.1f}%" if oc.get('iv_skew') is not None else '?')

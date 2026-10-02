@@ -280,7 +280,29 @@ TRAILING_DISTANCE    = 0.10        # Trail distance 10% from peak (was 20%)
 # Covers the gap left by the checkpoint loss-stop: entries AFTER the checkpoint
 # (REV at 12:00, late PATH-A) previously had no progress-based exit at all
 # (e.g. Jun 9 BNF REV -₹4,180 bled the full 150min to force-close).
-NEVER_PROGRESS_ENABLED   = True
+# DISABLED Oct 2 2026. Largest single drain in the book, and the only exit
+# whose premise the evidence contradicts.
+#   Never-Progressed   n=14  (39% of ALL exits)  net -Rs14,213  median -8.2%
+#   Trailing Stop      n=13                      net +Rs12,267  median  +9.3%
+#   Stop-Loss          n= 4                      net -Rs11,616
+#   EOD Force-Close    n= 3                      net    -Rs933
+#   Target             n= 2                      net  +Rs8,630
+# -Rs14,213 from one rule, against a total book of -Rs5,865. It cut positions
+# a median 45 minutes in, at -8.2%, from entries that had a median 206 minutes
+# of runway. Median peak before the cut was 1.1% -- they genuinely had not
+# moved, which is exactly the premise: "it is not working, get out".
+#
+# The premise is wrong. exit_lab.py, run on REAL Breeze premiums rather than
+# modelled ones, tested 17 exit variants and found "cutting reds earlier is
+# clearly worse". A market that has gone quiet may consolidate and then break
+# either way; exiting on absence-of-movement forfeits that option while still
+# paying for it.
+#
+# Honest limit: turning this off is NOT a free +Rs14,213. Some of those
+# positions would have run from -8.2% to the -25% stop. What the change buys
+# is the right to find out, on real forward prices, instead of assuming.
+# Set True to restore.
+NEVER_PROGRESS_ENABLED   = False
 NEVER_PROGRESS_MINUTES   = 45      # min age before the check applies. LOWERED 90→45
                                    # (Jul 21 diag): at 90 the exit was DEAD CODE — 0
                                    # fires ever. It was pincered: morning entries hit the
@@ -1789,6 +1811,41 @@ PHANTOM_PREM_TOP10_WEIGHTS    = {
     'NSE:ITC-EQ': 4.0, 'NSE:LT-EQ': 4.0, 'NSE:AXISBANK-EQ': 3.0,
     'NSE:SBIN-EQ': 3.0,
 }
+
+# --- ITM/ATM only (Oct 2 2026) ---------------------------------------------
+# Cap on how far OUT of the money an entry may go. 0 = ATM only; negative
+# values would buy ITM.
+#
+# Why: an option's break-even is an index move divided by its delta, so a
+# higher-delta contract needs LESS travel to pay. ATM delta is ~0.5 against
+# ~0.7 one strike in the money -- roughly 30% less movement required. That
+# attacks the binding constraint directly: only 23-31% of windows in our entry
+# range ever travel far enough to cover an ATM premium, and OTM raises that
+# bar rather than lowering it.
+#
+# In practice this is a GUARANTEE, not a behaviour change: PATH_REV and
+# PATH_TREND already set otm_strikes=0, and the POST11 OTM boost is gated
+# behind PATH_A_OTM_ENABLED=False. The clamp stops a future flag flip from
+# silently reintroducing OTM entries.
+#
+# NOT set negative (true ITM) despite the delta argument, because of capital:
+# a 1-strike ITM BANKNIFTY contract runs ~Rs24-31k of premium against Rs26,000
+# of working capital and a Rs5,000 per-trade risk cap. Revisit when capital or
+# the risk cap changes.
+MAX_OTM_STRIKES = 0
+
+# --- Dynamic OI/PCR support-resistance (Oct 2 2026) -------------------------
+# LOGGING ONLY -- deliberately not wired to any entry decision. See
+# oi_levels.py for why: eight static level definitions were tested across
+# 17,300 touches and every one rejected price at ~51%, as did repeated
+# rejection. A new definition has to beat that bar before it can trigger
+# anything. This one differs by reading the LIVE chain each bar and by scoring
+# OI CHANGE rather than OI level -- neither of which the static tests could see.
+OI_LEVELS_ENABLED        = True
+OI_LEVELS_LOG_EVERY_MIN  = 5
+OI_LEVEL_PCR_BULL        = 1.15   # PCR at/above -> put writers defending: support firms
+OI_LEVEL_PCR_BEAR        = 0.85   # PCR at/below -> call writers defending: resistance firms
+OI_LEVEL_PCR_ADJ         = 0.25   # how hard PCR reweights a level's score
 
 PHANTOM_PREMIUM_ENABLED  = True
 PHANTOM_PREM_TIME        = '10:00'   # same moment the live entry window opens
