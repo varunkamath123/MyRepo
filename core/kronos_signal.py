@@ -178,13 +178,26 @@ def _kronos_predict(ohlcv: pd.DataFrame, bars: int) -> tuple[pd.DataFrame, str]:
         bar_delta = timedelta(minutes=5)
     y_ts = pd.Series([last_ts + bar_delta * (i + 1) for i in range(bars)])
 
+    # Deterministic decoding: top_k=1 forces top_k_top_p_filtering to zero out
+    # every logit but the single highest one, so torch.multinomial always draws
+    # that survivor with probability 1 -- same effect as greedy/argmax decoding,
+    # without touching the vendored Kronos source (sample_logits=False exists in
+    # sample_from_logits() but auto_regressive_inference() hardcodes True, so
+    # it's unreachable through the public predict() API). T/top_p become no-ops
+    # once only one token survives, so they're left at their original values.
+    #
+    # Checked after 3 identical backtest runs on the same NIFTY data produced
+    # wildly different results (+134,258 / -51,756 / -110,126 INR -- a 244k
+    # spread) under T=1.0 sample_count=1 stochastic sampling: every Kronos call,
+    # backtest or live, was drawing one random sample from the model's output
+    # distribution rather than a reproducible read.
     pred_df = predictor.predict(
         df=df,
         x_timestamp=x_ts,
         y_timestamp=y_ts,
         pred_len=bars,
         T=1.0,
-        top_k=0,
+        top_k=1,
         top_p=0.9,
         sample_count=1,
         verbose=False,
