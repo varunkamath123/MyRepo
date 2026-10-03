@@ -1847,6 +1847,46 @@ OI_LEVEL_PCR_BULL        = 1.15   # PCR at/above -> put writers defending: suppo
 OI_LEVEL_PCR_BEAR        = 0.85   # PCR at/below -> call writers defending: resistance firms
 OI_LEVEL_PCR_ADJ         = 0.25   # how hard PCR reweights a level's score
 
+# --- Premium recorder (Oct 3 2026) -----------------------------------------
+# Captures what becomes PERMANENTLY untestable if it is not captured today.
+#
+# Fyers delists expired option contracts -- every historical option symbol
+# tested on Oct 2 returned "Invalid symbol provided". Consequences already
+# paid for: only 1 of 36 real-priced trades could be re-priced, and on that
+# one a plausible model was wrong by 6.7x (+Rs1,483 modelled vs +Rs221 real).
+# That is a capture problem, not a data problem. From today the archive builds
+# itself and Breeze stops being the bottleneck for anything going forward.
+#
+# Recorded every PREMIUM_REC_EVERY_MIN minutes, one batched quotes call per
+# instrument:
+#   * ATM +/- PREMIUM_REC_STRIKES option premiums, both legs -- makes future
+#     option backtests real-priced instead of modelled
+#   * bid/ask per contract -- we currently have NO spread data at all, so
+#     every paper fill and every backtest marks at LTP and flatters itself
+#   * index futures near + next month -- basis and term structure, entirely
+#     absent from the archive, and the instrument an 11-point index edge
+#     actually fits
+#   * per-strike OI and volume -- the raw distribution behind oi_levels, so a
+#     different level definition can be tested later on the same tape
+#   * spot, VIX and ATM IV at the SAME instant -- the existing stores sample
+#     these on different clocks and force interpolation
+#
+# Cost: ~21 symbols x 3 instruments every 5 min, one batched call each.
+# Roughly 1-3 MB/day of JSONL; disk is 32% used with 14G free.
+PREMIUM_RECORDER_ENABLED = True
+PREMIUM_REC_EVERY_MIN    = 5
+PREMIUM_REC_STRIKES      = 4      # ATM +/- this many strikes, both legs
+PREMIUM_REC_BATCH        = 25     # symbols per quotes() call
+# Non-futures extras only. Futures symbols are DERIVED from the date inside
+# premium_recorder._futures() -- hardcoding 'NSE:NIFTY26OCTFUT' here would go
+# stale every month and the symbol would quietly stop quoting, which looks
+# like missing data rather than a bug.
+PREMIUM_REC_EXTRA = {
+    'NIFTY':     [('vix', 'NSE:INDIAVIX-INDEX')],
+    'BANKNIFTY': [],
+    'SENSEX':    [],
+}
+
 PHANTOM_PREMIUM_ENABLED  = True
 PHANTOM_PREM_TIME        = '10:00'   # same moment the live entry window opens
 PHANTOM_PREM_WING_GAPS   = 2         # wings this many strikes out (defines risk)

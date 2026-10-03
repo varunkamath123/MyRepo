@@ -43,6 +43,7 @@ import path_mr
 import counterfactual
 import phantom_premium
 import oi_levels
+import premium_recorder
 import confidence
 import near_miss_tracker
 import trade_probability
@@ -4261,6 +4262,7 @@ class TradingBot:
             counterfactual.reset_day(self)
             phantom_premium.reset_day(self)
             oi_levels.reset_day(self)
+            premium_recorder.reset_day(self)
 
             # ── BNF Monday-before-monthly-expiry skip ─────────────────────
             self._skip_bnf_today = self._is_monday_before_bnf_monthly_expiry(today)
@@ -4923,6 +4925,9 @@ class TradingBot:
                 self._last_atm_iv = oc.get('atm_iv')
                 # Dynamic OI/PCR levels -- logged for evaluation, not traded on
                 oi_levels.update(self, oc, current_price)
+                # Capture premiums/bid-ask/futures now -- expired contracts
+                # are delisted, so anything not recorded today is gone.
+                premium_recorder.record(self, current_price)
                 st_label = {1: 'BULL', -1: 'BEAR'}.get(
                     htf.get('supertrend_15m'), '?')
                 _iv_skew_str = (f"{oc['iv_skew']:+.1f}%" if oc.get('iv_skew') is not None else '?')
