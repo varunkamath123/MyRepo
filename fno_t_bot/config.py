@@ -1517,10 +1517,37 @@ PATH_REV_MAXPAIN_PROX_PCT   = 0.005   # within 0.5% of MaxPain → proximity bon
 # extreme; the global chase gate (0.93) does not constrain a fade at all,
 # because for a fade the extreme is the GOOD end. Live entries, ranked:
 #   0.261 +Rs4,284 | 0.282 +Rs2,950 | 0.309 +Rs1,877 | 0.348 -Rs863 | 0.611 -Rs2,110
-# Monotone; 0.40 keeps the winning cluster and cuts the tail. Rupees before
-# Aug 18 are Black-Scholes-priced, so the RANKING is the evidence, not the
-# amounts. 0 disables.
-PATH_REV_MAX_CHASE          = 0.40
+# Monotone, but those rupees are Black-Scholes-priced -- the note's own words
+# were "the RANKING is the evidence, not the amounts". 0 disables.
+#
+# RAISED 0.40 -> 0.70 (Oct 5 2026). Since Sep 17 the counterfactual has priced
+# every blocked REV signal at REAL traded premiums, and it contradicts the
+# modelled ranking above:
+#   09-29 SENSEX    CALL chase 0.609   +403   Trailing Stop
+#   09-29 BANKNIFTY CALL chase 0.590   +435   Trailing Stop
+#   10-01 SENSEX    CALL chase 0.695   +794   Trailing Stop
+#   10-01 NIFTY     CALL chase 0.526   +464   Trailing Stop
+#   10-01 BANKNIFTY PUT  chase 0.460   -826   Never-Progressed (peak +4.9%)
+#   10-05 SENSEX    PUT  chase 0.406 +1,656   Trailing Stop
+#   10-05 BANKNIFTY PUT  chase 0.558   +290   Trailing Stop
+#   10-05 NIFTY     PUT  chase 0.476 +1,670   Trailing Stop
+#   n=8, 7W/1L, +Rs4,886, mean +Rs611, halves +Rs2,096 / +Rs2,790.
+#
+# The single loser was killed by NEVER_PROGRESS, disabled Oct 2 after proving
+# the largest drain in the book; it had peaked +4.9% before being cut at
+# -3.5%, so the rule that killed it no longer exists.
+#
+# 0.70 admits EXACTLY the measured band (0.406-0.695) and nothing beyond it.
+# There is no real-priced observation above 0.695, so the gate still blocks
+# everything unmeasured. Not removed, not set to 0.
+#
+# HONEST LIMIT: n=8. This project has reverted several changes built on n<15
+# (MIN_LEG_ATR, PATH_MR, gap-fade, MFE) -- but every one of those was a
+# MODELLED number later contradicted by real prices, which is the direction
+# this change runs in, not against. The counterfactual keeps logging, so if
+# the 0.40-0.70 band goes net negative it surfaces in the same place this
+# evidence came from. Revert to 0.40 if it does.
+PATH_REV_MAX_CHASE          = 0.70
 PATH_REV_ADX_WANE_RATIO     = 0.85    # ADX < peak × this = momentum waning
 
 # ─── PATH_TREND: Trend-Continuation Pullback Entry ───────────────────────────
