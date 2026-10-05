@@ -4927,7 +4927,7 @@ class TradingBot:
                 oi_levels.update(self, oc, current_price)
                 # Capture premiums/bid-ask/futures now -- expired contracts
                 # are delisted, so anything not recorded today is gone.
-                premium_recorder.record(self, current_price)
+                premium_recorder.record(self, current_price, oc)
                 st_label = {1: 'BULL', -1: 'BEAR'}.get(
                     htf.get('supertrend_15m'), '?')
                 _iv_skew_str = (f"{oc['iv_skew']:+.1f}%" if oc.get('iv_skew') is not None else '?')

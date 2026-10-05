@@ -132,7 +132,7 @@ def _symbols(bot, spot: float) -> tuple:
         return [], [], None, None
 
 
-def record(bot, spot: float) -> None:
+def record(bot, spot: float, oc: dict | None = None) -> None:
     """One snapshot. Throttled, batched, and silent on failure."""
     try:
         if not getattr(config, 'PREMIUM_RECORDER_ENABLED', False):
@@ -182,11 +182,39 @@ def record(bot, spot: float) -> None:
         if not quotes:
             return
 
+        # Open interest comes from the CHAIN, not from quotes(): the Oct 5
+        # schema probe showed fyers.quotes() returns lp/bid/ask/volume/spread
+        # but no OI field at all. Without this the archive would have captured
+        # premiums and silently no OI -- the exact failure the probe exists to
+        # catch, caught on day one.
+        chain = (oc or {}).get('strikes') or {}
+
+        def _oi(strike, typ):
+            v = chain.get(strike) or chain.get(float(strike)) or chain.get(str(strike))
+            if not isinstance(v, dict):
+                return {}
+            key = 'call_oi' if typ == 'CALL' else 'put_oi'
+            iv_key = 'call_iv' if typ == 'CALL' else 'put_iv'
+            out = {}
+            if v.get(key) is not None:
+                out['oi'] = v[key]
+            if v.get(iv_key) is not None:
+                out['iv'] = v[iv_key]
+            return out
+
         legs = []
         for k, t, s in opts:
             q = quotes.get(s)
-            if q:
-                legs.append(dict(strike=k, type=t, symbol=s, **q))
+            if not q:
+                continue
+            # Merge, do NOT double-splat: if the broker ever starts returning
+            # an 'oi' field, dict(**q, **_oi(...)) raises TypeError on the
+            # duplicate key and the whole snapshot is silently dropped by the
+            # outer except. Chain OI wins, since it is the authoritative source.
+            leg = dict(strike=k, type=t, symbol=s)
+            leg.update(q)
+            leg.update(_oi(k, t))
+            legs.append(leg)
         rec = dict(
             schema=1, instrument=bot.instrument,
             ts=now.isoformat(), spot=round(float(spot), 2),

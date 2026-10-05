@@ -226,5 +226,53 @@ ck('reset_day re-arms the probe for the next session',
    getattr(b, '_premrec_probed', True) is False)
 
 
+print('\n--- OI from the CHAIN, not quotes() (Oct 5 2026 regression) ---')
+# The Oct 5 schema probe showed fyers.quotes() returns lp/bid/ask/volume but
+# NO open interest. Without pulling it from the chain the archive would have
+# captured premiums and silently no OI.
+clear()
+chain = {'strikes': {}}
+for _k, _t, _s in opts:
+    e = chain['strikes'].setdefault(_k, {})
+    e['call_oi' if _t == 'CALL' else 'put_oi'] = 11000 + _k
+    e['call_iv' if _t == 'CALL' else 'put_iv'] = 12.5
+b = FakeBot(FakeFyers(payload))
+PR.record(b, 22513.0, chain)
+r = rows()
+ck('records with a chain supplied', len(r) == 1, len(r))
+if r:
+    legs = {(l['strike'], l['type']): l for l in r[0]['legs']}
+    k0, t0, _ = opts[0]
+    ck('oi captured from the chain', legs[(k0, t0)].get('oi') == 11000 + k0,
+       legs[(k0, t0)])
+    ck('per-leg iv captured from the chain', legs[(k0, t0)].get('iv') == 12.5)
+    ck('quote fields still present alongside', legs[(k0, t0)].get('bid') == 150.0)
+
+clear()
+b = FakeBot(FakeFyers(payload))
+PR.record(b, 22513.0)                            # no chain passed
+r = rows()
+ck('no chain -> still records the premium legs',
+   len(r) == 1 and len(r[0]['legs']) == 10, len(r[0]['legs']) if r else 'no row')
+
+clear()
+b = FakeBot(FakeFyers(payload))
+PR.record(b, 22513.0, {'strikes': {'garbage': None}})
+ck('malformed chain does not break the snapshot', len(rows()) == 1)
+
+# the payload ALREADY carries 'oi', so merging chain oi on top is a duplicate
+# key -- double-splatting raised TypeError and silently dropped the snapshot
+clear()
+b = FakeBot(FakeFyers(payload))
+PR.record(b, 22513.0, chain)
+r = rows()
+ck('quote oi AND chain oi together does not drop the snapshot', len(r) == 1, len(r))
+if r:
+    k0, t0, _ = opts[0]
+    legs = {(l['strike'], l['type']): l for l in r[0]['legs']}
+    ck('chain oi wins over the quote field', legs[(k0, t0)]['oi'] == 11000 + k0,
+       legs[(k0, t0)]['oi'])
+
+
 print(f'\n{P} passed, {F} failed')
 sys.exit(1 if F else 0)

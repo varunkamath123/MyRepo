@@ -265,5 +265,26 @@ ck('PHANTOM_PREM_CONTEXT=False leaves every field None',
 config.PHANTOM_PREM_CONTEXT = True
 
 
+print('\n--- EOD self-close (Oct 5 2026 regression) ---')
+# The bot's EOD branch is gated on the CHAMPION having positions, so on a
+# no-trade day the fly never settled and the session was lost. The book must
+# close on its own clock.
+for _f in glob.glob(os.path.join(TMP, '*.jsonl')):
+    os.remove(_f)
+config.FORCE_CLOSE_TIME = '23:59'
+b = FakeBot(fly()); PP.open_book(b, 22510.0, 12.0)
+PP.mark(b, 22511.0, 12.0)                       # before the close, nothing due
+ck('holds while inside the session', b._pprem_open is not None and not rows())
+
+config.FORCE_CLOSE_TIME = '00:00'               # now past it
+PP.mark(b, 22511.0, 12.0)                       # caller passes force_close=False
+r = rows()
+ck('self-closes at FORCE_CLOSE_TIME without the caller forcing it',
+   len(r) == 1 and 'Force-Close' in r[0]['exit_reason'],
+   r[0]['exit_reason'] if r else 'no row')
+ck('and clears the position', b._pprem_open is None)
+config.FORCE_CLOSE_TIME = '23:59'
+
+
 print(f'\n{P} passed, {F} failed')
 sys.exit(1 if F else 0)

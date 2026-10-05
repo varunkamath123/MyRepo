@@ -268,6 +268,16 @@ def mark(bot, index_px: float, hv: float, force_close: bool = False) -> None:
         pos['trough_pnl'] = min(pos['trough_pnl'], pnl_unit)
         minutes = (now - pos['entry_time']).total_seconds() / 60.0
 
+        # Self-detect the force-close. The bot's EOD branch is gated on
+        # `self.positions` -- the CHAMPION's book -- so on a day with no live
+        # trade (Oct 5 2026 was the first) the phantom never settled and the
+        # session was lost. This book is independent and must close on its own
+        # clock, whatever the champion did.
+        if not force_close:
+            fc = str(getattr(config, 'FORCE_CLOSE_TIME', '15:00'))
+            if now.strftime('%H:%M') >= fc:
+                force_close = True
+
         stop   = float(getattr(config, 'PHANTOM_PREM_STOP', 1.00))
         target = float(getattr(config, 'PHANTOM_PREM_TARGET', 0.50))
         reason = None
