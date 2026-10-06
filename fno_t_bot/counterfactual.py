@@ -53,6 +53,26 @@ try:
 except Exception:                       # imported before options_bot is ready
     bs_price = round_trip_costs = IST = None
 
+def _late(name):
+    """Resolve a name from options_bot at CALL time, not import time.
+
+    options_bot imports these shadow modules at its line ~43, long before it
+    defines round_trip_costs (line ~74) and IST (line ~65) -- so the
+    module-level `from options_bot import ...` silently bound None in every
+    one of them. Oct 6 2026 was the proof: phantom rows carried naive
+    timestamps and `costs: 0.0`, which overstated every phantom P&L by the
+    whole four-leg commission. Resolving on first use closes the cycle.
+    """
+    g = globals()
+    if g.get(name) is None:
+        try:
+            import options_bot as _ob
+            g[name] = getattr(_ob, name, None)
+        except Exception:
+            pass
+    return g.get(name)
+
+
 
 def _log_dir() -> str:
     return getattr(config, 'LOG_DIRECTORY', 'logs')

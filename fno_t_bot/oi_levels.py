@@ -52,6 +52,26 @@ try:
 except Exception:
     IST = None
 
+def _late(name):
+    """Resolve a name from options_bot at CALL time, not import time.
+
+    options_bot imports these shadow modules at its line ~43, long before it
+    defines round_trip_costs (line ~74) and IST (line ~65) -- so the
+    module-level `from options_bot import ...` silently bound None in every
+    one of them. Oct 6 2026 was the proof: phantom rows carried naive
+    timestamps and `costs: 0.0`, which overstated every phantom P&L by the
+    whole four-leg commission. Resolving on first use closes the cycle.
+    """
+    g = globals()
+    if g.get(name) is None:
+        try:
+            import options_bot as _ob
+            g[name] = getattr(_ob, name, None)
+        except Exception:
+            pass
+    return g.get(name)
+
+
 
 def _log_dir() -> str:
     return getattr(config, 'LOG_DIRECTORY', 'logs')
@@ -163,7 +183,7 @@ def update(bot, oc: dict, spot: float) -> dict | None:
         if not lv:
             return None
         bot._oi_lv_prev = lv
-        now = datetime.now(IST) if IST else datetime.now()
+        now = datetime.now(_late('IST')) if _late('IST') else datetime.now()
         every = int(getattr(config, 'OI_LEVELS_LOG_EVERY_MIN', 5))
         last = getattr(bot, '_oi_lv_logged', None)
         if last is None or (now - last).total_seconds() >= every * 60:

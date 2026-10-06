@@ -64,6 +64,26 @@ try:
 except Exception:                      # imported before options_bot is ready
     round_trip_costs = IST = None
 
+def _late(name):
+    """Resolve a name from options_bot at CALL time, not import time.
+
+    options_bot imports these shadow modules at its line ~43, long before it
+    defines round_trip_costs (line ~74) and IST (line ~65) -- so the
+    module-level `from options_bot import ...` silently bound None in every
+    one of them. Oct 6 2026 was the proof: phantom rows carried naive
+    timestamps and `costs: 0.0`, which overstated every phantom P&L by the
+    whole four-leg commission. Resolving on first use closes the cycle.
+    """
+    g = globals()
+    if g.get(name) is None:
+        try:
+            import options_bot as _ob
+            g[name] = getattr(_ob, name, None)
+        except Exception:
+            pass
+    return g.get(name)
+
+
 
 def _log_dir() -> str:
     return getattr(config, 'LOG_DIRECTORY', 'logs')
@@ -191,7 +211,7 @@ def open_book(bot, index_px: float, hv: float) -> None:
             return
         if getattr(bot, '_pprem_open', None) or getattr(bot, '_pprem_done', False):
             return
-        now = datetime.now(IST)
+        now = datetime.now(_late('IST'))
         if now.strftime('%H:%M') < str(getattr(config, 'PHANTOM_PREM_TIME', '10:00')):
             return
 
@@ -244,7 +264,7 @@ def mark(bot, index_px: float, hv: float, force_close: bool = False) -> None:
         pos = getattr(bot, '_pprem_open', None)
         if not pos:
             return
-        now  = datetime.now(IST)
+        now  = datetime.now(_late('IST'))
         legs = [('short', 'CALL', pos['strikes']['short_CALL']),
                 ('short', 'PUT',  pos['strikes']['short_PUT']),
                 ('long',  'CALL', pos['strikes']['long_CALL']),
@@ -291,11 +311,12 @@ def mark(bot, index_px: float, hv: float, force_close: bool = False) -> None:
             return
 
         costs = 0.0                      # four legs, each a round trip
-        if round_trip_costs:
+        _rtc = _late('round_trip_costs')
+        if _rtc:
             for r, t, _ in legs:
                 e = pos['entry_px'][f'{r}_{t}']
                 x = px[(r, t)] if px else e
-                costs += round_trip_costs(e, x, pos['qty'])
+                costs += _rtc(e, x, pos['qty'])
         pnl_net = pnl_unit * pos['qty'] - costs
 
         _write(pos['instrument'], dict(

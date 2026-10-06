@@ -68,6 +68,26 @@ try:
 except Exception:
     IST = None
 
+def _late(name):
+    """Resolve a name from options_bot at CALL time, not import time.
+
+    options_bot imports these shadow modules at its line ~43, long before it
+    defines round_trip_costs (line ~74) and IST (line ~65) -- so the
+    module-level `from options_bot import ...` silently bound None in every
+    one of them. Oct 6 2026 was the proof: phantom rows carried naive
+    timestamps and `costs: 0.0`, which overstated every phantom P&L by the
+    whole four-leg commission. Resolving on first use closes the cycle.
+    """
+    g = globals()
+    if g.get(name) is None:
+        try:
+            import options_bot as _ob
+            g[name] = getattr(_ob, name, None)
+        except Exception:
+            pass
+    return g.get(name)
+
+
 # Fields worth keeping if the broker returns them. Anything not listed is
 # dropped to keep the file small; anything listed but absent is simply absent.
 _KEEP = ('lp', 'bid', 'ask', 'bid_size', 'ask_size', 'spread', 'volume', 'v',
@@ -98,7 +118,7 @@ def _futures(instrument: str) -> list:
     pre = _FUT_PREFIX.get(instrument)
     if not pre:
         return []
-    now = datetime.now(IST) if IST else datetime.now()
+    now = datetime.now(_late('IST')) if _late('IST') else datetime.now()
     out = []
     y, m = now.year, now.month
     for lbl in ('fut_near', 'fut_next'):
@@ -139,7 +159,7 @@ def record(bot, spot: float, oc: dict | None = None) -> None:
             return
         if not bot.fyers or not spot or spot <= 0:
             return
-        now = datetime.now(IST) if IST else datetime.now()
+        now = datetime.now(_late('IST')) if _late('IST') else datetime.now()
         every = int(getattr(config, 'PREMIUM_REC_EVERY_MIN', 5))
         last = getattr(bot, '_premrec_last', None)
         if last is not None and (now - last).total_seconds() < every * 60:
@@ -155,16 +175,45 @@ def record(bot, spot: float, oc: dict | None = None) -> None:
         # cheaper than one call per contract.
         quotes = {}
         probe = None
+        failed = []
         CH = int(getattr(config, 'PREMIUM_REC_BATCH', 25))
-        for i in range(0, len(syms), CH):
-            chunk = syms[i:i + CH]
+
+        def _ask(chunk):
+            """Fetch one chunk. Returns the rows, or None if the call failed.
+
+            Oct 6 2026: NIFTY lost a 65-minute window and BANKNIFTY a
+            136-minute one, while oi_levels -- called on the very next line of
+            the same loop -- logged 75 snapshots with no gaps at all. The
+            failure was inside here and completely silent, because a bad chunk
+            just hit `continue`. A single unquotable symbol (a rolled futures
+            month, an illiquid wing) takes the whole batch down with it, so a
+            failed chunk is now retried symbol-by-symbol and whatever does
+            fail is logged rather than vanishing.
+            """
             try:
                 r = bot.fyers.quotes({'symbols': ','.join(chunk)})
-            except Exception:
-                continue
+            except Exception as exc:
+                return None, str(exc)[:80]
             if not isinstance(r, dict) or r.get('s') != 'ok':
-                continue
-            for row in (r.get('d') or []):
+                return None, str((r or {}).get('message'))[:80]
+            return (r.get('d') or []), None
+
+        for i in range(0, len(syms), CH):
+            chunk = syms[i:i + CH]
+            rowset, err = _ask(chunk)
+            if rowset is None and len(chunk) > 1:
+                # one poisoned symbol should not cost us the other twenty
+                rowset = []
+                for one in chunk:
+                    sub, suberr = _ask([one])
+                    if sub:
+                        rowset += sub
+                    else:
+                        failed.append(one)
+            elif rowset is None:
+                failed.append(chunk[0])
+                rowset = []
+            for row in rowset:
                 nm = row.get('n') or row.get('symbol')
                 v = row.get('v')
                 if nm and isinstance(v, dict):
@@ -179,7 +228,16 @@ def record(bot, spot: float, oc: dict | None = None) -> None:
                     # cost of one extra dict per day.
                     if probe is None:
                         probe = {'symbol': nm, 'raw': v}
+        if failed:
+            bot.logger.info(
+                f"  [PREM-REC] {bot.instrument}: {len(failed)} symbol(s) would "
+                f"not quote, recorded the rest — {', '.join(failed[:4])}"
+            )
         if not quotes:
+            bot.logger.info(
+                f"  [PREM-REC] {bot.instrument}: NO symbol quoted this "
+                f"snapshot — archive gap. Tried {len(syms)}."
+            )
             return
 
         # Open interest comes from the CHAIN, not from quotes(): the Oct 5
