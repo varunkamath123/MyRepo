@@ -1,0 +1,13 @@
+[Unit]
+Description=FnO_T_Bot India overnight strategy: %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tradingbot
+WorkingDirectory=/opt/trading_bot/live_bot
+ExecStart=/opt/trading_bot/venv/bin/python3 overnight_india.py %i
+TimeoutStartSec=3h
+StandardOutput=journal
+StandardError=journal
