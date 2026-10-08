@@ -27,19 +27,27 @@ NSE_HOLIDAYS_2025 = [
     date(2025, 12, 25),  # Christmas Day
 ]
 
-# ─── NSE Trading Holidays 2026 (Verify before use!) ───────────────────────────
-# Source: NSE circular. Update this list from nseindia.com each year.
-# !! Dates marked (approx) must be verified at nseindia.com/resources/exchange-communication-holidays
+# ─── NSE Trading Holidays 2026 ────────────────────────────────────────────────
+# Source: NSE circular NSE/FAOP/71777 (Dec 12 2025), weekday holidays only.
+# Replaced Oct 7 2026: the earlier list guessed Dussehra = Oct 9 and Diwali = Nov 9
+# (both wrong, so the bots would have skipped a real trading day) and omitted five
+# holidays. Weekend holidays (Feb 15, Mar 21, Aug 15, Nov 8) need no entry.
 NSE_HOLIDAYS_2026 = [
-    date(2026, 1, 26),   # Republic Day (Monday) ✓
-    date(2026, 3,  3),   # Holi ✓ (confirmed — market was closed)
-    date(2026, 4,  3),   # Good Friday ✓ (Easter Sunday = Apr 5, 2026)
-    date(2026, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti ✓
-    date(2026, 5,  1),   # Maharashtra Day ✓
-    date(2026, 10, 2),   # Gandhi Jayanti ✓
-    date(2026, 10, 9),   # Dussehra (approx — verify at NSE)
-    date(2026, 11, 9),   # Diwali (approx — verify at NSE)
-    date(2026, 12, 25),  # Christmas Day ✓
+    date(2026, 1, 26),   # Republic Day
+    date(2026, 3,  3),   # Holi
+    date(2026, 3, 26),   # Shri Ram Navami
+    date(2026, 3, 31),   # Shri Mahavir Jayanti
+    date(2026, 4,  3),   # Good Friday
+    date(2026, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
+    date(2026, 5,  1),   # Maharashtra Day
+    date(2026, 5, 28),   # Bakri Id
+    date(2026, 6, 26),   # Muharram
+    date(2026, 9, 14),   # Ganesh Chaturthi
+    date(2026, 10, 2),   # Mahatma Gandhi Jayanti
+    date(2026, 10, 20),  # Dussehra
+    date(2026, 11, 10),  # Diwali-Balipratipada
+    date(2026, 11, 24),  # Prakash Gurpurb Sri Guru Nanak Dev
+    date(2026, 12, 25),  # Christmas
 ]
 
 ALL_HOLIDAYS = set(NSE_HOLIDAYS_2025 + NSE_HOLIDAYS_2026)
