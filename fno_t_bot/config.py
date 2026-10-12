@@ -51,7 +51,7 @@ INSTRUMENTS = {
         'monthly_expiry_only': False,     # NIFTY has weekly Tuesday expiries (not monthly-only)
                                           # Fyers compact format: NSE:NIFTY266DD[strike]CE
                                           # Confirmed Jun 2026: fills land on weekly Tue contracts
-        'capital'            : 26000,     # ₹26k — unified bot (ORB 09:30–11:00 + main 11:00–14:30)
+        'capital'            : 100000,     # ₹26k — unified bot (ORB 09:30–11:00 + main 11:00–14:30)
     },
     'BANKNIFTY': {
         'index_symbol'       : 'NSE:NIFTYBANK-INDEX',
@@ -62,7 +62,7 @@ INSTRUMENTS = {
         'monthly_expiry_only': True,      # SEBI Nov 2023: NSE dropped BANKNIFTY weeklies
                                           # Only monthly expiry (last Tue of month) is valid
         'skip_monday_before_expiry': True, # Mon before last-Tue rolls DTE to ~29 — wrong option
-        'capital'            : 26000,     # ₹26k — unified bot (ORB 09:30–11:00 + main 11:00–14:30)
+        'capital'            : 100000,     # ₹26k — unified bot (ORB 09:30–11:00 + main 11:00–14:30)
     },
     'SENSEX': {
         'index_symbol'  : 'BSE:SENSEX-INDEX',
@@ -77,10 +77,20 @@ INSTRUMENTS = {
                                      # Jul 17 = Friday) → Fyers errmsg → LTP None → every
                                      # SENSEX weekly-contract live order aborted (Jul 9), and
                                      # position monitoring was blind (May 4 -52% overrun).
-        'capital'       : 26000,     # Live capital — same allocation as NIFTY/BNF (May 2026)
+        'capital'       : 100000,     # Live capital — same allocation as NIFTY/BNF (May 2026)
     },
 }
-TOTAL_CAPITAL   = 78000     # ₹78,000 — ₹26k NIFTY + ₹26k BANKNIFTY + ₹26k SENSEX (all live)
+TOTAL_CAPITAL   = 300000    # RAISED Oct 12 2026 (user direction): Rs1L per index.
+# Rs26k could not express any structure: one SENSEX lot was 45% of the book,
+# and a 4-leg fly's fixed commission ran 2-3x the intraday theta it collected
+# (Oct 6-12: 8 structures, every one net negative after costs). At Rs1L the
+# fixed per-order cost amortises over 4-10x the size, which makes structures
+# MEASURABLE that previously could not clear their own brokerage.
+# IT DOES NOT CREATE AN EDGE. A null signal at 4 lots is still null -- it just
+# reaches its verdict four times faster. Two caps still bind and were left
+# alone deliberately: DYN_MAX_LOTS_LADDER tops out at 4 lots, and
+# REGIME_CHOPPY_LOTS_CAP forces 1 lot in CHOPPY regime -- which is what most
+# recent entries logged. Raise those only as separate, argued decisions.
 INITIAL_CAPITAL = TOTAL_CAPITAL  # backward-compat for bot.py backtest
 
 # ─── Per-Instrument Strategy Overrides (used by variant vX) ──────────────────
@@ -101,7 +111,7 @@ INSTRUMENT_STRATEGY = {
     #   - Tuesday: confirmed danger zone (v7 data: 31.2% WR, -₹3,472)
     'NIFTY': {
         'live_mode'     : True,   # LIVE — real orders via Fyers
-        'capital'       : 26000,  # ₹26k — unified bot (ORB + main session)
+        'capital'       : 100000,  # ₹26k — unified bot (ORB + main session)
         'skip_tuesday'  : True,
         'skip_thursday' : False,  # Thu 60% WR, +₹3,258 — keep
         'call_adx_min': 30,     # Confirmed: ADX 25-29 CALL entries whipsaw and stop out
@@ -162,7 +172,7 @@ INSTRUMENT_STRATEGY = {
     'BANKNIFTY': {
         'live_mode'     : True,   # INTENDED live — actual mode gated by capital_gate.py
                                   # (LIVE only when combined capital >= CAPITAL_GATE_BNF_LIVE=50k)
-        'capital'       : 26000,  # ₹26k — unified bot (ORB + main session)
+        'capital'       : 100000,  # ₹26k — unified bot (ORB + main session)
         'skip_tuesday'  : True,
         'skip_thursday' : False,
         'call_adx_min': 30,     # Confirmed 60% WR — maintain this threshold
@@ -210,7 +220,7 @@ INSTRUMENT_STRATEGY = {
     'SENSEX': {
         'live_mode'     : False,  # Overridden LIVE by FORCE_SENSEX_LIVE=True (May 2026)
                                   # capital_gate.py honours FORCE_SENSEX_LIVE before threshold check
-        'capital'       : 26000,  # Live capital — ₹26k matching NIFTY/BNF allocation
+        'capital'       : 100000,  # Live capital — ₹26k matching NIFTY/BNF allocation
         'skip_tuesday'  : True,
         'skip_thursday' : False,  # Blanket block removed May 2026 — scoring gates handle quality
         'call_adx_min': 25,     # CALL WR 61.5% — standard threshold fine
