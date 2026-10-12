@@ -120,6 +120,57 @@ ck('alternate is None for a monthly symbol',
    alt_month_symbol('NSE:BANKNIFTY26OCT22850PE'), None)
 
 print('=' * 74)
+print('\n--- weekly expiry must never land on an UNLISTED contract (Oct 12 2026) ---')
+# SEBI lists only ONE weekly per index. Walking forward to the NEXT target
+# weekday when the nearest is inside MIN_DAYS_TO_EXPIRY produced a symbol that
+# does not exist: on Mon Oct 12 2026 it asked for the Oct 20 NIFTY weekly,
+# which returned no quote, so NIFTY could not trade at all and the premium
+# archive wrote 74 snapshots with zero legs.
+import datetime as _dt
+from unittest import mock as _mock
+
+
+def _expiry_on(day, instrument='NIFTY', min_days=2):
+    """get_next_expiry as if today were `day`."""
+    import fyers_orders as _fo
+    import config
+    _old = config.MIN_DAYS_TO_EXPIRY
+    config.MIN_DAYS_TO_EXPIRY = min_days
+
+    class _FakeDT(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _dt.datetime(day.year, day.month, day.day, 10, 0,
+                                tzinfo=getattr(_fo, 'IST', None))
+    try:
+        with _mock.patch.object(_fo, 'datetime', _FakeDT):
+            return _fo.get_next_expiry(instrument)
+    finally:
+        config.MIN_DAYS_TO_EXPIRY = _old
+
+
+# NIFTY expiry weekday is Tuesday.
+mon = _dt.date(2026, 10, 12)      # Monday, expiry Tue Oct 13 -> only 1 DTE
+e = _expiry_on(mon)
+ck('Monday before expiry does NOT return the unlisted Oct 20 weekly',
+   e == _dt.date(2026, 10, 20), False)
+ck('it returns the Oct 27 MONTHLY instead', e, _dt.date(2026, 10, 27))
+ck('and that expiry clears MIN_DAYS_TO_EXPIRY', (e - mon).days >= 2, True)
+
+wed = _dt.date(2026, 10, 7)       # Wednesday, next Tue Oct 13 is 6 days out
+e2 = _expiry_on(wed)
+ck('a normal day still takes the nearest weekly', e2, _dt.date(2026, 10, 13))
+
+tue = _dt.date(2026, 10, 13)      # expiry day itself -> 0 DTE
+e3 = _expiry_on(tue)
+ck('expiry day itself never returns today', e3 > tue, True)
+ck('expiry day does not return the unlisted next weekly',
+   e3 == _dt.date(2026, 10, 20), False)
+
+e4 = _expiry_on(_dt.date(2026, 10, 12), min_days=1)
+ck('with min_days=1 the nearest weekly IS usable', e4, _dt.date(2026, 10, 13))
+
+
 print(f'RESULT: {P} passed, {F} failed')
 print('=' * 74)
 sys.exit(1 if F else 0)

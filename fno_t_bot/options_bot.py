@@ -3008,6 +3008,7 @@ class TradingBot:
             'trend_leg_atr'    : signal.get('trend_leg_atr'),
             'session_move_pct' : signal.get('session_move_pct'),
             'session_rng_atr'  : signal.get('session_rng_atr'),
+            'rev_chase'        : signal.get('rev_chase'),
             'rev_score'        : signal.get('rev_score'),
             'rev_mp_dist'      : signal.get('rev_mp_dist'),
             'rev_di_spread'    : signal.get('rev_di_spread'),
@@ -3525,6 +3526,7 @@ class TradingBot:
                     'trend_leg_atr'    : pos.get('trend_leg_atr'),
                     'session_move_pct' : pos.get('session_move_pct'),
                     'session_rng_atr'  : pos.get('session_rng_atr'),
+                    'rev_chase'        : pos.get('rev_chase'),
                     'rev_score'        : pos.get('rev_score'),
                     'rev_mp_dist'      : pos.get('rev_mp_dist'),
                     'rev_di_spread'    : pos.get('rev_di_spread'),
@@ -3860,30 +3862,36 @@ class TradingBot:
         # Monotone. 0.40 keeps the whole winning cluster and cuts the tail.
         # NOTE the P&L above except the last two is Black-Scholes-priced
         # (pre Aug 18 fix), so treat the RANKING as the signal, not the rupees.
+        # Computed unconditionally and carried on the signal. Until Oct 12 2026
+        # rev_chase was recorded ONLY when it blocked a signal, so the revert
+        # trigger pre-registered with the Oct 5 raise -- "revert to 0.40 if the
+        # 0.40-0.70 band goes net negative" -- could not be evaluated: the
+        # three REV losses of Oct 9-12 can neither be attributed to the raise
+        # nor cleared of it, because nothing recorded where in the band they
+        # sat. A trigger that cannot be measured is not a trigger.
+        _rev_chase = None
         _max_chase = getattr(config, 'PATH_REV_MAX_CHASE', 0.40)
-        if _max_chase > 0:
-            _td_rev = df[df.index.date == df.index[-1].date()]
-            if len(_td_rev) > 0:
-                _d_hi = float(_td_rev['High'].max()); _d_lo = float(_td_rev['Low'].min())
-                if _d_hi > _d_lo:
-                    _rp = (_px - _d_lo) / (_d_hi - _d_lo)
-                    _rev_chase = _rp if rev_dir == 'CALL' else (1.0 - _rp)
-                    if _rev_chase > _max_chase:
-                        self.logger.info(
-                            f"  [PATH-REV] {self.instrument} {rev_dir}: entry "
-                            f"{_rev_chase:.3f} into the reversal > {_max_chase} "
-                            f"— the turn is already {_rev_chase*100:.0f}% done, skipped"
-                        )
-                        try:
-                            counterfactual.record(
-                                self, rev_dir, float(_px), 'REV_CHASE',
-                                f'rev chase {_rev_chase:.3f} > {_max_chase}',
-                                float(df['HV'].iloc[-1]),
-                                extra=dict(rev_chase=round(_rev_chase, 3),
-                                           path='REV'))
-                        except Exception:
-                            pass
-                        return None
+        _td_rev = df[df.index.date == df.index[-1].date()]
+        if len(_td_rev) > 0:
+            _d_hi = float(_td_rev['High'].max()); _d_lo = float(_td_rev['Low'].min())
+            if _d_hi > _d_lo:
+                _rp = (_px - _d_lo) / (_d_hi - _d_lo)
+                _rev_chase = _rp if rev_dir == 'CALL' else (1.0 - _rp)
+        if _max_chase > 0 and _rev_chase is not None and _rev_chase > _max_chase:
+            self.logger.info(
+                f"  [PATH-REV] {self.instrument} {rev_dir}: entry "
+                f"{_rev_chase:.3f} into the reversal > {_max_chase} "
+                f"— the turn is already {_rev_chase*100:.0f}% done, skipped"
+            )
+            try:
+                counterfactual.record(
+                    self, rev_dir, float(_px), 'REV_CHASE',
+                    f'rev chase {_rev_chase:.3f} > {_max_chase}',
+                    float(df['HV'].iloc[-1]),
+                    extra=dict(rev_chase=round(_rev_chase, 3), path='REV'))
+            except Exception:
+                pass
+            return None
 
         # ── Score gate ────────────────────────────────────────────────────────
         _min_score = getattr(config, 'PATH_REV_MIN_SCORE', 3)
@@ -3911,6 +3919,8 @@ class TradingBot:
             # outcome later, not just the total. The open question is whether a
             # 3 that includes MaxPain beats a 3 built purely from the redundant
             # trend-fade pair.
+            'rev_chase'      : (round(_rev_chase, 3)
+                                if _rev_chase is not None else None),
             'rev_score'      : score,
             'rev_mp_dist'    : (round(_mp_dist, 5) if _mp_dist is not None else None),
             'rev_di_spread'  : round(_cur_spread, 2),

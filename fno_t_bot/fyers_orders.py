@@ -58,13 +58,37 @@ def get_next_expiry(instrument: str) -> date:
                 return expiry
         raise RuntimeError(f"Could not find valid monthly expiry for {instrument}")
 
-    # Weekly mode: walk forward up to 2 weeks
-    check = today
-    for _ in range(14):
-        if check.weekday() == target_wday:
-            if (check - today).days >= min_days:
-                return check
-        check += timedelta(days=1)
+    # Weekly mode. SEBI's single-weekly-expiry rule means only ONE weekly
+    # contract per index is listed at a time -- the nearest one. So "walk
+    # forward to the next target weekday" is wrong whenever the nearest weekly
+    # falls inside min_days: it lands on a contract that does not exist.
+    #
+    # Oct 12 2026 (Monday; NIFTY expiry Tuesday Oct 13) is the proof. With
+    # min_days=2 this returned Oct 20, and:
+    #     Oct 13 weekly   lp = 80.80      <- listed
+    #     Oct 20 weekly   NOT QUOTED      <- does not exist
+    #     Oct 27 monthly  lp = 241.05     <- listed
+    # NIFTY could not quote a single option: no trades all session, and the
+    # premium archive wrote 74 snapshots containing zero legs. Silent until
+    # the per-symbol failure logging added Oct 6 surfaced it, and it would
+    # recur every Monday before a Tuesday expiry -- one session in five.
+    #
+    # The monthly is always listed, so that is the correct fallback rather
+    # than a weekly a further week out.
+    nearest = today
+    while nearest.weekday() != target_wday:
+        nearest += timedelta(days=1)
+    if (nearest - today).days >= min_days:
+        return nearest
+
+    for month_offset in range(3):
+        raw_month = today.month + month_offset
+        yr  = today.year + (raw_month - 1) // 12
+        mon = ((raw_month - 1) % 12) + 1
+        last_day = date(yr, mon, _cal.monthrange(yr, mon)[1])
+        monthly  = last_day - timedelta(days=(last_day.weekday() - target_wday) % 7)
+        if (monthly - today).days >= min_days:
+            return monthly
 
     raise RuntimeError(f"Could not find valid expiry for {instrument}")
 
