@@ -1924,6 +1924,49 @@ PREMIUM_REC_EXTRA = {
     'SENSEX':    [],
 }
 
+# --- Shadow engine: ADX + VIX + OI + PCR (Oct 13 2026) ---------------------
+# LOGS ONLY. No orders, no phantom positions, no API calls of its own -- the
+# premium archive already records ATM +/-4 every 5 min, so the evaluator prices
+# these signals offline by joining the two files. Cannot touch the live book.
+#
+# HONEST PRIOR: each of these four inputs has already tested null.
+#   OI/PCR drift     642 obs  47.4% right  -0.025%
+#   MaxPain pull     666 obs  49.7%        +0.010%
+#   OI walls as S/R  n=10-63  ~51%, NIFTY and BNF opposite signs
+#   ADX->retracement 1,664    rho -0.058
+#   ADX as a gate    is what REV/TREND already use: p=0.663 / p=0.412
+#   VIX level        IV *level* predicts nothing (p=0.116); the ratio does
+# And the only conjunction tested so far (MACD+OI+price, "all three agree") was
+# the WORST of the group: 45.5% vs a 50.8% base rate, both halves negative.
+# What is untested is these four as a JOINT rule. Shadow costs nothing.
+#
+# Four components each vote -1/0/+1; VIX is a regime filter, not a vote.
+# Fires when |score| >= SHADOW_QUAD_FIRE_THRESHOLD and VIX is inside the band.
+#
+# EVERY evaluation is logged with the component votes AND the raw inputs, not
+# just the bars where it fires. One dataset then answers any threshold, any
+# subset of components, any cutoff -- OFFLINE. That is deliberate: live
+# sweeping is how 3,072 variants got tried and cost 9 permanently unreachable
+# confidence points.
+#
+# PRE-REGISTERED (written before any data exists, see REBUILD_PLAN.md):
+#   Hypothesis  at threshold 3, the signalled direction beats that
+#               instrument's own base rate in BOTH chronological halves.
+#   Kill        after 30 sessions, if the hit rate sits inside base rate +/-3pp
+#               or flips sign between halves, this engine is dead and that goes
+#               into REBUILD_PLAN.md. A threshold sweep afterwards does not
+#               rescue it -- the sweep IS the failure mode.
+SHADOW_QUAD_ENABLED        = True
+SHADOW_QUAD_LOG_EVERY_MIN  = 5
+SHADOW_QUAD_FIRE_THRESHOLD = 3      # of 4 components agreeing
+SHADOW_QUAD_ADX_FLOOR      = 20     # below this the ADX component abstains
+SHADOW_QUAD_DI_SPREAD      = 8      # DI dominance needed for a direction vote
+SHADOW_QUAD_PCR_BULL       = 1.10   # put writing -> writers defend downside
+SHADOW_QUAD_PCR_BEAR       = 0.90   # call writing -> writers defend upside
+SHADOW_QUAD_MP_MIN_DIST    = 0.20   # % of spot; inside this MaxPain abstains
+SHADOW_QUAD_VIX_MIN        = 11
+SHADOW_QUAD_VIX_MAX        = 22
+
 PHANTOM_PREMIUM_ENABLED  = True
 PHANTOM_PREM_TIME        = '10:00'   # same moment the live entry window opens
 PHANTOM_PREM_WING_GAPS   = 2         # wings this many strikes out (defines risk)
