@@ -1981,8 +1981,27 @@ PAPER_REQUIRE_REAL_LTP = True
 
 COUNTERFACTUAL_ENABLED = True
 
-CHALLENGER_MODE        = 'SPREAD'   # 'SPREAD' | 'STRIKE' (legacy OTM study)
-CHALLENGER_SPREAD_GAPS = 2          # short leg this many strikes further OTM
+# CHALLENGER REMOVED Oct 13 2026. It ran for roughly two months in SPREAD mode
+# and closed ZERO trades, so the structural A/B it existed to run never
+# actually ran: n=0, no P&L, nothing learned. Code was deleted rather than
+# flag-gated, because the vX path already taught that lesson -- it sat first
+# in the dispatch cascade, reachable only because another flag routed there,
+# 0 trades in four months, and its only possible effect was to pre-empt a
+# working engine.
+#
+# What it was: a shadow book taking the same signal as the Champion with a
+# different strike (OI-guided OTM) or structure (debit spread, short leg
+# CHALLENGER_SPREAD_GAPS further out), to A/B strike selection.
+#
+# Why it produced nothing is itself worth knowing before rebuilding it: it was
+# gated on the Champion actually opening a position first (fixed Sep 13 2026
+# after it was found bypassing the rv_iv gate), and the Champion opened 41
+# positions in 22 sessions -- then the spread's own MIN_OPTION_PRICE and
+# net-credit floors rejected what was left. Any future structural A/B should
+# be driven off the signal, not off the Champion's fill.
+#
+# Kept deliberately: the `if 'challenger' in f: continue` filters in the
+# research scripts, so no analysis can ever read a stale challenger file.
 
 PATH_MR_SHADOW_ENABLED = True
 

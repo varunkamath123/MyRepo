@@ -72,7 +72,6 @@ IST = pytz.timezone('Asia/Kolkata')
 # force-close at 14:30. Cap entries at 13:00 regardless of instrument's vX end time.
 _PATH_F_END = dtime(*map(int, config.PATH_F_ENTRY_END.split(':')))
 
-
 # ─── Transaction cost helper ─────────────────────────────────────────────────
 
 def round_trip_costs(entry_price: float, exit_price: float,
@@ -90,7 +89,6 @@ def round_trip_costs(entry_price: float, exit_price: float,
 
     return brokerage + exchange + sebi + gst + stt + stamp
 
-
 # ─── Black-Scholes (paper mode pricing) ─────────────────────────────────────
 
 def bs_price(option_type: str, S: float, K: float,
@@ -103,7 +101,6 @@ def bs_price(option_type: str, S: float, K: float,
     if option_type == 'CALL':
         return float(S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2))
     return float(K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1))
-
 
 def bs_delta(option_type: str, S: float, K: float,
              T: float, sigma: float) -> float | None:
@@ -119,7 +116,6 @@ def bs_delta(option_type: str, S: float, K: float,
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     nd1 = float(norm.cdf(d1))
     return nd1 if option_type == 'CALL' else nd1 - 1.0
-
 
 # ─── Bot ─────────────────────────────────────────────────────────────────────
 
@@ -185,15 +181,6 @@ class TradingBot:
         self._regime_date          = None      # date when regime was last detected
         self._quality_state        = 'NORMAL'  # NORMAL / REDUCED
         self._quality_consecutive_wins = 0
-
-        # ── Challenger (shadow OI-guided strategy) state ──────────────────────
-        # Champion  = current live strategy (ATM strike, vX fresh-crossover only)
-        # Challenger = same signal, OI-guided strike; no real orders; logs shadow P&L
-        self.challenger_positions    = []
-        self.challenger_trade_log    = []
-        self.challenger_daily_pnl    = 0.0
-        self.challenger_total_pnl    = 0.0
-        self.challenger_trades_today = 0
 
         # ── OI Zones (pre-session support/resistance context) ─────────────────
         # Loaded from data/oi_zones/latest_{instrument}.json (written by
@@ -2478,72 +2465,6 @@ class TradingBot:
 
     # ── Challenger: OI-guided strike selection ────────────────────────────────
 
-    _CHALLENGER_MIN_OI = 50_000   # minimum OI for an OTM strike to be considered liquid
-
-    def select_challenger_strike(self, signal_type: str,
-                                  underlying: float, oc: dict) -> int:
-        """
-        OI-guided strike selection for Challenger shadow strategy.
-
-        Evaluates up to 3 strikes in the OTM direction from ATM:
-          CALL: ATM, ATM+1×gap, ATM+2×gap
-          PUT : ATM, ATM-1×gap, ATM-2×gap
-
-        Scoring per candidate (higher = better):
-          iv_discount : atm_iv - strike_iv  (positive = cheaper than ATM = undervalued)
-          mp_bonus    : +0.5 if strike is on the favourable side of max_pain
-                        (CALL ≤ max_pain or PUT ≥ max_pain → price gravity helps)
-
-        OTM strikes with OI < _CHALLENGER_MIN_OI are skipped (illiquid).
-        ATM is always kept as fallback (score = mp_bonus only, iv_discount = 0).
-        Falls back to ATM when no option-chain data is available.
-        """
-        atm_strike   = int(round(underlying / self.strike_gap) * self.strike_gap)
-        strikes_data = oc.get('strikes', {})
-        atm_iv       = oc.get('atm_iv') or 0.0
-        max_pain     = oc.get('max_pain')
-
-        if signal_type == 'CALL':
-            candidates = [atm_strike + n * self.strike_gap for n in range(3)]
-        else:
-            candidates = [atm_strike - n * self.strike_gap for n in range(3)]
-
-        best_strike = atm_strike
-        best_score  = -999.0
-
-        for cand in candidates:
-            sdata = strikes_data.get(cand, {})
-            if signal_type == 'CALL':
-                oi = sdata.get('call_oi', 0)
-                iv = sdata.get('call_iv', atm_iv)
-            else:
-                oi = sdata.get('put_oi', 0)
-                iv = sdata.get('put_iv', atm_iv)
-
-            # Skip illiquid OTM strikes; ATM always eligible
-            if oi < self._CHALLENGER_MIN_OI and cand != atm_strike:
-                continue
-
-            # IV discount: lower IV than ATM = undervalued (positive = good)
-            iv_discount = (atm_iv - iv) if atm_iv else 0.0
-
-            # Max-pain alignment: price gravitates toward max_pain near expiry
-            mp_bonus = 0.0
-            if max_pain:
-                if signal_type == 'CALL' and cand <= max_pain:
-                    mp_bonus = 0.5   # CALL strike at/below max pain — gravity pulls price here
-                elif signal_type == 'PUT' and cand >= max_pain:
-                    mp_bonus = 0.5   # PUT strike at/above max pain — gravity helps
-
-            score = iv_discount + mp_bonus
-            if score > best_score:
-                best_score  = score
-                best_strike = cand
-
-        return best_strike
-
-    # ── OI Influence (lot sizing) ─────────────────────────────────────────────
-
     def _oi_adjust_lots(self, signal_type: str, base_lots: int,
                         oc: dict) -> tuple[int, str]:
         """
@@ -3057,7 +2978,9 @@ class TradingBot:
     def _rv_iv_blocked(self, signal: dict, hv: float) -> bool:
         """Shared RV/IV premium-richness gate. See config.RV_IV_GATE_ENABLED.
 
-        Called by BOTH enter_trade and enter_challenger_trade. Until Sep 13 2026
+        Called by enter_trade. (It also guarded the Challenger until that
+        engine was removed Oct 13 2026 for producing zero trades in two
+        months.) Until Sep 13 2026
         the gate lived only inside enter_trade, so a blocked signal still opened
         a Challenger position -- the two books then differed in structure AND in
         gating, and the structural A/B could not be read. Sep 10 NIFTY and
@@ -3130,117 +3053,8 @@ class TradingBot:
                 if ltp and ltp > 0:
                     px, src = float(ltp), 'LTP'
         except Exception as exc:
-            self.logger.debug(f"  [CHALLENGER] quote failed {strike}{opt_type}: {exc}")
+            self.logger.debug(f"  [QUOTE] failed {strike}{opt_type}: {exc}")
         return px, sym, src
-
-    def enter_challenger_trade(self, signal: dict, hv: float,
-                               oc: dict, lots: int = 1) -> None:
-        """
-        Shadow entry for Challenger — no real orders placed.
-
-        Same signal as Champion; OI-guided strike via select_challenger_strike().
-        BS pricing uses hv (same as Champion) with the selected strike, so P&L
-        comparison is a clean A/B: same model, same IV, different strike K.
-        """
-        # NOTE: no gate checks here. The caller only reaches this function when
-        # the Champion actually opened, so every Champion gate already applies.
-        # Re-checking RV/IV here (as it did between Sep 13-16) logged each block
-        # twice and wrote the counterfactual jsonl twice.
-        underlying   = signal['price']
-        atm_strike   = int(round(underlying / self.strike_gap) * self.strike_gap)
-        eff_lot_size = self.lot_size * lots
-        mode         = getattr(config, 'CHALLENGER_MODE', 'STRIKE')
-
-        # Use the Champion's OWN strike so the A/B differs only in STRUCTURE.
-        _otm   = signal.get('otm_strikes', 0)
-        long_k = (atm_strike + _otm * self.strike_gap) if signal['type'] == 'CALL' \
-            else (atm_strike - _otm * self.strike_gap)
-
-        short_k = short_sym = None
-        if mode == 'SPREAD':
-            gaps    = max(int(getattr(config, 'CHALLENGER_SPREAD_GAPS', 2)), 1)
-            short_k = (long_k + gaps * self.strike_gap) if signal['type'] == 'CALL' \
-                else (long_k - gaps * self.strike_gap)
-            ch_strike = long_k
-        else:
-            ch_strike = self.select_challenger_strike(signal['type'], underlying, oc)
-            long_k    = ch_strike
-
-        long_px, long_sym, long_src = self._quote_option(
-            long_k, signal['type'], underlying, hv)
-
-        if mode == 'SPREAD':
-            short_px, short_sym, short_src = self._quote_option(
-                short_k, signal['type'], underlying, hv)
-            # A debit spread's short leg must be cheaper than its long leg. If a
-            # bad quote inverts that, the structure is meaningless -- skip rather
-            # than log a nonsense trade.
-            if short_px >= long_px:
-                self.logger.info(
-                    f"  [CHALLENGER] short leg ₹{short_px:.2f} >= long "
-                    f"₹{long_px:.2f} - bad quote, skipping shadow entry"
-                )
-                return
-            entry_price = long_px - short_px          # net debit
-            _src_tag    = f"{long_src}/{short_src}"
-        else:
-            short_px    = 0.0
-            entry_price = long_px
-            _src_tag    = long_src
-
-        if entry_price < config.MIN_OPTION_PRICE:
-            self.logger.info(
-                f"  [CHALLENGER] net ₹{entry_price:.2f} < min "
-                f"₹{config.MIN_OPTION_PRICE}. Skipping shadow entry."
-            )
-            return
-
-        position = {
-            'type'            : signal['type'],
-            'entry_time'      : datetime.now(IST),
-            'entry_price'     : entry_price,
-            'entry_underlying': underlying,
-            'strike'          : ch_strike,
-            'lot_size'        : eff_lot_size,
-            'hv_at_entry'     : hv,
-            'highest_pnl_pct' : 0.0,
-            'atm_strike'      : atm_strike,   # Champion's strike — for comparison log
-            'mode'            : mode,
-            'long_strike'     : long_k,
-            'short_strike'    : short_k,
-            'long_symbol'     : long_sym,
-            'short_symbol'    : short_sym,
-            'long_entry'      : round(long_px, 2),
-            'short_entry'     : round(short_px, 2),
-            'px_src'          : _src_tag,
-            'width_pts'       : (abs(short_k - long_k) if short_k else None),
-        }
-        self.challenger_positions.append(position)
-        self.challenger_trades_today += 1
-
-        if mode == 'SPREAD':
-            _w  = abs(short_k - long_k)
-            _mx = _w - entry_price                     # max value at expiry
-            self.logger.info(
-                f"  [CHALLENGER] ENTRY {signal['type']:4s} SPREAD | "
-                f"long {long_k} ₹{long_px:.2f} / short {short_k} ₹{short_px:.2f} | "
-                f"net debit ₹{entry_price:.2f} vs Champion naked ₹{long_px:.2f} "
-                f"({100*(1-entry_price/long_px):.0f}% less premium at risk) | "
-                f"width {_w:.0f}pts max ₹{_mx:.2f} ({100*_mx/entry_price:.0f}%) | "
-                f"px={_src_tag} | Trade #{self.challenger_trades_today}"
-            )
-        else:
-            delta_n  = (ch_strike - atm_strike) // self.strike_gap
-            ch_label = f"OTM{delta_n:+d}" if ch_strike != atm_strike else "ATM"
-            self.logger.info(
-                f"  [CHALLENGER] ENTRY {signal['type']:4s} | "
-                f"Strike: {ch_strike} ({ch_label} vs Champion ATM {atm_strike}) | "
-                f"Opt: ₹{entry_price:.2f} | px={_src_tag} | "
-                f"MaxPain={oc.get('max_pain', '?')} | "
-                f"Trade #{self.challenger_trades_today}"
-            )
-
-    # ── Exit Management ───────────────────────────────────────────────────────
 
     def check_exits(self, current_price: float, hv: float,
                     force_close: bool = False,
@@ -3591,110 +3405,6 @@ class TradingBot:
 
         for idx in reversed(to_close):
             self.positions.pop(idx)
-
-    def check_challenger_exits(self, current_price: float, hv: float,
-                               force_close: bool = False) -> None:
-        """
-        Evaluate stops/targets for Challenger shadow positions each cycle.
-
-        Marks to REAL traded premiums, Black-Scholes only as fallback. Until
-        Sep 8 2026 this always used BS while the Champion had moved to live
-        LTPs in August, so the two books were priced by different systems and
-        every "Challenger vs Champion" number was a pricing artefact rather
-        than a strategy result. The Sep 8 SENSEX pair is the clean example:
-        identical strike, same minute, Champion -1.2% on the real quote and
-        Challenger -62.5% on the model.
-        """
-        to_close = []
-        for idx, pos in enumerate(self.challenger_positions):
-            elapsed_days = (
-                datetime.now(IST) - pos['entry_time']
-            ).total_seconds() / 86400
-            T_rem = max(config.DAYS_TO_EXPIRY - elapsed_days, 0.01) / 365
-
-            def _mark(sym, strike):
-                """Live premium for one leg; BS on the same T_rem as fallback."""
-                if sym and self.fyers:
-                    try:
-                        from fyers_orders import get_ltp
-                        _l = get_ltp(self.fyers, sym)
-                        if _l and _l > 0:
-                            return float(_l)
-                    except Exception:
-                        pass
-                return bs_price(pos['type'], current_price, strike, T_rem, hv)
-
-            if pos.get('mode') == 'SPREAD' and pos.get('short_strike'):
-                current_opt = (_mark(pos.get('long_symbol'), pos['long_strike'])
-                               - _mark(pos.get('short_symbol'), pos['short_strike']))
-                current_opt = max(current_opt, 0.01)   # a debit spread cannot go < 0
-            else:
-                current_opt = _mark(pos.get('long_symbol'), pos['strike'])
-
-            pnl_pct = (current_opt - pos['entry_price']) / pos['entry_price']
-            if pnl_pct > pos['highest_pnl_pct']:
-                pos['highest_pnl_pct'] = pnl_pct
-
-            exit_reason = None
-            if force_close:
-                exit_reason = f"EOD Force-Close ({config.FORCE_CLOSE_TIME})"
-            elif pnl_pct <= -config.STOP_LOSS:
-                exit_reason = f"Stop-Loss ({config.STOP_LOSS*100:.0f}%)"
-            elif pnl_pct >= config.BASE_TARGET:
-                exit_reason = f"Target ({config.BASE_TARGET*100:.0f}%)"
-            elif (config.USE_TRAILING_PROFIT
-                  and pos['highest_pnl_pct'] > config.TRAILING_ACTIVATION
-                  and pnl_pct < pos['highest_pnl_pct'] - config.TRAILING_DISTANCE):
-                exit_reason = "Trailing Stop"
-            elif elapsed_days >= config.MAX_HOLDING_DAYS:
-                exit_reason = "Max Hold Period"
-
-            if exit_reason:
-                costs   = round_trip_costs(pos['entry_price'], current_opt, pos['lot_size'])
-                pnl_net = (current_opt - pos['entry_price']) * pos['lot_size'] - costs
-
-                self.challenger_daily_pnl += pnl_net
-                self.challenger_total_pnl += pnl_net
-
-                self.challenger_trade_log.append({
-                    'instrument'  : self.instrument,
-                    'entry_time'  : pos['entry_time'].isoformat(),
-                    'exit_time'   : datetime.now(IST).isoformat(),
-                    'type'        : pos['type'],
-                    'strike'      : pos['strike'],
-                    'atm_strike'  : pos['atm_strike'],
-                    'ch_mode'     : pos.get('mode'),
-                    'long_strike' : pos.get('long_strike'),
-                    'short_strike': pos.get('short_strike'),
-                    'long_entry'  : pos.get('long_entry'),
-                    'short_entry' : pos.get('short_entry'),
-                    'width_pts'   : pos.get('width_pts'),
-                    'px_src'      : pos.get('px_src'),
-                    'entry_price' : round(pos['entry_price'], 2),
-                    'exit_price'  : round(current_opt, 2),
-                    'pnl_pct'     : round(pnl_pct * 100, 2),
-                    'costs'       : round(costs, 2),
-                    'pnl_net'     : round(pnl_net, 2),
-                    'exit_reason' : exit_reason,
-                    'mode'        : 'challenger',
-                })
-                self._save_challenger_trade_log()
-
-                icon  = "✅" if pnl_net > 0 else "❌"
-                delta = self.challenger_total_pnl - self.total_pnl
-                self.logger.info(
-                    f"  {icon} [CHALLENGER] EXIT {pos['type']:4s} | "
-                    f"{exit_reason:28s} | "
-                    f"P&L: ₹{pnl_net:>8,.2f} ({pnl_pct*100:+.1f}%) | "
-                    f"Strike: {pos['strike']} (Champion ATM {pos['atm_strike']}) | "
-                    f"Cumul vs Champion: {'+' if delta >= 0 else ''}₹{delta:,.0f}"
-                )
-                to_close.append(idx)
-
-        for idx in reversed(to_close):
-            self.challenger_positions.pop(idx)
-
-    # ── Utilities ─────────────────────────────────────────────────────────────
 
     def _update_morning_trend(self, df: 'pd.DataFrame') -> None:
         """Track peak ADX and peak |DI+ − DI−| during the ORB window.
@@ -4206,18 +3916,7 @@ class TradingBot:
                     f"Daily P&L: ₹{self.daily_pnl:,.2f} | "
                     f"Total P&L: ₹{self.total_pnl:,.2f}"
                 )
-                # Challenger EOD summary — compare vs Champion for that day
-                if self.challenger_trades_today > 0 or self.challenger_daily_pnl != 0.0:
-                    delta_day   = self.challenger_daily_pnl - self.daily_pnl
-                    delta_total = self.challenger_total_pnl - self.total_pnl
-                    self.logger.info(
-                        f"[DAY END CHALLENGER] {self.instrument} | "
-                        f"Trades: {self.challenger_trades_today} | "
-                        f"Daily P&L: ₹{self.challenger_daily_pnl:,.2f} "
-                        f"({'+' if delta_day >= 0 else ''}{delta_day:,.0f} vs Champion) | "
-                        f"Total P&L: ₹{self.challenger_total_pnl:,.2f} "
-                        f"({'+' if delta_total >= 0 else ''}{delta_total:,.0f} vs Champion)"
-                    )
+
             # ── Near-miss EOD summary (only on no-trade days) ─────────────────
             if self.trades_today == 0 and self._nm_best:
                 nm = self._nm_best
@@ -4242,8 +3941,7 @@ class TradingBot:
             self.current_date            = today
             self.trades_today            = 0
             self.daily_pnl               = 0.0
-            self.challenger_trades_today = 0
-            self.challenger_daily_pnl    = 0.0
+
             self._nm_best_adx            = 0.0     # reset near-miss tracker
             self._nm_best                = {}
             self._nm_pending             = []      # discard any unresolved outcomes
@@ -4454,13 +4152,6 @@ class TradingBot:
             f'daily_pnl=₹{self.daily_pnl:,.2f} | trades_today={self.trades_today}'
         )
 
-    def _save_challenger_trade_log(self) -> None:
-        os.makedirs(config.LOG_DIRECTORY, exist_ok=True)
-        path = os.path.join(config.LOG_DIRECTORY,
-                            f'{config.BOT_NAME}_{self.instrument}_challenger_trades.json')
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(self.challenger_trade_log, f, indent=2)
-
     def _log_status(self, price: float) -> None:
         mode = "LIVE" if self.live else "PAPER"
         self.logger.info(
@@ -4469,16 +4160,6 @@ class TradingBot:
             f"Trades: {self.trades_today}/{config.MAX_TRADES_PER_DAY} | "
             f"Daily P&L: ₹{self.daily_pnl:,.2f} | Capital: ₹{self.capital:,.2f}"
         )
-        # Challenger status line — only shown when there's data to compare
-        if self.challenger_positions or self.challenger_total_pnl != 0.0:
-            delta = self.challenger_total_pnl - self.total_pnl
-            self.logger.info(
-                f"[CHALLENGER] {self.instrument}: "
-                f"Pos: {len(self.challenger_positions)} | "
-                f"Daily P&L: ₹{self.challenger_daily_pnl:,.2f} | "
-                f"Total P&L: ₹{self.challenger_total_pnl:,.2f} "
-                f"({'+' if delta >= 0 else ''}{delta:,.0f} vs Champion)"
-            )
 
     # ── Regime Detection ──────────────────────────────────────────────────────
 
@@ -4874,7 +4555,6 @@ class TradingBot:
                         current_price = float(df['Close'].iloc[-1])
                         hv            = float(df['HV'].iloc[-1])
                         self.check_exits(current_price, hv, force_close=True)
-                        self.check_challenger_exits(current_price, hv, force_close=True)
                         counterfactual.mark(self, current_price, hv, force_close=True)
                         phantom_premium.mark(self, current_price, hv, force_close=True)
 
@@ -4917,7 +4597,6 @@ class TradingBot:
 
                 # ── Check exits ───────────────────────────────────────────
                 self.check_exits(current_price, hv)
-                self.check_challenger_exits(current_price, hv)
                 counterfactual.mark(self, current_price, hv)
                 # Index closes for phantom_premium's divergence measure (the
                 # bot keeps no df on self; this is the only place it is in scope)
@@ -6244,25 +5923,7 @@ class TradingBot:
                                     # entry, so a chase-blocked signal earlier in the
                                     # session does not silence the engine for the day.
                                     self._path_trend_fired = True
-                                # The Challenger must take a trade ONLY if the
-                                # Champion actually took it. Gating it on the
-                                # outcome (did a position appear?) inherits every
-                                # guard inside enter_trade automatically -- RV/IV,
-                                # RISK-GATE, min-premium, capital, and anything
-                                # added later. Checking gates one at a time does
-                                # not scale: RV/IV parity was fixed on Sep 13 and
-                                # RISK-GATE was found bypassing it on Sep 16.
-                                _n_before = len(self.positions)
                                 self.enter_trade(signal, hv, lots=_lots)
-                                if len(self.positions) > _n_before:
-                                    self.enter_challenger_trade(signal, hv, oc,
-                                                                lots=_lots)
-                                else:
-                                    self.logger.debug(
-                                        f"  [CHALLENGER] {self.instrument}: Champion "
-                                        f"did not open — Challenger stands down "
-                                        f"(A/B stays paired)"
-                                    )
 
                 # ── Path F: update any open sim position outside entry window ─
                 # (e.g. force-close at 14:30 even if can_enter is False)
@@ -6334,7 +5995,6 @@ class TradingBot:
             except Exception as exc:
                 self.logger.error(f"Loop error: {exc}", exc_info=True)
                 time.sleep(30)
-
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
