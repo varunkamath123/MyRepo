@@ -2644,30 +2644,6 @@ class TradingBot:
             strike = _atm + _otm * self.strike_gap
         else:
             strike = _atm - _otm * self.strike_gap
-        # Capital-scaled upsizing. LOT_SIZING_MODE='capital' lets the position
-        # grow with the account instead of being pinned at whatever the engine
-        # asked for -- the engines hardcode 'lots': 1, so before this the
-        # account balance had no effect on size at all. _affordable_lots()
-        # computes the count from the REAL premium against both the risk cap
-        # and MAX_DEPLOY_PCT, so it scales continuously rather than topping out
-        # the way DYN_MAX_LOTS_LADDER did at 4 lots.
-        if str(getattr(config, 'LOT_SIZING_MODE', 'fixed')).lower() == 'capital':
-            _px_for_size = signal.get('price_est') or None
-            if not _px_for_size:
-                try:
-                    _px_for_size = bs_price(signal['type'], underlying, strike,
-                                            config.DAYS_TO_EXPIRY / 365, hv)
-                except Exception:
-                    _px_for_size = None
-            if _px_for_size:
-                _aff = self._affordable_lots(float(_px_for_size), _stop_pct)
-                if _aff > lots:
-                    self.logger.info(
-                        f"  [SIZE] {self.instrument}: {lots} lot(s) requested → "
-                        f"{_aff} affordable at ₹{_px_for_size:.0f} "
-                        f"(capital-scaled; risk cap and {getattr(config,'MAX_DEPLOY_PCT',0.40)*100:.0f}% deploy cap)"
-                    )
-                    lots = _aff
         eff_lot_size = self.lot_size * lots
 
         # ── Dynamic profit target (IV-scaled) ────────────────────────────────
@@ -2740,6 +2716,28 @@ class TradingBot:
         _path      = signal.get('path', '')
         _stop_pct  = (self.inst_cfg.get('path_a_stop', config.PATH_A_STOP)
                       if _path == 'A' else config.STOP_LOSS)
+
+        # Capital-scaled upsizing. Placed HERE and not earlier because it needs
+        # both _stop_pct and _fb_price -- the first draft sat ~80 lines above
+        # the _stop_pct assignment and raised UnboundLocalError inside
+        # enter_trade on Oct 13 2026, killing a live SENSEX entry at 10:50 on a
+        # day the index rose 1.50%. Caught in production, not by a test: there
+        # were 28 tests on _affordable_lots and ZERO on this call site.
+        #
+        # The engines hardcode 'lots': 1, so without this the account balance
+        # has no effect on position size at all. Any oversize is corrected by
+        # the risk ladder immediately below.
+        if (str(getattr(config, 'LOT_SIZING_MODE', 'fixed')).lower() == 'capital'
+                and _fb_price):
+            _aff = self._affordable_lots(float(_fb_price), _stop_pct)
+            if _aff > lots:
+                self.logger.info(
+                    f"  [SIZE] {self.instrument}: {lots} lot(s) requested → "
+                    f"{_aff} affordable at ₹{_fb_price:.0f} (capital-scaled: "
+                    f"risk cap + {getattr(config, 'MAX_DEPLOY_PCT', 0.40)*100:.0f}% deploy cap)"
+                )
+                lots         = _aff
+                eff_lot_size = self.lot_size * lots
 
         # ── Risk-cap sizing ladder (reinstated Jul 8 — Jun 10 gate lost to deploy drift)
         # Rupee risk = premium × contracts × stop%. Multi-lot entries that bust

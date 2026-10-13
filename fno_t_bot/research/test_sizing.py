@@ -118,5 +118,44 @@ finally:
     config.CONVICTION_LOT_SOURCE, config.CONVICTION_LOT_LADDER = _src, _lad
 ck('restored to inert after the test', b._conviction_lots({'unified_score': 95}) == 1)
 
+print('\n--- enter_trade INTEGRATION (the gap that let Oct 13 through) ---')
+# The first draft of the capital-sizing block referenced _stop_pct ~80 lines
+# before it was assigned. It raised UnboundLocalError inside enter_trade and
+# killed a live SENSEX entry on a day the index rose 1.50%. There were 28 tests
+# on _affordable_lots and NONE that actually called enter_trade, so nothing
+# caught it. This does.
+_prev = (config.PAPER_REQUIRE_REAL_LTP, config.PAPER_TRADE_MODE)
+try:
+    config.PAPER_REQUIRE_REAL_LTP = False      # no broker in a unit test
+    config.PAPER_TRADE_MODE = True
+    for mode in ('capital', 'fixed'):
+        config.LOT_SIZING_MODE = mode
+        for typ in ('CALL', 'PUT'):
+            sig = {'type': typ, 'price': 22500.0, 'adx': 30.0, 'strength': 1,
+                   'lots': 1, 'path': 'REV', 'otm_strikes': 0,
+                   'otm_reason': 'test', 'rev_score': 3}
+            err = None
+            try:
+                logging.disable(logging.CRITICAL)
+                b.enter_trade(dict(sig), 0.12, lots=1)
+            except (UnboundLocalError, NameError) as e:
+                err = e
+            except Exception:
+                err = None                     # other failures are not this bug
+            finally:
+                logging.disable(logging.NOTSET)
+            ck(f'enter_trade({typ}, mode={mode}) raises no Unbound/NameError',
+               err is None, err)
+finally:
+    config.PAPER_REQUIRE_REAL_LTP, config.PAPER_TRADE_MODE = _prev
+    config.LOT_SIZING_MODE = 'capital'
+
+ck('the sizing block sits AFTER _stop_pct is assigned',
+   (lambda src: src.index('_stop_pct  = (') < src.index('self._affordable_lots(float(_fb_price)'))(
+       __import__('io').open(os.path.join(os.path.dirname(os.path.dirname(
+           os.path.abspath(__file__))), 'options_bot.py'), encoding='utf-8').read()),
+   'ordering regression')
+
+
 print(f'\n{P} passed, {F} failed')
 sys.exit(1 if F else 0)
