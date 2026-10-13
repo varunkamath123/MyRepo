@@ -497,6 +497,55 @@ DYN_MAX_LOTS = 2
 # cap = max(MAX_RISK_FLOOR, book × MAX_RISK_PCT_OF_BOOK); recomputed daily.
 # 10% of book ≈ full-Kelly on the June live cohort (33% WR, avg win ₹3.1k vs
 # avg loss ₹1.0k → f* ≈ 0.11). Scales up with growth, down in drawdown.
+# ── Position sizing: continuous in capital (Oct 13 2026) ────────────────────
+# DYN_MAX_LOTS_LADDER was the binding lot ceiling and it STOPPED at 4 lots for
+# any book at or above ₹1L -- so ₹3L, ₹30L and ₹3cr all resolved to 4 lots. It
+# is now a hard safety stop only (ABSOLUTE_MAX_LOTS); the real constraint is the
+# risk budget applied to the actual premium, in _affordable_lots().
+#
+# Compounding that: the sizing book ignored configured capital entirely. It read
+# SENSEX_LIVE_START_CAPITAL plus cumulative paper P&L -- ₹37,230 on Oct 13 --
+# so raising TOTAL_CAPITAL to ₹300,000 changed the log line and nothing else.
+# get_sizing_book() now reads the configured per-instrument allocation.
+# 'fixed'   -> take exactly what the engine asked for (the engines hardcode 1,
+#              so the account balance has NO effect on size -- the behaviour
+#              that made Rs3L and Rs30L identical)
+# 'capital' -> upsize to what the capital can fund, from the real premium,
+#              bounded by the risk cap and MAX_DEPLOY_PCT
+# Set to 'capital' Oct 13 2026 on user direction. NOTE WHAT THIS MEANS: it
+# multiplies position size on engines that are currently indistinguishable from
+# random (REV p=0.663, TREND p=0.412, book -Rs9,664). It does not multiply
+# expectancy -- it multiplies VARIANCE around a mean near zero, and reaches the
+# same verdict proportionally faster. That is defensible while PAPER_TRADE_MODE
+# is True, because the cost of being wrong is information rather than money.
+# Revert to 'fixed' before any real capital is deployed below confidence 60.
+LOT_SIZING_MODE   = 'capital'
+ABSOLUTE_MAX_LOTS = 50      # hard stop regardless of capital or conviction
+MAX_DEPLOY_PCT    = 0.40    # max share of an instrument's capital in one position
+                            # (the 25% stop understates gap damage, so the risk
+                            #  cap alone would allow too much in a single trade)
+
+# ── Conviction-scaled lots: BUILT BUT OFF ───────────────────────────────────
+# None disables it and every entry requests 1 lot, which is current behaviour.
+#
+# It is off because conviction is not measurable yet. Tested Oct 13 2026 against
+# realised P&L over 41 real-priced trades:
+#     unified_score    rho -0.174  p=0.277   top half -₹14,747 / bottom +₹5,084
+#     exp_move_pct     rho -0.364  p=0.019   top half -₹18,724 / bottom +₹9,060
+#     composite_score  rho -0.003  p=0.985
+#     entry_adx        rho -0.049  p=0.760
+#     move_cover       rho -0.101  p=0.529
+#     rv_iv            rho -0.068  p=0.673
+#     trend_leg_atr    rho +0.206  p=0.499   (only positive sign, n=13)
+# The 0-100 unified scorer is INVERTED, and the one significant relationship is
+# negative. Scaling on any of these puts more capital on worse trades.
+#
+# To switch on later: set CONVICTION_LOT_SOURCE to a logged signal field and
+# give it a ladder. Per REBUILD_PLAN.md that needs n>=30 on the specific cohort
+# with BOTH chronological halves agreeing -- not one encouraging quarter.
+CONVICTION_LOT_SOURCE = None
+CONVICTION_LOT_LADDER = [(0, 1)]    # [(field_value_threshold, lots), ...]
+
 MAX_RISK_PCT_OF_BOOK = 0.10
 MAX_RISK_FLOOR       = 2500          # cap never below this (keeps 1 OTM lot tradeable in drawdown)
 # Lot ceiling unlocks with book growth: [(book ≥ threshold, max lots), ...]

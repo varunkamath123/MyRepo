@@ -2518,6 +2518,82 @@ class TradingBot:
 
     # ── Trade Entry ───────────────────────────────────────────────────────────
 
+    def _affordable_lots(self, premium: float, stop_pct: float) -> int:
+        """How many lots this capital can actually fund, from the REAL premium.
+
+        Two independent limits, whichever is tighter:
+          risk    -- premium x lot_size x stop_pct must stay inside the risk cap
+          notional-- total premium outlay capped at MAX_DEPLOY_PCT of capital,
+                     because a 25% stop understates the damage of a gap and the
+                     risk cap alone would allow an uncomfortable share of the
+                     book to sit in one position
+
+        This replaces DYN_MAX_LOTS_LADDER as the binding constraint. The ladder
+        was a lookup table topping out at 4 lots for any book at or above Rs1L,
+        so capital beyond that did nothing at all. This scales continuously.
+
+        Returns 0 when even one lot busts a limit -- the caller skips.
+        """
+        try:
+            if not premium or premium <= 0:
+                return 0
+            cap, hard_ceiling = self._get_risk_params()
+            book = 0.0
+            try:
+                from capital_gate import get_sizing_book
+                book = get_sizing_book(self.instrument)
+            except Exception:
+                pass
+            one_risk = premium * self.lot_size * max(stop_pct, 0.01)
+            by_risk = int(cap // one_risk) if one_risk > 0 else 0
+            deploy = float(getattr(config, 'MAX_DEPLOY_PCT', 0.40))
+            one_cost = premium * self.lot_size
+            by_notional = int((book * deploy) // one_cost) if one_cost > 0 else 0
+            return max(0, min(by_risk, by_notional, int(hard_ceiling)))
+        except Exception:
+            return 1
+
+    def _conviction_lots(self, signal: dict) -> int:
+        """Lot multiplier from conviction. Returns 1 unless explicitly enabled.
+
+        DELIBERATELY INERT BY DEFAULT. On 2026-10-13 every conviction field in
+        the trade log was tested against realised P&L across 41 real-priced
+        trades, and not one of them predicts outcome:
+
+            field             rho        p     low-half / high-half
+            unified_score   -0.174    0.277   +Rs5,084 / -Rs14,747
+            exp_move_pct    -0.364    0.019   +Rs9,060 / -Rs18,724
+            composite_score -0.003    0.985
+            entry_adx       -0.049    0.760
+            move_cover      -0.101    0.529
+            rv_iv           -0.068    0.673
+            trend_leg_atr   +0.206    0.499   (only positive sign, n=13)
+
+        The 0-100 unified scorer is INVERTED -- its highest-rated half lost
+        Rs14,747 while its lowest-rated half made Rs5,084. And the single
+        statistically significant relationship, exp_move_pct at p=0.019, is
+        negative. Scaling size on any of these would put MORE capital on WORSE
+        trades, which is worse than not scaling at all.
+
+        So the machinery exists and the hook is one config line
+        (CONVICTION_LOT_SOURCE), but it stays off until a measure earns it on
+        n>=30 with both chronological halves agreeing.
+        """
+        src = getattr(config, 'CONVICTION_LOT_SOURCE', None)
+        if not src:
+            return 1
+        try:
+            val = signal.get(src)
+            if val is None:
+                return 1
+            for thr, mult in sorted(getattr(config, 'CONVICTION_LOT_LADDER', []),
+                                    reverse=True):
+                if float(val) >= float(thr):
+                    return max(1, int(mult))
+        except Exception:
+            pass
+        return 1
+
     def _get_risk_params(self) -> tuple:
         """Daily-cached capital-scaled (risk_cap_rs, max_lots) — v1.7.
 
@@ -2528,7 +2604,7 @@ class TradingBot:
         _today = datetime.now(IST).date()
         if getattr(self, '_risk_params_date', None) != _today:
             from capital_gate import get_risk_params
-            _cap, _max_lots, _book = get_risk_params(self.logger)
+            _cap, _max_lots, _book = get_risk_params(self.logger, self.instrument)
             self._risk_cap_today   = _cap
             self._max_lots_today   = _max_lots
             self._risk_params_date = _today
@@ -2568,7 +2644,31 @@ class TradingBot:
             strike = _atm + _otm * self.strike_gap
         else:
             strike = _atm - _otm * self.strike_gap
-        eff_lot_size = self.lot_size * lots   # 1× or 2× based on signal strength score
+        # Capital-scaled upsizing. LOT_SIZING_MODE='capital' lets the position
+        # grow with the account instead of being pinned at whatever the engine
+        # asked for -- the engines hardcode 'lots': 1, so before this the
+        # account balance had no effect on size at all. _affordable_lots()
+        # computes the count from the REAL premium against both the risk cap
+        # and MAX_DEPLOY_PCT, so it scales continuously rather than topping out
+        # the way DYN_MAX_LOTS_LADDER did at 4 lots.
+        if str(getattr(config, 'LOT_SIZING_MODE', 'fixed')).lower() == 'capital':
+            _px_for_size = signal.get('price_est') or None
+            if not _px_for_size:
+                try:
+                    _px_for_size = bs_price(signal['type'], underlying, strike,
+                                            config.DAYS_TO_EXPIRY / 365, hv)
+                except Exception:
+                    _px_for_size = None
+            if _px_for_size:
+                _aff = self._affordable_lots(float(_px_for_size), _stop_pct)
+                if _aff > lots:
+                    self.logger.info(
+                        f"  [SIZE] {self.instrument}: {lots} lot(s) requested → "
+                        f"{_aff} affordable at ₹{_px_for_size:.0f} "
+                        f"(capital-scaled; risk cap and {getattr(config,'MAX_DEPLOY_PCT',0.40)*100:.0f}% deploy cap)"
+                    )
+                    lots = _aff
+        eff_lot_size = self.lot_size * lots
 
         # ── Dynamic profit target (IV-scaled) ────────────────────────────────
         # Scale BASE_TARGET up/down proportionally with ATM-IV at entry.
@@ -5893,9 +5993,16 @@ class TradingBot:
                                 # TRENDING 50% WR / avg +₹989 — multi-lot
                                 # conviction belongs in trending tape only.
                                 _lots_pre_clamp = _lots
-                                # v1.7: lot ceiling scales with book capital
-                                # (DYN_MAX_LOTS_LADDER: 2 now, 3 at ₹75k, 4 at ₹1L)
+                                # Lot ceiling now scales continuously with
+                                # capital via _affordable_lots(), computed from
+                                # the real premium rather than a lookup table
+                                # that stopped at 4 lots for any book >= ₹1L.
+                                # _conviction_lots() is inert by default: every
+                                # conviction field tested flat or INVERTED on
+                                # 41 trades (unified_score rho -0.174, its top
+                                # half -₹14,747 vs bottom +₹5,084).
                                 _, _max_lots_cap = self._get_risk_params()
+                                _lots = max(_lots, self._conviction_lots(signal))
                                 _lots = min(_lots, _max_lots_cap)
                                 if (getattr(config, 'REGIME_DETECTION_ENABLED', True)
                                         and self._regime == 'CHOPPY'):
