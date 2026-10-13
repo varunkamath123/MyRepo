@@ -519,7 +519,14 @@ DYN_MAX_LOTS = 2
 # same verdict proportionally faster. That is defensible while PAPER_TRADE_MODE
 # is True, because the cost of being wrong is information rather than money.
 # Revert to 'fixed' before any real capital is deployed below confidence 60.
-LOT_SIZING_MODE   = 'capital'
+# REVERTED to 'fixed' Oct 13 2026, same day it was switched on. It worked
+# exactly as designed, which is the problem: the SENSEX PUT that fired at 10:50
+# on a day the index rose 1.50% and closed at its high would have been sized at
+# 5 lots instead of 1, turning a -Rs1,673 loss into -Rs8,366. Capital scaling
+# multiplies whatever the engine's edge is, and the engine's edge is currently
+# indistinguishable from zero. Switch back to 'capital' when an engine has
+# earned it -- per REBUILD_PLAN.md that means confidence >= 60, not a good week.
+LOT_SIZING_MODE   = 'fixed'
 ABSOLUTE_MAX_LOTS = 50      # hard stop regardless of capital or conviction
 MAX_DEPLOY_PCT    = 0.40    # max share of an instrument's capital in one position
                             # (the 25% stop understates gap damage, so the risk
@@ -1551,7 +1558,25 @@ TUESDAY_GATE_ENABLED      = False
 #
 # PAPER-ONLY (PATH_REV_LIVE=False) — logs [PATH-REV PAPER].  Set True after 30 trades.
 PATH_REV_ENABLED            = True    # enable reversal detection (logs paper signal)
-PATH_REV_LIVE               = True    # LIVE — deployed May 5 2026 after retroactive validation
+# STOPPED Oct 13 2026 (user direction). Still ENABLED, so it evaluates and its
+# signals are tracked in the counterfactual at REAL prices under gate
+# 'REV_OFF' -- the question 'should REV come back?' stays answerable.
+#
+# Live record at the point it was stopped: n=27, 12W/15L, -Rs5,077, mean
+# -Rs188, p=0.663. Halves +Rs4,245 / -Rs9,322 -- it worked for roughly the
+# first 23 trades and then broke. Win/loss ratio 0.99 at a 44% hit rate loses
+# by arithmetic. Last five trades were all losses.
+#
+# Oct 13 is the clearest single case. At the moment it fired, the bot's own
+# scan line read DI+=32.6 DI-=20.2 (BULL), ADX=43.2, 15m SuperTrend BULL --
+# and REV fired a PUT, which the unified scorer rated 88/100. It generated 49
+# PUT signals on SENSEX and 44 on NIFTY while both indices rose and closed at
+# their highs. A plain ATM CALL bought at 10:00 made Rs37,626 across the three.
+#
+# REV fades exhaustion and does not consult direction at all -- that is by
+# design, and on trending days the design is simply wrong. Set True again only
+# with evidence from the REV_OFF counterfactual, not on a hunch.
+PATH_REV_LIVE               = False
 # START was '12:00', a fixed outer-bound guess unrelated to the actual exhaustion
 # condition. Diagnostic (Aug 8 2026, causal replay w/ multi-day ADX warm-up,
 # 236 eligible days): 142/236 (60%) first crossed score>=3 BEFORE 12:00; of
@@ -1644,7 +1669,29 @@ PATH_REV_ADX_WANE_RATIO     = 0.85    # ADX < peak × this = momentum waning
 #   stack, zero capital risk under PAPER_TRADE_MODE) as the actual forward
 #   validation step, per user direction Aug 8 2026.
 PATH_TREND_ENABLED       = True
-PATH_TREND_LIVE          = True     # paper-trades directly -- no separate shadow stage needed
+# STOPPED Oct 13 2026 (user direction), same day as PATH_REV. Still ENABLED, so
+# it evaluates and its signals are tracked in the counterfactual at REAL prices
+# under gate 'TREND_OFF'.
+#
+# Record at the point it was stopped: n=14, 6W/8L, -Rs4,587, mean -Rs328,
+# p=0.412. Halves -Rs2,481 / -Rs2,106 -- unlike REV it never worked in either
+# half. Win/loss ratio 0.72. Median chase_pos 0.893: it enters at the 89th
+# percentile of the day's range, which is the PATH-A failure mode it was
+# explicitly built to avoid (the 25-70% pullback band that made it different
+# was retired Aug 12 2026 after four days, and it has been a confirmation
+# engine ever since).
+#
+# The Oct 13 reason for stopping it: on a clean trend day -- all three indices
+# opening at their low and closing at their high -- TREND correctly generated
+# CALL signals and the chase gate blocked them 13 times for 'bought the
+# extreme'. An engine whose signal is right and whose entry is always refused
+# produces nothing. Fixing that is a gate question, not a TREND question, and
+# it needs the premium archive rather than another threshold guess.
+#
+# With both REV and TREND off, NO engine books a trade. That is deliberate:
+# REBUILD_PLAN.md Phase 0. The book freezes at -Rs9,664 over 41 trades and the
+# archive keeps accumulating.
+PATH_TREND_LIVE          = False
 PATH_TREND_START         = '09:45'  # after OR forms (6 bars)
 PATH_TREND_END           = '13:00'  # leave >=90min runway to 14:30 force-close
 PATH_TREND_MIN_ADX       = 22       # lower than REV's 30 -- catches the trend while building

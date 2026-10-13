@@ -5333,22 +5333,33 @@ class TradingBot:
                                 signal = _rev_sig
                                 self._path_rev_fired = True
                             else:
-                                # Paper-only: log + estimate option price but don't enter
-                                _rv_px = _rev_sig['price']
+                                # REV is switched off (Oct 13 2026) but still
+                                # measured. The old paper branch priced the
+                                # signal with bs_price, which mis-prices real
+                                # premiums here by 41-123% -- that record could
+                                # not tell us whether REV was right. Routing it
+                                # through the counterfactual instead prices it at
+                                # real traded LTPs and runs it through the same
+                                # exit stack, so the question 'should REV come
+                                # back?' stays answerable on evidence.
                                 _rv_tp = _rev_sig['type']
-                                _rv_str = int(_rv_px // self.strike_gap) * self.strike_gap
-                                if _rv_tp == 'CALL':
-                                    _rv_str += self.strike_gap
-                                _T_rem = max(config.DAYS_TO_EXPIRY - 0, 0.01) / 365
-                                elapsed_d = 0.0
-                                _rv_hv = float(df['HV'].iloc[-1]) if 'HV' in df.columns else 0.18
-                                _rv_opt = bs_price(_rv_tp, _rv_px, _rv_str, _T_rem, _rv_hv)
                                 self.logger.info(
-                                    f"  [PATH-REV PAPER] {self.instrument} {_rv_tp} "
-                                    f"| Strike={_rv_str:,} | Est opt ₹{_rv_opt:.2f} "
-                                    f"| (set PATH_REV_LIVE=True to trade live)"
+                                    f"  [PATH-REV OFF] {self.instrument} {_rv_tp} "
+                                    f"would have fired — tracked in the "
+                                    f"counterfactual at real prices, not booked"
                                 )
-                                self._path_rev_fired = True   # log once per day
+                                try:
+                                    counterfactual.record(
+                                        self, _rv_tp, float(_rev_sig['price']),
+                                        'REV_OFF',
+                                        'PATH_REV_LIVE=False (stopped Oct 13 2026)',
+                                        float(df['HV'].iloc[-1]),
+                                        extra=dict(path='REV',
+                                                   rev_score=_rev_sig.get('rev_score'),
+                                                   rev_chase=_rev_sig.get('rev_chase')))
+                                except Exception:
+                                    pass
+                                self._path_rev_fired = True   # once per day
 
                     # ── PATH_TREND: trend-continuation pullback entry ────────────
                     # Fills the gap PATH_REV structurally cannot: REV only fades an
@@ -5367,8 +5378,27 @@ class TradingBot:
                             if getattr(config, 'PATH_TREND_LIVE', False):
                                 signal = _trend_sig
                             else:
-                                # Shadow/log-only mode: nothing downstream will
-                                # consume it, so burn the daily shot here.
+                                # TREND is switched off (Oct 13 2026) but still
+                                # measured. Nothing downstream consumes the
+                                # signal, so burn the daily shot here -- and log
+                                # it to the counterfactual at REAL traded prices
+                                # so 'should TREND come back?' stays answerable
+                                # on evidence rather than memory.
+                                self.logger.info(
+                                    f"  [PATH-TREND OFF] {self.instrument} "
+                                    f"{_trend_sig['type']} would have fired — "
+                                    f"tracked in the counterfactual, not booked"
+                                )
+                                try:
+                                    counterfactual.record(
+                                        self, _trend_sig['type'],
+                                        float(_trend_sig['price']), 'TREND_OFF',
+                                        'PATH_TREND_LIVE=False (stopped Oct 13 2026)',
+                                        float(df['HV'].iloc[-1]),
+                                        extra=dict(path='TREND',
+                                                   trend_leg_atr=_trend_sig.get('trend_leg_atr')))
+                                except Exception:
+                                    pass
                                 self._path_trend_fired = True
                             # NOTE (Aug 12): when LIVE, the daily one-shot is NOT
                             # burned here -- it is set only after the trade actually
