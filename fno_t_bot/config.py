@@ -51,7 +51,7 @@ INSTRUMENTS = {
         'monthly_expiry_only': False,     # NIFTY has weekly Tuesday expiries (not monthly-only)
                                           # Fyers compact format: NSE:NIFTY266DD[strike]CE
                                           # Confirmed Jun 2026: fills land on weekly Tue contracts
-        'capital'            : 26000,     # ₹26k — unified bot (ORB 09:30–11:00 + main 11:00–14:30)
+        'capital'            : 100000,     # ₹26k — unified bot (ORB 09:30–11:00 + main 11:00–14:30)
     },
     'BANKNIFTY': {
         'index_symbol'       : 'NSE:NIFTYBANK-INDEX',
@@ -62,7 +62,7 @@ INSTRUMENTS = {
         'monthly_expiry_only': True,      # SEBI Nov 2023: NSE dropped BANKNIFTY weeklies
                                           # Only monthly expiry (last Tue of month) is valid
         'skip_monday_before_expiry': True, # Mon before last-Tue rolls DTE to ~29 — wrong option
-        'capital'            : 26000,     # ₹26k — unified bot (ORB 09:30–11:00 + main 11:00–14:30)
+        'capital'            : 100000,     # ₹26k — unified bot (ORB 09:30–11:00 + main 11:00–14:30)
     },
     'SENSEX': {
         'index_symbol'  : 'BSE:SENSEX-INDEX',
@@ -77,10 +77,20 @@ INSTRUMENTS = {
                                      # Jul 17 = Friday) → Fyers errmsg → LTP None → every
                                      # SENSEX weekly-contract live order aborted (Jul 9), and
                                      # position monitoring was blind (May 4 -52% overrun).
-        'capital'       : 26000,     # Live capital — same allocation as NIFTY/BNF (May 2026)
+        'capital'       : 100000,     # Live capital — same allocation as NIFTY/BNF (May 2026)
     },
 }
-TOTAL_CAPITAL   = 78000     # ₹78,000 — ₹26k NIFTY + ₹26k BANKNIFTY + ₹26k SENSEX (all live)
+TOTAL_CAPITAL   = 300000    # RAISED Oct 12 2026 (user direction): Rs1L per index.
+# Rs26k could not express any structure: one SENSEX lot was 45% of the book,
+# and a 4-leg fly's fixed commission ran 2-3x the intraday theta it collected
+# (Oct 6-12: 8 structures, every one net negative after costs). At Rs1L the
+# fixed per-order cost amortises over 4-10x the size, which makes structures
+# MEASURABLE that previously could not clear their own brokerage.
+# IT DOES NOT CREATE AN EDGE. A null signal at 4 lots is still null -- it just
+# reaches its verdict four times faster. Two caps still bind and were left
+# alone deliberately: DYN_MAX_LOTS_LADDER tops out at 4 lots, and
+# REGIME_CHOPPY_LOTS_CAP forces 1 lot in CHOPPY regime -- which is what most
+# recent entries logged. Raise those only as separate, argued decisions.
 INITIAL_CAPITAL = TOTAL_CAPITAL  # backward-compat for bot.py backtest
 
 # ─── Per-Instrument Strategy Overrides (used by variant vX) ──────────────────
@@ -101,7 +111,7 @@ INSTRUMENT_STRATEGY = {
     #   - Tuesday: confirmed danger zone (v7 data: 31.2% WR, -₹3,472)
     'NIFTY': {
         'live_mode'     : True,   # LIVE — real orders via Fyers
-        'capital'       : 26000,  # ₹26k — unified bot (ORB + main session)
+        'capital'       : 100000,  # ₹26k — unified bot (ORB + main session)
         'skip_tuesday'  : True,
         'skip_thursday' : False,  # Thu 60% WR, +₹3,258 — keep
         'call_adx_min': 30,     # Confirmed: ADX 25-29 CALL entries whipsaw and stop out
@@ -128,7 +138,16 @@ INSTRUMENT_STRATEGY = {
         # ADX to peak and wane first), so widening mainly admits more TREND -- our weakest
         # path (-Rs4,208 live). Watch the counterfactual log and TREND's share.
         # For 09:45 instead, change the three entry_start values below to '09:45'.
-        'entry_start'   : '10:00',
+        # WIDENED 10:00 -> 09:45 (Oct 2 2026, user direction). PATH_REV_START and
+        # PATH_TREND_START were ALREADY 09:45 -- the global 10:00 was blocking
+        # signals the engines were willing to take. Buys +11% more windows and
+        # +2.3pp payability. NOTE THE TENSION with the 09:xx row above (n=35,
+        # 17.1% right): that measures whether entries WIN, this measures whether
+        # the window can MOVE enough. Both can be true -- the window travels far
+        # enough and the engines still call it wrong. The caveat above stands:
+        # early fires are mostly TREND, our weakest path. Revert this line to
+        # '10:00' (leaving FORCE_CLOSE_TIME at 15:00) if TREND's share climbs.
+        'entry_start'   : '09:45',
         'entry_end'     : '14:00',# 14:xx = 25% WR; too close to force-close — blocked
         'max_concurrent': 1,      # No pyramiding — signal quality already high at 72% WR
         # ── Per-instrument PATH-A exit parameters (override global PATH_A_*) ──
@@ -153,7 +172,7 @@ INSTRUMENT_STRATEGY = {
     'BANKNIFTY': {
         'live_mode'     : True,   # INTENDED live — actual mode gated by capital_gate.py
                                   # (LIVE only when combined capital >= CAPITAL_GATE_BNF_LIVE=50k)
-        'capital'       : 26000,  # ₹26k — unified bot (ORB + main session)
+        'capital'       : 100000,  # ₹26k — unified bot (ORB + main session)
         'skip_tuesday'  : True,
         'skip_thursday' : False,
         'call_adx_min': 30,     # Confirmed 60% WR — maintain this threshold
@@ -166,7 +185,16 @@ INSTRUMENT_STRATEGY = {
         # options (low gamma), making the 80% target hard to hit on weak moves.
         'tuesday_put_adx_min'   : 35,  # needs a genuinely strong bear trend for 8-day options
         'tuesday_put_di_spread' : 12,  # high DI dominance to justify low-gamma contract
-        'entry_start'   : '10:00',
+        # WIDENED 10:00 -> 09:45 (Oct 2 2026, user direction). PATH_REV_START and
+        # PATH_TREND_START were ALREADY 09:45 -- the global 10:00 was blocking
+        # signals the engines were willing to take. Buys +11% more windows and
+        # +2.3pp payability. NOTE THE TENSION with the 09:xx row above (n=35,
+        # 17.1% right): that measures whether entries WIN, this measures whether
+        # the window can MOVE enough. Both can be true -- the window travels far
+        # enough and the engines still call it wrong. The caveat above stands:
+        # early fires are mostly TREND, our weakest path. Revert this line to
+        # '10:00' (leaving FORCE_CLOSE_TIME at 15:00) if TREND's share climbs.
+        'entry_start'   : '09:45',
         'entry_end'     : '14:00',# Cut from 14:45 → 14:00 (Apr 24 2026): 14:10 2-lot entry had only 20 min to EOD force-close (14:30). 56% WR stat pre-dates Strength=2 lot-doubling. 30-min minimum runway required.
         'max_concurrent': 1,      # Concurrent=2 not valid — causes cascading losses
         # ── Per-instrument PATH-A exit parameters (override global PATH_A_*) ──
@@ -192,7 +220,7 @@ INSTRUMENT_STRATEGY = {
     'SENSEX': {
         'live_mode'     : False,  # Overridden LIVE by FORCE_SENSEX_LIVE=True (May 2026)
                                   # capital_gate.py honours FORCE_SENSEX_LIVE before threshold check
-        'capital'       : 26000,  # Live capital — ₹26k matching NIFTY/BNF allocation
+        'capital'       : 100000,  # Live capital — ₹26k matching NIFTY/BNF allocation
         'skip_tuesday'  : True,
         'skip_thursday' : False,  # Blanket block removed May 2026 — scoring gates handle quality
         'call_adx_min': 25,     # CALL WR 61.5% — standard threshold fine
@@ -203,7 +231,16 @@ INSTRUMENT_STRATEGY = {
         # Tuesday PUT conditions
         'tuesday_put_adx_min'   : 30,
         'tuesday_put_di_spread' : 8,
-        'entry_start'   : '10:00',
+        # WIDENED 10:00 -> 09:45 (Oct 2 2026, user direction). PATH_REV_START and
+        # PATH_TREND_START were ALREADY 09:45 -- the global 10:00 was blocking
+        # signals the engines were willing to take. Buys +11% more windows and
+        # +2.3pp payability. NOTE THE TENSION with the 09:xx row above (n=35,
+        # 17.1% right): that measures whether entries WIN, this measures whether
+        # the window can MOVE enough. Both can be true -- the window travels far
+        # enough and the engines still call it wrong. The caveat above stands:
+        # early fires are mostly TREND, our weakest path. Revert this line to
+        # '10:00' (leaving FORCE_CLOSE_TIME at 15:00) if TREND's share climbs.
+        'entry_start'   : '09:45',
                                   # Note: PATH-A ORB fires on OR break independently of this
         'entry_end'     : '14:00',# 14:xx = 33% WR — blocked (consistent with NIFTY finding)
         'max_concurrent': 1,
@@ -253,7 +290,29 @@ TRAILING_DISTANCE    = 0.10        # Trail distance 10% from peak (was 20%)
 # Covers the gap left by the checkpoint loss-stop: entries AFTER the checkpoint
 # (REV at 12:00, late PATH-A) previously had no progress-based exit at all
 # (e.g. Jun 9 BNF REV -₹4,180 bled the full 150min to force-close).
-NEVER_PROGRESS_ENABLED   = True
+# DISABLED Oct 2 2026. Largest single drain in the book, and the only exit
+# whose premise the evidence contradicts.
+#   Never-Progressed   n=14  (39% of ALL exits)  net -Rs14,213  median -8.2%
+#   Trailing Stop      n=13                      net +Rs12,267  median  +9.3%
+#   Stop-Loss          n= 4                      net -Rs11,616
+#   EOD Force-Close    n= 3                      net    -Rs933
+#   Target             n= 2                      net  +Rs8,630
+# -Rs14,213 from one rule, against a total book of -Rs5,865. It cut positions
+# a median 45 minutes in, at -8.2%, from entries that had a median 206 minutes
+# of runway. Median peak before the cut was 1.1% -- they genuinely had not
+# moved, which is exactly the premise: "it is not working, get out".
+#
+# The premise is wrong. exit_lab.py, run on REAL Breeze premiums rather than
+# modelled ones, tested 17 exit variants and found "cutting reds earlier is
+# clearly worse". A market that has gone quiet may consolidate and then break
+# either way; exiting on absence-of-movement forfeits that option while still
+# paying for it.
+#
+# Honest limit: turning this off is NOT a free +Rs14,213. Some of those
+# positions would have run from -8.2% to the -25% stop. What the change buys
+# is the right to find out, on real forward prices, instead of assuming.
+# Set True to restore.
+NEVER_PROGRESS_ENABLED   = False
 NEVER_PROGRESS_MINUTES   = 45      # min age before the check applies. LOWERED 90→45
                                    # (Jul 21 diag): at 90 the exit was DEAD CODE — 0
                                    # fires ever. It was pincered: morning entries hit the
@@ -386,7 +445,22 @@ AVOID_LUNCH_HOURS   = False
 LUNCH_START         = "12:30"
 LUNCH_END           = "13:30"
 INTRADAY_FORCE_CLOSE = True
-FORCE_CLOSE_TIME     = "14:30"      # Exit 60min before close (was 15:10) — reduce drift
+# WIDENED 14:30 -> 15:00 (Oct 2 2026). Runway, not signal quality, is the
+# dominant variable in this book. Measured over 412/409/409 complete sessions,
+# holding to 15:00 instead of 14:30 (entry unchanged at 10:00) lifts the share
+# of windows that can ever cover an ATM option's break-even:
+#     NIFTY     20.8% -> 26.8%      BANKNIFTY 27.5% -> 34.3%
+#     SENSEX    20.8% -> 26.6%
+# and with entry also moved to 09:45: 29.1% / 36.7% / 28.9%. That is a ~40%
+# increase in payable windows -- a larger effect than ANY entry signal tested
+# (direction is ~50% across 12 methods; the best captured +0.010% against a
+# 0.51% median break-even).
+# 15:15 would be better still (31.1/39.6/31.8) but 15:00 keeps a 30-minute
+# buffer to the 15:30 close, before end-of-day spread widening.
+# NO overnight exposure is created: every position still closes same-day.
+# The previous 14:30 was set to "reduce drift" on the old long-premium engines
+# and was never revisited after the payability finding.
+FORCE_CLOSE_TIME     = "15:00"      # same-day close, 30min before the bell
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
 MAX_DAILY_LOSS           = 8000    # PRIMARY gate: stop trading when per-instrument P&L < -₹8,000
@@ -423,6 +497,104 @@ DYN_MAX_LOTS = 2
 # cap = max(MAX_RISK_FLOOR, book × MAX_RISK_PCT_OF_BOOK); recomputed daily.
 # 10% of book ≈ full-Kelly on the June live cohort (33% WR, avg win ₹3.1k vs
 # avg loss ₹1.0k → f* ≈ 0.11). Scales up with growth, down in drawdown.
+# ── Position sizing: continuous in capital (Oct 13 2026) ────────────────────
+# DYN_MAX_LOTS_LADDER was the binding lot ceiling and it STOPPED at 4 lots for
+# any book at or above ₹1L -- so ₹3L, ₹30L and ₹3cr all resolved to 4 lots. It
+# is now a hard safety stop only (ABSOLUTE_MAX_LOTS); the real constraint is the
+# risk budget applied to the actual premium, in _affordable_lots().
+#
+# Compounding that: the sizing book ignored configured capital entirely. It read
+# SENSEX_LIVE_START_CAPITAL plus cumulative paper P&L -- ₹37,230 on Oct 13 --
+# so raising TOTAL_CAPITAL to ₹300,000 changed the log line and nothing else.
+# get_sizing_book() now reads the configured per-instrument allocation.
+# ── Dynamic lot sizing ──────────────────────────────────────────────────────
+# 'fixed'   -> exactly what the engine asked for (engines hardcode 1)
+# 'risk'    -> EQUAL-RISK: scale so every trade risks ~TARGET_RISK_PER_TRADE
+# 'capital' -> upsize to whatever the capital can fund (see _affordable_lots)
+#
+# WHY SIZING MATTERS AT ALL, measured Oct 14 2026 by rescaling the 41 booked
+# trades -- identical entries, identical exits, only the quantum changed:
+#     size UP on unified_score      -Rs51,253
+#     size UP on move_cover         -Rs49,638
+#     size UP on rv_iv              -Rs39,518
+#     capital-scaled 4x             -Rs38,655
+#     1 lot flat (actual)            -Rs9,664
+#     equal-risk                    -Rs11,885
+#     size DOWN on unified_score     -Rs4,111
+#     size DOWN on exp_move_pct      +Rs6,656
+# A Rs58,000 spread from quantum alone -- a bigger effect than anything twelve
+# direction methods produced. Quantum is not secondary here.
+#
+# BUT THE SHAPE IS INVERTED. Every rule that sizes UP on a quality signal is
+# dramatically worse, because the quality signals themselves are inverted
+# (unified_score rho -0.174 against P&L; exp_move_pct rho -0.364, p=0.019).
+#
+# AND THE ONE POSITIVE RULE IS CIRCULAR. "Size down on exp_move_pct" is just a
+# restatement of that -0.364 correlation, applied to the same 41 trades, as one
+# of ten variants tried. It has zero out-of-sample content and fails all three
+# REBUILD_PLAN.md rules (n>=30 per cohort, both halves, pre-registered). It is
+# recorded here as a hypothesis to test forward, NOT as a setting to adopt.
+LOT_SIZING_MODE        = 'fixed'
+TARGET_RISK_PER_TRADE  = 2500    # used by mode 'risk'; the median of the 41
+                                 # booked trades was Rs2,422, with a 9.1x spread
+                                 # (Rs654 to Rs5,980) nobody intended
+
+# PRE-REGISTERED: what would earn conviction sizing its place.
+# Both engines are off, so no sizing rule can be validated on booked trades.
+# The counterfactual now records every sizing-relevant field on each tracked
+# signal (see counterfactual.SIZING_FIELDS), which makes rules evaluable on
+# SHADOW data -- out of sample relative to the 41 trades they were mined on.
+#   Test       research/sizing_eval.py, >= 30 shadow observations per cohort
+#   Earns it   a rule beats 1-lot flat in BOTH chronological halves
+#   Fails      anything that only works pooled, or needs the threshold moved
+# Until then LOT_SIZING_MODE stays 'fixed' and CONVICTION_LOT_SOURCE stays None.
+
+# 'fixed'   -> take exactly what the engine asked for (the engines hardcode 1,
+#              so the account balance has NO effect on size -- the behaviour
+#              that made Rs3L and Rs30L identical)
+# 'capital' -> upsize to what the capital can fund, from the real premium,
+#              bounded by the risk cap and MAX_DEPLOY_PCT
+# Set to 'capital' Oct 13 2026 on user direction. NOTE WHAT THIS MEANS: it
+# multiplies position size on engines that are currently indistinguishable from
+# random (REV p=0.663, TREND p=0.412, book -Rs9,664). It does not multiply
+# expectancy -- it multiplies VARIANCE around a mean near zero, and reaches the
+# same verdict proportionally faster. That is defensible while PAPER_TRADE_MODE
+# is True, because the cost of being wrong is information rather than money.
+# Revert to 'fixed' before any real capital is deployed below confidence 60.
+# REVERTED to 'fixed' Oct 13 2026, same day it was switched on. It worked
+# exactly as designed, which is the problem: the SENSEX PUT that fired at 10:50
+# on a day the index rose 1.50% and closed at its high would have been sized at
+# 5 lots instead of 1, turning a -Rs1,673 loss into -Rs8,366. Capital scaling
+# multiplies whatever the engine's edge is, and the engine's edge is currently
+# indistinguishable from zero. Switch back to 'capital' when an engine has
+# earned it -- per REBUILD_PLAN.md that means confidence >= 60, not a good week.
+LOT_SIZING_MODE   = 'fixed'
+ABSOLUTE_MAX_LOTS = 50      # hard stop regardless of capital or conviction
+MAX_DEPLOY_PCT    = 0.40    # max share of an instrument's capital in one position
+                            # (the 25% stop understates gap damage, so the risk
+                            #  cap alone would allow too much in a single trade)
+
+# ── Conviction-scaled lots: BUILT BUT OFF ───────────────────────────────────
+# None disables it and every entry requests 1 lot, which is current behaviour.
+#
+# It is off because conviction is not measurable yet. Tested Oct 13 2026 against
+# realised P&L over 41 real-priced trades:
+#     unified_score    rho -0.174  p=0.277   top half -₹14,747 / bottom +₹5,084
+#     exp_move_pct     rho -0.364  p=0.019   top half -₹18,724 / bottom +₹9,060
+#     composite_score  rho -0.003  p=0.985
+#     entry_adx        rho -0.049  p=0.760
+#     move_cover       rho -0.101  p=0.529
+#     rv_iv            rho -0.068  p=0.673
+#     trend_leg_atr    rho +0.206  p=0.499   (only positive sign, n=13)
+# The 0-100 unified scorer is INVERTED, and the one significant relationship is
+# negative. Scaling on any of these puts more capital on worse trades.
+#
+# To switch on later: set CONVICTION_LOT_SOURCE to a logged signal field and
+# give it a ladder. Per REBUILD_PLAN.md that needs n>=30 on the specific cohort
+# with BOTH chronological halves agreeing -- not one encouraging quarter.
+CONVICTION_LOT_SOURCE = None
+CONVICTION_LOT_LADDER = [(0, 1)]    # [(field_value_threshold, lots), ...]
+
 MAX_RISK_PCT_OF_BOOK = 0.10
 MAX_RISK_FLOOR       = 2500          # cap never below this (keeps 1 OTM lot tradeable in drawdown)
 # Lot ceiling unlocks with book growth: [(book ≥ threshold, max lots), ...]
@@ -1428,7 +1600,25 @@ TUESDAY_GATE_ENABLED      = False
 #
 # PAPER-ONLY (PATH_REV_LIVE=False) — logs [PATH-REV PAPER].  Set True after 30 trades.
 PATH_REV_ENABLED            = True    # enable reversal detection (logs paper signal)
-PATH_REV_LIVE               = True    # LIVE — deployed May 5 2026 after retroactive validation
+# STOPPED Oct 13 2026 (user direction). Still ENABLED, so it evaluates and its
+# signals are tracked in the counterfactual at REAL prices under gate
+# 'REV_OFF' -- the question 'should REV come back?' stays answerable.
+#
+# Live record at the point it was stopped: n=27, 12W/15L, -Rs5,077, mean
+# -Rs188, p=0.663. Halves +Rs4,245 / -Rs9,322 -- it worked for roughly the
+# first 23 trades and then broke. Win/loss ratio 0.99 at a 44% hit rate loses
+# by arithmetic. Last five trades were all losses.
+#
+# Oct 13 is the clearest single case. At the moment it fired, the bot's own
+# scan line read DI+=32.6 DI-=20.2 (BULL), ADX=43.2, 15m SuperTrend BULL --
+# and REV fired a PUT, which the unified scorer rated 88/100. It generated 49
+# PUT signals on SENSEX and 44 on NIFTY while both indices rose and closed at
+# their highs. A plain ATM CALL bought at 10:00 made Rs37,626 across the three.
+#
+# REV fades exhaustion and does not consult direction at all -- that is by
+# design, and on trending days the design is simply wrong. Set True again only
+# with evidence from the REV_OFF counterfactual, not on a hunch.
+PATH_REV_LIVE               = False
 # START was '12:00', a fixed outer-bound guess unrelated to the actual exhaustion
 # condition. Diagnostic (Aug 8 2026, causal replay w/ multi-day ADX warm-up,
 # 236 eligible days): 142/236 (60%) first crossed score>=3 BEFORE 12:00; of
@@ -1453,10 +1643,37 @@ PATH_REV_MAXPAIN_PROX_PCT   = 0.005   # within 0.5% of MaxPain → proximity bon
 # extreme; the global chase gate (0.93) does not constrain a fade at all,
 # because for a fade the extreme is the GOOD end. Live entries, ranked:
 #   0.261 +Rs4,284 | 0.282 +Rs2,950 | 0.309 +Rs1,877 | 0.348 -Rs863 | 0.611 -Rs2,110
-# Monotone; 0.40 keeps the winning cluster and cuts the tail. Rupees before
-# Aug 18 are Black-Scholes-priced, so the RANKING is the evidence, not the
-# amounts. 0 disables.
-PATH_REV_MAX_CHASE          = 0.40
+# Monotone, but those rupees are Black-Scholes-priced -- the note's own words
+# were "the RANKING is the evidence, not the amounts". 0 disables.
+#
+# RAISED 0.40 -> 0.70 (Oct 5 2026). Since Sep 17 the counterfactual has priced
+# every blocked REV signal at REAL traded premiums, and it contradicts the
+# modelled ranking above:
+#   09-29 SENSEX    CALL chase 0.609   +403   Trailing Stop
+#   09-29 BANKNIFTY CALL chase 0.590   +435   Trailing Stop
+#   10-01 SENSEX    CALL chase 0.695   +794   Trailing Stop
+#   10-01 NIFTY     CALL chase 0.526   +464   Trailing Stop
+#   10-01 BANKNIFTY PUT  chase 0.460   -826   Never-Progressed (peak +4.9%)
+#   10-05 SENSEX    PUT  chase 0.406 +1,656   Trailing Stop
+#   10-05 BANKNIFTY PUT  chase 0.558   +290   Trailing Stop
+#   10-05 NIFTY     PUT  chase 0.476 +1,670   Trailing Stop
+#   n=8, 7W/1L, +Rs4,886, mean +Rs611, halves +Rs2,096 / +Rs2,790.
+#
+# The single loser was killed by NEVER_PROGRESS, disabled Oct 2 after proving
+# the largest drain in the book; it had peaked +4.9% before being cut at
+# -3.5%, so the rule that killed it no longer exists.
+#
+# 0.70 admits EXACTLY the measured band (0.406-0.695) and nothing beyond it.
+# There is no real-priced observation above 0.695, so the gate still blocks
+# everything unmeasured. Not removed, not set to 0.
+#
+# HONEST LIMIT: n=8. This project has reverted several changes built on n<15
+# (MIN_LEG_ATR, PATH_MR, gap-fade, MFE) -- but every one of those was a
+# MODELLED number later contradicted by real prices, which is the direction
+# this change runs in, not against. The counterfactual keeps logging, so if
+# the 0.40-0.70 band goes net negative it surfaces in the same place this
+# evidence came from. Revert to 0.40 if it does.
+PATH_REV_MAX_CHASE          = 0.70
 PATH_REV_ADX_WANE_RATIO     = 0.85    # ADX < peak × this = momentum waning
 
 # ─── PATH_TREND: Trend-Continuation Pullback Entry ───────────────────────────
@@ -1494,7 +1711,29 @@ PATH_REV_ADX_WANE_RATIO     = 0.85    # ADX < peak × this = momentum waning
 #   stack, zero capital risk under PAPER_TRADE_MODE) as the actual forward
 #   validation step, per user direction Aug 8 2026.
 PATH_TREND_ENABLED       = True
-PATH_TREND_LIVE          = True     # paper-trades directly -- no separate shadow stage needed
+# STOPPED Oct 13 2026 (user direction), same day as PATH_REV. Still ENABLED, so
+# it evaluates and its signals are tracked in the counterfactual at REAL prices
+# under gate 'TREND_OFF'.
+#
+# Record at the point it was stopped: n=14, 6W/8L, -Rs4,587, mean -Rs328,
+# p=0.412. Halves -Rs2,481 / -Rs2,106 -- unlike REV it never worked in either
+# half. Win/loss ratio 0.72. Median chase_pos 0.893: it enters at the 89th
+# percentile of the day's range, which is the PATH-A failure mode it was
+# explicitly built to avoid (the 25-70% pullback band that made it different
+# was retired Aug 12 2026 after four days, and it has been a confirmation
+# engine ever since).
+#
+# The Oct 13 reason for stopping it: on a clean trend day -- all three indices
+# opening at their low and closing at their high -- TREND correctly generated
+# CALL signals and the chase gate blocked them 13 times for 'bought the
+# extreme'. An engine whose signal is right and whose entry is always refused
+# produces nothing. Fixing that is a gate question, not a TREND question, and
+# it needs the premium archive rather than another threshold guess.
+#
+# With both REV and TREND off, NO engine books a trade. That is deliberate:
+# REBUILD_PLAN.md Phase 0. The book freezes at -Rs9,664 over 41 trades and the
+# archive keeps accumulating.
+PATH_TREND_LIVE          = False
 PATH_TREND_START         = '09:45'  # after OR forms (6 bars)
 PATH_TREND_END           = '13:00'  # leave >=90min runway to 14:30 force-close
 PATH_TREND_MIN_ADX       = 22       # lower than REV's 30 -- catches the trend while building
@@ -1748,6 +1987,124 @@ PHANTOM_PREM_TOP10_WEIGHTS    = {
     'NSE:SBIN-EQ': 3.0,
 }
 
+# --- ITM/ATM only (Oct 2 2026) ---------------------------------------------
+# Cap on how far OUT of the money an entry may go. 0 = ATM only; negative
+# values would buy ITM.
+#
+# Why: an option's break-even is an index move divided by its delta, so a
+# higher-delta contract needs LESS travel to pay. ATM delta is ~0.5 against
+# ~0.7 one strike in the money -- roughly 30% less movement required. That
+# attacks the binding constraint directly: only 23-31% of windows in our entry
+# range ever travel far enough to cover an ATM premium, and OTM raises that
+# bar rather than lowering it.
+#
+# In practice this is a GUARANTEE, not a behaviour change: PATH_REV and
+# PATH_TREND already set otm_strikes=0, and the POST11 OTM boost is gated
+# behind PATH_A_OTM_ENABLED=False. The clamp stops a future flag flip from
+# silently reintroducing OTM entries.
+#
+# NOT set negative (true ITM) despite the delta argument, because of capital:
+# a 1-strike ITM BANKNIFTY contract runs ~Rs24-31k of premium against Rs26,000
+# of working capital and a Rs5,000 per-trade risk cap. Revisit when capital or
+# the risk cap changes.
+MAX_OTM_STRIKES = 0
+
+# --- Dynamic OI/PCR support-resistance (Oct 2 2026) -------------------------
+# LOGGING ONLY -- deliberately not wired to any entry decision. See
+# oi_levels.py for why: eight static level definitions were tested across
+# 17,300 touches and every one rejected price at ~51%, as did repeated
+# rejection. A new definition has to beat that bar before it can trigger
+# anything. This one differs by reading the LIVE chain each bar and by scoring
+# OI CHANGE rather than OI level -- neither of which the static tests could see.
+OI_LEVELS_ENABLED        = True
+OI_LEVELS_LOG_EVERY_MIN  = 5
+OI_LEVEL_PCR_BULL        = 1.15   # PCR at/above -> put writers defending: support firms
+OI_LEVEL_PCR_BEAR        = 0.85   # PCR at/below -> call writers defending: resistance firms
+OI_LEVEL_PCR_ADJ         = 0.25   # how hard PCR reweights a level's score
+
+# --- Premium recorder (Oct 3 2026) -----------------------------------------
+# Captures what becomes PERMANENTLY untestable if it is not captured today.
+#
+# Fyers delists expired option contracts -- every historical option symbol
+# tested on Oct 2 returned "Invalid symbol provided". Consequences already
+# paid for: only 1 of 36 real-priced trades could be re-priced, and on that
+# one a plausible model was wrong by 6.7x (+Rs1,483 modelled vs +Rs221 real).
+# That is a capture problem, not a data problem. From today the archive builds
+# itself and Breeze stops being the bottleneck for anything going forward.
+#
+# Recorded every PREMIUM_REC_EVERY_MIN minutes, one batched quotes call per
+# instrument:
+#   * ATM +/- PREMIUM_REC_STRIKES option premiums, both legs -- makes future
+#     option backtests real-priced instead of modelled
+#   * bid/ask per contract -- we currently have NO spread data at all, so
+#     every paper fill and every backtest marks at LTP and flatters itself
+#   * index futures near + next month -- basis and term structure, entirely
+#     absent from the archive, and the instrument an 11-point index edge
+#     actually fits
+#   * per-strike OI and volume -- the raw distribution behind oi_levels, so a
+#     different level definition can be tested later on the same tape
+#   * spot, VIX and ATM IV at the SAME instant -- the existing stores sample
+#     these on different clocks and force interpolation
+#
+# Cost: ~21 symbols x 3 instruments every 5 min, one batched call each.
+# Roughly 1-3 MB/day of JSONL; disk is 32% used with 14G free.
+PREMIUM_RECORDER_ENABLED = True
+PREMIUM_REC_EVERY_MIN    = 5
+PREMIUM_REC_STRIKES      = 4      # ATM +/- this many strikes, both legs
+PREMIUM_REC_BATCH        = 25     # symbols per quotes() call
+# Non-futures extras only. Futures symbols are DERIVED from the date inside
+# premium_recorder._futures() -- hardcoding 'NSE:NIFTY26OCTFUT' here would go
+# stale every month and the symbol would quietly stop quoting, which looks
+# like missing data rather than a bug.
+PREMIUM_REC_EXTRA = {
+    'NIFTY':     [('vix', 'NSE:INDIAVIX-INDEX')],
+    'BANKNIFTY': [],
+    'SENSEX':    [],
+}
+
+# --- Shadow engine: ADX + VIX + OI + PCR (Oct 13 2026) ---------------------
+# LOGS ONLY. No orders, no phantom positions, no API calls of its own -- the
+# premium archive already records ATM +/-4 every 5 min, so the evaluator prices
+# these signals offline by joining the two files. Cannot touch the live book.
+#
+# HONEST PRIOR: each of these four inputs has already tested null.
+#   OI/PCR drift     642 obs  47.4% right  -0.025%
+#   MaxPain pull     666 obs  49.7%        +0.010%
+#   OI walls as S/R  n=10-63  ~51%, NIFTY and BNF opposite signs
+#   ADX->retracement 1,664    rho -0.058
+#   ADX as a gate    is what REV/TREND already use: p=0.663 / p=0.412
+#   VIX level        IV *level* predicts nothing (p=0.116); the ratio does
+# And the only conjunction tested so far (MACD+OI+price, "all three agree") was
+# the WORST of the group: 45.5% vs a 50.8% base rate, both halves negative.
+# What is untested is these four as a JOINT rule. Shadow costs nothing.
+#
+# Four components each vote -1/0/+1; VIX is a regime filter, not a vote.
+# Fires when |score| >= SHADOW_QUAD_FIRE_THRESHOLD and VIX is inside the band.
+#
+# EVERY evaluation is logged with the component votes AND the raw inputs, not
+# just the bars where it fires. One dataset then answers any threshold, any
+# subset of components, any cutoff -- OFFLINE. That is deliberate: live
+# sweeping is how 3,072 variants got tried and cost 9 permanently unreachable
+# confidence points.
+#
+# PRE-REGISTERED (written before any data exists, see REBUILD_PLAN.md):
+#   Hypothesis  at threshold 3, the signalled direction beats that
+#               instrument's own base rate in BOTH chronological halves.
+#   Kill        after 30 sessions, if the hit rate sits inside base rate +/-3pp
+#               or flips sign between halves, this engine is dead and that goes
+#               into REBUILD_PLAN.md. A threshold sweep afterwards does not
+#               rescue it -- the sweep IS the failure mode.
+SHADOW_QUAD_ENABLED        = True
+SHADOW_QUAD_LOG_EVERY_MIN  = 5
+SHADOW_QUAD_FIRE_THRESHOLD = 3      # of 4 components agreeing
+SHADOW_QUAD_ADX_FLOOR      = 20     # below this the ADX component abstains
+SHADOW_QUAD_DI_SPREAD      = 8      # DI dominance needed for a direction vote
+SHADOW_QUAD_PCR_BULL       = 1.10   # put writing -> writers defend downside
+SHADOW_QUAD_PCR_BEAR       = 0.90   # call writing -> writers defend upside
+SHADOW_QUAD_MP_MIN_DIST    = 0.20   # % of spot; inside this MaxPain abstains
+SHADOW_QUAD_VIX_MIN        = 11
+SHADOW_QUAD_VIX_MAX        = 22
+
 PHANTOM_PREMIUM_ENABLED  = True
 PHANTOM_PREM_TIME        = '10:00'   # same moment the live entry window opens
 PHANTOM_PREM_WING_GAPS   = 2         # wings this many strikes out (defines risk)
@@ -1762,8 +2119,27 @@ PAPER_REQUIRE_REAL_LTP = True
 
 COUNTERFACTUAL_ENABLED = True
 
-CHALLENGER_MODE        = 'SPREAD'   # 'SPREAD' | 'STRIKE' (legacy OTM study)
-CHALLENGER_SPREAD_GAPS = 2          # short leg this many strikes further OTM
+# CHALLENGER REMOVED Oct 13 2026. It ran for roughly two months in SPREAD mode
+# and closed ZERO trades, so the structural A/B it existed to run never
+# actually ran: n=0, no P&L, nothing learned. Code was deleted rather than
+# flag-gated, because the vX path already taught that lesson -- it sat first
+# in the dispatch cascade, reachable only because another flag routed there,
+# 0 trades in four months, and its only possible effect was to pre-empt a
+# working engine.
+#
+# What it was: a shadow book taking the same signal as the Champion with a
+# different strike (OI-guided OTM) or structure (debit spread, short leg
+# CHALLENGER_SPREAD_GAPS further out), to A/B strike selection.
+#
+# Why it produced nothing is itself worth knowing before rebuilding it: it was
+# gated on the Champion actually opening a position first (fixed Sep 13 2026
+# after it was found bypassing the rv_iv gate), and the Champion opened 41
+# positions in 22 sessions -- then the spread's own MIN_OPTION_PRICE and
+# net-credit floors rejected what was left. Any future structural A/B should
+# be driven off the signal, not off the Champion's fill.
+#
+# Kept deliberately: the `if 'challenger' in f: continue` filters in the
+# research scripts, so no analysis can ever read a stale challenger file.
 
 PATH_MR_SHADOW_ENABLED = True
 

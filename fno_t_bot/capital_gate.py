@@ -43,7 +43,37 @@ def get_combined_live_capital() -> float:
         return float(config.SENSEX_LIVE_START_CAPITAL)
 
 
-def get_risk_params(logger: logging.Logger | None = None) -> tuple:
+def get_sizing_book(instrument: str | None = None) -> float:
+    """Capital available for SIZING a position, from configuration.
+
+    Separate from get_combined_live_capital() on purpose. That function returns
+    SENSEX_LIVE_START_CAPITAL plus cumulative NIFTY/BANKNIFTY P&L -- a July 2026
+    constant eroded by paper losses -- and resolve_live_mode() depends on it to
+    decide live-vs-paper. Pointing the sizing path at configured capital while
+    leaving the gate alone keeps a capital change from silently flipping an
+    instrument into live mode.
+
+    The defect this fixes, found Oct 13 2026: TOTAL_CAPITAL was raised to
+    Rs300,000 and sizing never saw it. get_risk_params was reading Rs37,230 and
+    issuing a Rs3,723 risk cap, so the account balance had no effect on
+    position size whatsoever.
+    """
+    try:
+        if instrument:
+            per = (config.INSTRUMENT_STRATEGY.get(instrument, {}) or {}).get('capital')
+            if per:
+                return float(per)
+        tot = getattr(config, 'TOTAL_CAPITAL', None)
+        if tot:
+            n = max(1, len([i for i in getattr(config, 'INSTRUMENTS', {})]))
+            return float(tot) / n
+    except Exception:
+        pass
+    return float(getattr(config, 'SENSEX_LIVE_START_CAPITAL', 50_000))
+
+
+def get_risk_params(logger: logging.Logger | None = None,
+                    instrument: str | None = None) -> tuple:
     """
     v1.7: capital-scaled per-trade risk sizing.
 
@@ -63,14 +93,17 @@ def get_risk_params(logger: logging.Logger | None = None) -> tuple:
     """
     log = logger or _log
     try:
-        book  = get_combined_live_capital()
+        book  = get_sizing_book(instrument)
         pct   = getattr(config, 'MAX_RISK_PCT_OF_BOOK', 0.10)
         floor = getattr(config, 'MAX_RISK_FLOOR', 2500)
         cap   = max(float(floor), book * pct)
-        max_lots = 2
-        for _thr, _lots in sorted(getattr(config, 'DYN_MAX_LOTS_LADDER', [(0, 2)])):
-            if book >= _thr:
-                max_lots = int(_lots)
+        # ABSOLUTE ceiling only. The real constraint is the risk budget applied
+        # to the ACTUAL premium, computed per entry in
+        # TradingBot._affordable_lots(). DYN_MAX_LOTS_LADDER used to be the
+        # binding ceiling and it stopped at 4 lots for any book >= Rs1L, so
+        # Rs3L, Rs30L and Rs3cr all resolved to the same 4 -- a lookup table
+        # that simply ran out. It is kept as a hard safety stop, nothing more.
+        max_lots = int(getattr(config, 'ABSOLUTE_MAX_LOTS', 50))
         return cap, max_lots, book
     except Exception as exc:
         log.warning(f'[RISK-SCALE] book read failed ({exc}) — using static fallback')

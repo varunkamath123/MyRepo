@@ -231,6 +231,23 @@ def main():
     OUT_FILE.write_text(json.dumps(result, indent=2))
     log.info("Wrote %s", OUT_FILE)
 
+    # Append-only history. OUT_FILE is overwritten on every run, so until
+    # Oct 8 2026 this swarm had produced hundreds of directional calls and
+    # kept exactly none of them -- there was no way to ask whether its lean
+    # predicts anything. It is the one signal in this project that is not a
+    # function of price (it reads RBI policy, FII/DII flows, scheduled
+    # events), which makes it the most interesting thing we were not
+    # measuring. A call made at 08:45 is genuinely predictive, so the
+    # archive is clean by construction -- no hindsight can leak in.
+    try:
+        hist = OUT_FILE.parent / "logs" / "mirofish_history.jsonl"
+        hist.parent.mkdir(parents=True, exist_ok=True)
+        with open(hist, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(result, default=str) + chr(10))
+        log.info("Appended to %s", hist)
+    except Exception as exc:
+        log.warning("history append failed: %s", exc)
+
     for inst in ("NIFTY", "BANKNIFTY"):
         r = result[inst]
         log.info("[%s] lean=%s score=%.2f  reasons=%s",
