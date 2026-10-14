@@ -44,28 +44,27 @@ Morning news-exit scan (--morning-scan):
   with reason NEWS_EXIT. Thresholds are tighter than the entry veto — this
   only fires on a clear overnight flip, not a moderate contradiction.
 
-CONFIDENCE_DECAY — profit-gated, never realizes a loss:
+CONFIDENCE_DECAY — fires green or red (changed Oct 14 2026):
   A day's fresh Kronos read can quietly stop supporting the held direction
   (weak same-direction, NEUTRAL, or a sub-threshold opposing lean) without
   ever crossing the KRONOS_REV bar. This is conviction-based, not calendar-
-  based — a deliberate choice: a real-Kronos backtest check showed the
-  strategy's two best trades held 48 and 56 days respectively, well past any
-  defensible calendar cap derived from the (small, 12-20 trade) backtest
-  sample, so a time-based exit was tried and dropped as too likely to cut a
-  genuine trend early. CONFIDENCE_DECAY only fires when unrealized P&L >= 0;
-  if the position is red when conviction fades, it holds and stays governed
-  by the existing stop/trail/reversal/ST-flip/news checks instead — the
-  stop-loss remains the sole loss-cutting mechanism.
+  based — a time-based exit was tried and dropped because the strategy's
+  best trades held 48 and 56 days, well past any defensible calendar cap.
 
-  Known gap this profit-gate creates: a position underwater from day one
-  (e.g. the Aug 27 - Sep 9 2026 NIFTY trade) gets zero benefit from
-  CONFIDENCE_DECAY regardless of what Kronos's daily conviction actually
-  does, since in_profit is false the whole way. Position.entry_confidence
-  and the per-day "Signal check" log line (added after that trade) exist so
-  this is now checkable going forward -- whether conviction was fading
-  and blocked, or genuinely held steady while only price moved -- instead
-  of being invisible, which it was for that trade (confidence/direction
-  were computed daily but only ever logged on the day an exit fired).
+  It used to be profit-gated (fire only when unrealized P&L >= 0, on the
+  theory that the stop-loss should be the only loss-cutting mechanism). That
+  left a position underwater from day one (the Aug 27 - Sep 9 2026 NIFTY
+  trade, -43,046) with no way to act on vanished conviction, and the Oct 12
+  BANKNIFTY short went NEUTRAL within a day with the same problem. The gate
+  was removed on instruction.
+
+  Whether firing at a loss actually helps is tracked, not assumed: when
+  decay closes a RED position, a counterfactual copy keeps running under the
+  OLD profit-gated rule (decay_cf_state.json / decay_cf_trades.jsonl, no
+  capital at stake) until the old rules close it. Each closed pair records
+  real P&L (decay fired) vs not-fired P&L; the running "value of firing
+  decay" total is in --status. Decay exits taken while green aren't tracked
+  since old and new rules agree there.
 
 Predicted target / risk:reward (instrumentation, not yet a gate):
   score_forecast() in core/candle_patterns.py already computes a price
@@ -247,6 +246,34 @@ def _log_shadow_trade(record: dict):
         f.write(json.dumps(record) + "\n")
 
 
+# ── CONFIDENCE_DECAY counterfactual book ────────────────────────────────────
+# Live rule (since Oct 14 2026): CONFIDENCE_DECAY fires green or red. Whenever
+# it closes a position that was RED, the old rule would have kept holding it,
+# so a counterfactual copy of that position keeps running under the old
+# profit-gated rule (check_exit(..., decay_requires_profit=True)) until the old
+# rules close it. Each closed pair gives: real P&L (decay fired) vs
+# counterfactual P&L (decay had not fired); delta > 0 means firing helped.
+# Decay exits taken while GREEN are not tracked -- old and new rules agree.
+
+DECAY_CF_FILE = Path(__file__).parent / "decay_cf_state.json"
+DECAY_CF_LOG  = Path(__file__).parent / "decay_cf_trades.jsonl"
+
+
+def _load_decay_cf() -> dict:
+    if DECAY_CF_FILE.exists():
+        return json.loads(DECAY_CF_FILE.read_text())
+    return {"open": {}, "closed": 0, "sum_real": 0.0, "sum_cf": 0.0}
+
+
+def _save_decay_cf(cf: dict):
+    DECAY_CF_FILE.write_text(json.dumps(cf, indent=2))
+
+
+def _log_decay_cf(record: dict):
+    with open(DECAY_CF_LOG, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
 # ── Data access: complete daily context + live entry price ────────────────────
 
 def get_context(instrument: str, bars: int = 150) -> pd.DataFrame:
@@ -388,11 +415,17 @@ def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float, floa
 # ── Exit check ────────────────────────────────────────────────────────────────
 
 def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
-               price: float) -> Optional[str]:
+               price: float, decay_requires_profit: bool = False,
+               label: str = "") -> Optional[str]:
     """
     Return exit reason if the position should close at `price` (live), else None.
     Indicators/signal are computed on the complete daily context `df`; the P&L
     and stop/trail checks use the live `price`.
+
+    decay_requires_profit=False is the live rule (CONFIDENCE_DECAY fires
+    whether the position is green or red). True reproduces the OLD profit-gated
+    rule and exists only to drive the "decay had not fired" counterfactual
+    book (see decay_cf_* below); `label` tags its log lines.
     """
     p = INSTRUMENT_PARAMS.get(instrument, _DEFAULT_PARAMS)
 
@@ -435,8 +468,8 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
             conf_delta_str = f"{(confidence - pos.entry_confidence) * 100:+.0f}pp vs entry"
         else:
             conf_delta_str = f"direction differs from entry ({pos.direction})"
-        log.info("[%s] Signal check: %s conf=%.0f%%  (%s)  pnl=%s",
-                 instrument, direction, confidence * 100, conf_delta_str,
+        log.info("[%s]%s Signal check: %s conf=%.0f%%  (%s)  pnl=%s",
+                 instrument, label, direction, confidence * 100, conf_delta_str,
                  "profit" if in_profit else "loss")
 
         if EXIT_ON_KRONOS_REVERSAL:
@@ -446,10 +479,11 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
 
         # Confidence decay: today's read no longer independently supports
         # holding at entry-quality conviction (weak same-direction, NEUTRAL,
-        # or a sub-threshold opposing lean). Only realizes a win — if the
-        # position is red, the stop-loss remains the only way to cut it.
+        # or a sub-threshold opposing lean). Fires green or red (live rule,
+        # changed Oct 14 2026); the old profit-gated behaviour is only
+        # reachable via decay_requires_profit=True for the counterfactual.
         still_supported = (direction == pos.direction and confidence >= p["kronos_conf_min"])
-        if not still_supported and in_profit:
+        if not still_supported and (in_profit or not decay_requires_profit):
             return "CONFIDENCE_DECAY"
 
         if EXIT_ON_SUPERTREND_FLIP:
@@ -503,6 +537,7 @@ def cmd_daily_run(instruments: list[str]):
     """
     state = _load_state()
     shadow_state = _load_shadow_state()
+    decay_cf = _load_decay_cf()
     today = date.today().isoformat()
 
     # Fetch context + live price once per instrument
@@ -536,6 +571,18 @@ def cmd_daily_run(instruments: list[str]):
                      f"{record['predicted_profit_inr']:+.0f}" if record['predicted_profit_inr'] is not None else "n/a",
                      pos.entry_date)
             _log_trade(record)
+            if reason == "CONFIDENCE_DECAY" and pnl < 0:
+                # The old rule would have held this red position; keep a copy
+                # running under it so we can compare outcomes.
+                decay_cf["open"][inst] = {
+                    "pos":             asdict(pos),
+                    "real_exit_date":  today,
+                    "real_exit_price": price,
+                    "real_pnl_inr":    pnl,
+                }
+                log.info("[DECAY-CF][%s] counterfactual opened: decay fired while RED "
+                         "(real exit %.1f, INR %+.0f); tracking the hold under the old rule",
+                         inst, price, pnl)
             del state.positions[inst]
         else:
             pts = ((price - pos.entry_price) if pos.direction == "LONG"
@@ -563,6 +610,43 @@ def cmd_daily_run(instruments: list[str]):
                    else (pos.entry_price - price))
             log.info("[SHADOW][%s] HOLD %s  entry=%.1f  live=%.1f  unrealised INR %+.0f",
                      inst, pos.direction, pos.entry_price, price, pts * pos.lot_size)
+
+    # ── PASS 1c: decay counterfactual (OLD profit-gated rule, no capital) ───
+    for inst in list(decay_cf["open"].keys()):
+        if inst not in ctx:
+            continue
+        rec    = decay_cf["open"][inst]
+        cpos   = Position(**rec["pos"])
+        price  = px[inst]
+        reason = check_exit(inst, cpos, ctx[inst], price,
+                            decay_requires_profit=True, label="[DECAY-CF]")
+        if reason:
+            cf_pnl, record = _close_position_record(inst, cpos, reason, price, today)
+            value = rec["real_pnl_inr"] - cf_pnl        # > 0 => firing decay beat holding
+            decay_cf["closed"]   += 1
+            decay_cf["sum_real"] += rec["real_pnl_inr"]
+            decay_cf["sum_cf"]   += cf_pnl
+            record.update({
+                "event":           "DECAY_CF_CLOSE",
+                "real_exit_date":  rec["real_exit_date"],
+                "real_exit_price": rec["real_exit_price"],
+                "real_pnl_inr":    rec["real_pnl_inr"],
+                "cf_pnl_inr":      cf_pnl,
+                "decay_value_inr": value,
+            })
+            log.info("[DECAY-CF][%s] CLOSED via %s @ %.1f: not-fired INR %+.0f vs real INR %+.0f "
+                     "-> firing decay was worth INR %+.0f",
+                     inst, reason, price, cf_pnl, rec["real_pnl_inr"], value)
+            _log_decay_cf(record)
+            del decay_cf["open"][inst]
+        else:
+            rec["pos"] = asdict(cpos)                   # keeps hwm / trail progress
+            pts = ((price - cpos.entry_price) if cpos.direction == "LONG"
+                   else (cpos.entry_price - price))
+            log.info("[DECAY-CF][%s] HOLD %s  entry=%.1f  live=%.1f  not-fired unrealised INR %+.0f "
+                     "vs real exit INR %+.0f",
+                     inst, cpos.direction, cpos.entry_price, price,
+                     pts * cpos.lot_size, rec["real_pnl_inr"])
 
     # ── PASS 2: entries -- real (slot-gated) or MiroFish shadow (not) ───────
     # Every instrument without an open real OR shadow position gets evaluated
@@ -648,8 +732,10 @@ def cmd_daily_run(instruments: list[str]):
 
     _save_state(state)
     _save_shadow_state(shadow_state)
+    _save_decay_cf(decay_cf)
     print_status(state)
     print_shadow_status(shadow_state)
+    print_decay_cf_status(decay_cf)
 
 
 def cmd_morning_scan():
@@ -751,9 +837,30 @@ def print_shadow_status(shadow_state: ShadowState):
     print(sep)
 
 
+def print_decay_cf_status(cf: dict):
+    sep = "=" * 60
+    print(f"\n{sep}")
+    print("  DECAY COUNTERFACTUAL  (decay fired while red vs had it not)")
+    print(sep)
+    if cf["closed"]:
+        print(f"  Closed pairs : {cf['closed']}   real INR {cf['sum_real']:+,.0f}   "
+              f"not-fired INR {cf['sum_cf']:+,.0f}")
+        print(f"  Value of firing decay: INR {cf['sum_real'] - cf['sum_cf']:+,.0f}   "
+              f"(positive = firing helped)")
+    else:
+        print("  No closed pairs yet.")
+    for inst, rec in cf["open"].items():
+        p = rec["pos"]
+        print(f"  TRACKING {inst:<10} {p['direction']}  entry={p['entry_price']:.1f}  "
+              f"real exit {rec['real_exit_price']:.1f} on {rec['real_exit_date']} "
+              f"(INR {rec['real_pnl_inr']:+,.0f})")
+    print(sep)
+
+
 def cmd_status():
     print_status(_load_state())
     print_shadow_status(_load_shadow_state())
+    print_decay_cf_status(_load_decay_cf())
 
 
 def cmd_reset():
