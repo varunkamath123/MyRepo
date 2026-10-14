@@ -89,6 +89,11 @@ def _write(instrument: str, rec: dict) -> None:
         pass
 
 
+SIZING_FIELDS = ('unified_score', 'composite_score', 'exp_move_pct',
+                 'move_cover', 'rv_iv', 'entry_adx', 'rev_score',
+                 'trend_leg_atr', 'chase_pos')
+
+
 def record(bot, direction: str, index_px: float, gate: str, reason: str,
            hv: float, extra: dict | None = None) -> None:
     """Open a phantom position for a signal a gate just refused.

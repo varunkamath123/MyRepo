@@ -507,6 +507,48 @@ DYN_MAX_LOTS = 2
 # SENSEX_LIVE_START_CAPITAL plus cumulative paper P&L -- ₹37,230 on Oct 13 --
 # so raising TOTAL_CAPITAL to ₹300,000 changed the log line and nothing else.
 # get_sizing_book() now reads the configured per-instrument allocation.
+# ── Dynamic lot sizing ──────────────────────────────────────────────────────
+# 'fixed'   -> exactly what the engine asked for (engines hardcode 1)
+# 'risk'    -> EQUAL-RISK: scale so every trade risks ~TARGET_RISK_PER_TRADE
+# 'capital' -> upsize to whatever the capital can fund (see _affordable_lots)
+#
+# WHY SIZING MATTERS AT ALL, measured Oct 14 2026 by rescaling the 41 booked
+# trades -- identical entries, identical exits, only the quantum changed:
+#     size UP on unified_score      -Rs51,253
+#     size UP on move_cover         -Rs49,638
+#     size UP on rv_iv              -Rs39,518
+#     capital-scaled 4x             -Rs38,655
+#     1 lot flat (actual)            -Rs9,664
+#     equal-risk                    -Rs11,885
+#     size DOWN on unified_score     -Rs4,111
+#     size DOWN on exp_move_pct      +Rs6,656
+# A Rs58,000 spread from quantum alone -- a bigger effect than anything twelve
+# direction methods produced. Quantum is not secondary here.
+#
+# BUT THE SHAPE IS INVERTED. Every rule that sizes UP on a quality signal is
+# dramatically worse, because the quality signals themselves are inverted
+# (unified_score rho -0.174 against P&L; exp_move_pct rho -0.364, p=0.019).
+#
+# AND THE ONE POSITIVE RULE IS CIRCULAR. "Size down on exp_move_pct" is just a
+# restatement of that -0.364 correlation, applied to the same 41 trades, as one
+# of ten variants tried. It has zero out-of-sample content and fails all three
+# REBUILD_PLAN.md rules (n>=30 per cohort, both halves, pre-registered). It is
+# recorded here as a hypothesis to test forward, NOT as a setting to adopt.
+LOT_SIZING_MODE        = 'fixed'
+TARGET_RISK_PER_TRADE  = 2500    # used by mode 'risk'; the median of the 41
+                                 # booked trades was Rs2,422, with a 9.1x spread
+                                 # (Rs654 to Rs5,980) nobody intended
+
+# PRE-REGISTERED: what would earn conviction sizing its place.
+# Both engines are off, so no sizing rule can be validated on booked trades.
+# The counterfactual now records every sizing-relevant field on each tracked
+# signal (see counterfactual.SIZING_FIELDS), which makes rules evaluable on
+# SHADOW data -- out of sample relative to the 41 trades they were mined on.
+#   Test       research/sizing_eval.py, >= 30 shadow observations per cohort
+#   Earns it   a rule beats 1-lot flat in BOTH chronological halves
+#   Fails      anything that only works pooled, or needs the threshold moved
+# Until then LOT_SIZING_MODE stays 'fixed' and CONVICTION_LOT_SOURCE stays None.
+
 # 'fixed'   -> take exactly what the engine asked for (the engines hardcode 1,
 #              so the account balance has NO effect on size -- the behaviour
 #              that made Rs3L and Rs30L identical)

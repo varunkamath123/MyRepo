@@ -2518,6 +2518,42 @@ class TradingBot:
 
     # ── Trade Entry ───────────────────────────────────────────────────────────
 
+    def _shadow_sizing_fields(self, signal: dict, df) -> dict:
+        """Sizing-relevant fields capturable at a SHADOW signal point.
+
+        Not everything is. unified_score, exp_move_pct and move_cover are all
+        computed inside enter_trade, downstream of the signal, so they do not
+        exist when a shadow signal is logged. That matters: the one sizing rule
+        that turned the Oct 14 replay positive was 'size DOWN on exp_move_pct',
+        and it CANNOT be tested forward on shadow data as things stand. It was
+        also circular (mined from and tested on the same 41 trades), so the
+        honest position is that it remains untestable rather than promising.
+
+        What is available here: ADX, chase_pos, rv_iv, and the path's own
+        score fields.
+        """
+        out = {}
+        try:
+            out['entry_adx'] = signal.get('adx')
+            _px = float(signal.get('price') or 0)
+            _td = df[df.index.date == df.index[-1].date()]
+            if len(_td) and _px:
+                _hi = float(_td['High'].max()); _lo = float(_td['Low'].min())
+                if _hi > _lo:
+                    _rp = (_px - _lo) / (_hi - _lo)
+                    out['chase_pos'] = round(
+                        _rp if signal.get('type') == 'CALL' else 1.0 - _rp, 3)
+            _iv = getattr(self, '_last_atm_iv', None) or getattr(self, '_last_vix', None)
+            _hv = float(df['HV'].iloc[-1]) if 'HV' in df.columns else None
+            if _iv and _hv and _iv > 0:
+                out['rv_iv'] = round(_hv * 100.0 / _iv, 3)
+            for k in ('rev_score', 'rev_chase', 'trend_leg_atr'):
+                if signal.get(k) is not None:
+                    out[k] = signal.get(k)
+        except Exception:
+            pass
+        return out
+
     def _affordable_lots(self, premium: float, stop_pct: float) -> int:
         """How many lots this capital can actually fund, from the REAL premium.
 
@@ -2727,8 +2763,35 @@ class TradingBot:
         # The engines hardcode 'lots': 1, so without this the account balance
         # has no effect on position size at all. Any oversize is corrected by
         # the risk ladder immediately below.
-        if (str(getattr(config, 'LOT_SIZING_MODE', 'fixed')).lower() == 'capital'
-                and _fb_price):
+        _mode = str(getattr(config, 'LOT_SIZING_MODE', 'fixed')).lower()
+        if _mode == 'risk' and _fb_price:
+            # EQUAL-RISK NORMALISATION. Scale so every trade risks about the
+            # same rupee amount, instead of letting the lot size and premium
+            # decide it. Measured Oct 14 2026 across the 41 booked trades, risk
+            # per trade ranged Rs654 to Rs5,980 -- a 9.1x spread, with
+            # BANKNIFTY positions carrying a median Rs3,368 against NIFTY's
+            # Rs2,175 purely because its lot is dearer. Nothing intended that.
+            #
+            # This makes NO predictive claim and does not improve expectancy:
+            # replayed on those 41 trades it gives -Rs11,885 against -Rs9,664
+            # flat. What it does is even out the halves (-Rs5,692/-Rs6,193
+            # versus -Rs1,717/-Rs7,947), which is exactly what a variance tool
+            # should do and all it should be credited with.
+            _tgt = float(getattr(config, 'TARGET_RISK_PER_TRADE', 2500))
+            _one = float(_fb_price) * self.lot_size * max(_stop_pct, 0.01)
+            if _one > 0:
+                _rl = max(1, min(int(getattr(config, 'ABSOLUTE_MAX_LOTS', 50)),
+                                 int(round(_tgt / _one))))
+                _rl = min(_rl, self._affordable_lots(float(_fb_price), _stop_pct) or 1)
+                if _rl != lots:
+                    self.logger.info(
+                        f"  [SIZE] {self.instrument}: {lots} → {_rl} lot(s) "
+                        f"equal-risk (1 lot risks ₹{_one:,.0f}, target "
+                        f"₹{_tgt:,.0f})"
+                    )
+                    lots         = _rl
+                    eff_lot_size = self.lot_size * lots
+        if _mode == 'capital' and _fb_price:
             _aff = self._affordable_lots(float(_fb_price), _stop_pct)
             if _aff > lots:
                 self.logger.info(
@@ -5354,9 +5417,9 @@ class TradingBot:
                                         'REV_OFF',
                                         'PATH_REV_LIVE=False (stopped Oct 13 2026)',
                                         float(df['HV'].iloc[-1]),
-                                        extra=dict(path='REV',
-                                                   rev_score=_rev_sig.get('rev_score'),
-                                                   rev_chase=_rev_sig.get('rev_chase')))
+                                        extra=dict(
+                                            path='REV',
+                                            **self._shadow_sizing_fields(_rev_sig, df)))
                                 except Exception:
                                     pass
                                 self._path_rev_fired = True   # once per day
@@ -5395,8 +5458,9 @@ class TradingBot:
                                         float(_trend_sig['price']), 'TREND_OFF',
                                         'PATH_TREND_LIVE=False (stopped Oct 13 2026)',
                                         float(df['HV'].iloc[-1]),
-                                        extra=dict(path='TREND',
-                                                   trend_leg_atr=_trend_sig.get('trend_leg_atr')))
+                                        extra=dict(
+                                            path='TREND',
+                                            **self._shadow_sizing_fields(_trend_sig, df)))
                                 except Exception:
                                     pass
                                 self._path_trend_fired = True
