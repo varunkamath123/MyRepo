@@ -161,13 +161,19 @@ def expiry_candidates(instrument: str, limit: int = 8) -> list:
     min_days = config.MIN_DAYS_TO_EXPIRY
     today = datetime.now(IST).date()
     out = []
-    d = today
-    for _ in range(60):
-        if d.weekday() == twd and (d - today).days >= min_days:
-            out.append(d)
-            if len(out) >= limit:
-                break
-        d += timedelta(days=1)
+    # BANKNIFTY carries monthly_expiry_only: SEBI removed weekly BANKNIFTY
+    # options in Nov 2023 and NSE kept only NIFTY as a weekly-expiry index.
+    # Leading its candidate list with weeklies made every probe for it start
+    # on contracts that cannot exist, spending quote quota to rediscover a
+    # fact already sitting in config.
+    if not inst.get('monthly_expiry_only', False):
+        d = today
+        for _ in range(60):
+            if d.weekday() == twd and (d - today).days >= min_days:
+                out.append(d)
+                if len(out) >= limit:
+                    break
+            d += timedelta(days=1)
     for off in range(3):
         rm = today.month + off
         yr = today.year + (rm - 1) // 12
@@ -199,27 +205,55 @@ def get_quotable_expiry(fyers, instrument: str, underlying_price: float,
         return _QUOTABLE_EXPIRY_CACHE[ck]
     atm = atm_strike(instrument, underlying_price)
     tried = []
-    for e in expiry_candidates(instrument):
+    throttled = False
+    # One bare quote per candidate. get_ltp() helpfully retries the
+    # alternate Oct/Nov/Dec month-code convention, which doubles the quote
+    # count and is pointless here: build_option_symbol already emits the
+    # right convention, and the thing under test is the EXPIRY. SENSEX spent
+    # 18 quotes that way on Oct 15 2026 and hit the broker's rate limit
+    # mid-probe.
+    for e in expiry_candidates(instrument, limit=4):
         sym = build_option_symbol(instrument, atm, 'PUT', e)
         tried.append(e)
         try:
-            if get_ltp(fyers, sym, retries=0):
+            r = fyers.quotes({'symbols': sym}) or {}
+            d0 = (r.get('d') or [{}])[0]
+            lp = (d0.get('v') or {}).get('lp')
+            # A rate limit is NOT evidence that a contract is unlisted.
+            # Reading it as one is how this logged 'Option data will be
+            # EMPTY' for a contract that was listed and quoting at 708.10.
+            code = r.get('code') or d0.get('code')
+            msg = str(r.get('message') or d0.get('errmsg') or '').lower()
+            if code == 429 or 'limit reached' in msg:
+                throttled = True
+                break
+            if lp:
                 _QUOTABLE_EXPIRY_CACHE[ck] = e
                 if logger and len(tried) > 1:
                     logger.info(
                         f"  [EXPIRY] {instrument}: "
-                        f"{', '.join(str(t) for t in tried[:-1])} not listed — "
-                        f"using {e} ({(e - today).days} DTE)"
+                        f"{', '.join(str(t) for t in tried[:-1])} not listed "
+                        f"\u2014 using {e} ({(e - today).days} DTE)"
                     )
                 return e
         except Exception:
             continue
     fb = get_next_expiry(instrument)
+    if throttled:
+        # Do NOT cache a throttled result. Nothing was learned, and caching
+        # it would pin the instrument to an unverified expiry all session.
+        if logger:
+            logger.warning(
+                f"  [EXPIRY] {instrument}: broker rate-limited mid-probe "
+                f"after {len(tried)} candidate(s) \u2014 using {fb} "
+                f"unverified; will re-probe on the next call."
+            )
+        return fb
     if logger:
         logger.error(
             f"  [EXPIRY] {instrument}: NONE of "
-            f"{', '.join(str(t) for t in tried)} quoted — falling back to {fb}. "
-            f"Option data for this instrument will be EMPTY."
+            f"{', '.join(str(t) for t in tried)} quoted \u2014 falling back "
+            f"to {fb}. Option data for this instrument will be EMPTY."
         )
     _QUOTABLE_EXPIRY_CACHE[ck] = fb
     return fb

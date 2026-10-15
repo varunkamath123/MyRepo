@@ -296,6 +296,80 @@ _fo._QUOTABLE_EXPIRY_CACHE.clear()
 
 
 
+print('\n--- probing must not waste quota or misread a rate limit ---')
+# Both defects below were found by running the validator against the live
+# broker, not by a test, which is why they are pinned here now.
+
+
+class _Quota:
+    """Counts quotes and answers 429 after a budget, like the real broker."""
+
+    def __init__(self, listed, budget=99):
+        self.listed = set(listed)
+        self.budget = budget
+        self.asked = []
+
+    def quotes(self, req):
+        sym = req['symbols']
+        self.asked.append(sym)
+        if len(self.asked) > self.budget:
+            return {'s': 'error', 'code': 429, 'message': 'request limit reached'}
+        if sym in self.listed:
+            return {'s': 'ok', 'd': [{'v': {'lp': 123.45}}]}
+        return {'s': 'ok', 'd': [{'v': {}}]}
+
+
+# 1. monthly_expiry_only must keep weeklies out of the candidate list
+_bnf = _at(thu, lambda: _fo.expiry_candidates('BANKNIFTY', limit=4), 'BANKNIFTY')
+ck('BANKNIFTY candidates contain no weeklies',
+   all(c.day >= 22 for c in _bnf), True)
+ck('BANKNIFTY candidates start at the monthly date math picks',
+   _bnf[0], _expiry_on(thu, instrument='BANKNIFTY'))
+ck('BANKNIFTY does NOT offer the Oct 20 weekly it cannot trade',
+   _dt.date(2026, 10, 20) in _bnf, False)
+_nf = _at(thu, lambda: _fo.expiry_candidates('NIFTY', limit=4))
+ck('NIFTY, which DOES have weeklies, still gets them',
+   _dt.date(2026, 10, 20) in _nf, True)
+
+# 2. probe budget: one bare quote per candidate, list kept short
+_fo._QUOTABLE_EXPIRY_CACHE.clear()
+_q = _Quota([_oct27])
+_at(thu, lambda: _fo.get_quotable_expiry(_q, 'NIFTY', 23000.0))
+ck('one quote per candidate, no alternate-convention retry',
+   len(_q.asked) <= 4, True)
+ck('and each probe is a distinct symbol', len(set(_q.asked)), len(_q.asked))
+_fo._QUOTABLE_EXPIRY_CACHE.clear()
+
+# 3. a 429 is NOT evidence that a contract is unlisted
+_fo._QUOTABLE_EXPIRY_CACHE.clear()
+_lg = _Rec()
+_q = _Quota([_oct27], budget=0)        # throttled on the very first probe
+_e = _at(thu, lambda: _fo.get_quotable_expiry(_q, 'NIFTY', 23000.0, _lg))
+ck('a rate limit falls back to date math', _e, _expiry_on(thu))
+ck('and is reported as a WARNING, not an ERROR',
+   ([lv for lv, _ in _lg.msgs], any('rate-limited' in m for _, m in _lg.msgs)),
+   (['warn'], True))
+ck('it must NOT claim "data will be EMPTY" — nothing was learned',
+   any('EMPTY' in m for _, m in _lg.msgs), False)
+ck('a throttled answer is NOT cached, so the next call re-probes',
+   ('NIFTY', thu) in _fo._QUOTABLE_EXPIRY_CACHE, False)
+
+# the re-probe must then succeed once the limit clears
+_q2 = _Quota([_oct27])
+_e2 = _at(thu, lambda: _fo.get_quotable_expiry(_q2, 'NIFTY', 23000.0))
+ck('after re-probing it finds the listed expiry', _e2, _dt.date(2026, 10, 27))
+_fo._QUOTABLE_EXPIRY_CACHE.clear()
+
+# 4. a genuinely dead chain still reports ERROR and caches
+_lg = _Rec()
+_q = _Quota([])
+_e = _at(thu, lambda: _fo.get_quotable_expiry(_q, 'NIFTY', 23000.0, _lg))
+ck('a genuinely unlisted chain is still an ERROR',
+   any(lv == 'error' for lv, _ in _lg.msgs), True)
+ck('and that IS cached, since it was actually established',
+   ('NIFTY', thu) in _fo._QUOTABLE_EXPIRY_CACHE, True)
+_fo._QUOTABLE_EXPIRY_CACHE.clear()
+
 print('\n--- one expiry per instrument per session, used by EVERY path ---')
 # Before this, six call sites in options_bot each called get_next_expiry()
 # independently. On Oct 15 2026 that meant the premium recorder archived the
