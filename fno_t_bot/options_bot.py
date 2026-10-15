@@ -360,6 +360,7 @@ class TradingBot:
                     'lot_size'         : abs(qty),
                     'hv_at_entry'      : 0.18,  # fallback HV; trail/SL still works
                     'highest_pnl_pct'  : max(0.0, cur_pnl_pct),
+                    'lowest_pnl_pct'   : min(0.0, cur_pnl_pct),
                 }
                 self.positions.append(position)
                 self.trades_today += 1
@@ -2857,6 +2858,13 @@ class TradingBot:
                 f"pre-size risk; relying on SL-M + polling stop"
             )
 
+        # Initialised before the live/paper split on purpose. The paper branch
+        # set this and the live branch did not, so building the trade record
+        # would have raised NameError on the first REAL fill -- the exact shape
+        # of the Oct 13 2026 _stop_pct bug that killed a live SENSEX entry.
+        # Both engines are off today, so it would have waited to fire until the
+        # moment real money was switched back on.
+        _px_src = None
         if self.live:
             # ── LIVE: place real order ────────────────────────────────────────
             from fyers_orders import enter_live_position
@@ -2869,6 +2877,7 @@ class TradingBot:
                 return
             entry_price   = pos_info['entry_price']
             option_symbol = pos_info['option_symbol']
+            _px_src       = 'FILL'        # real broker fill, not a quote
             sl_order_id   = pos_info.get('sl_order_id')   # None if SL-M failed
             sl_trigger    = pos_info.get('sl_trigger', 0.0)
             if sl_order_id:
@@ -2893,7 +2902,7 @@ class TradingBot:
             _bs_price_est = bs_price(signal['type'], underlying, strike, T, hv)
             entry_price   = None
             option_symbol = None
-            _px_src       = 'BS'
+            _px_src       = 'BS'          # overwritten to 'LTP' on a real quote
             try:
                 from fyers_orders import (build_option_symbol, get_next_expiry,
                                           get_ltp, resolve_quotable_option)
@@ -3039,6 +3048,16 @@ class TradingBot:
             'lot_size'         : eff_lot_size,
             'hv_at_entry'      : hv,
             'highest_pnl_pct'  : 0.0,
+            # Trough, added Oct 15 2026. The book's single largest drain is
+            # the 25% stop (-Rs39,567 over 15 trades, mean -Rs2,638) and it
+            # was the ONE exit parameter that could not be replayed, because
+            # only the peak was ever recorded. Without the trough there is no
+            # way to know whether a trade stopped at -25% would have recovered
+            # or fallen to -60%, so the stop level cannot be tested at all.
+            # The target level WAS replayable and the replay said leave it
+            # alone (every level below 55% is worse once capped winners are
+            # counted). This closes the equivalent gap on the stop side.
+            'lowest_pnl_pct'   : 0.0,
             'target_pct'       : _dyn_tgt,       # IV-scaled target (or BASE_TARGET if IV unavailable)
             'path'             : _path,          # used by check_exits for per-path stop/target
             'otm_strikes'      : _otm,           # 0=ATM, 1/2=OTM degree (check_exits uses this)
@@ -3071,6 +3090,13 @@ class TradingBot:
             'composite_score'  : signal.get('composite_score'),
             'size_reason'      : signal.get('size_reason', ''),
             # v1.7.3: option-buyer entry-quality pack (logging only)
+            # px_src added Oct 15 2026. The trade log carried NO price-source
+            # field, so no analysis could tell a real fill from a
+            # Black-Scholes one -- and BS pricing is 41-123% wrong in this
+            # project. Resolving the rv_iv sign question meant excluding the
+            # Sep 24-28 window by RECALLING that the October symbol code was
+            # broken then, rather than reading it from the data. Never again.
+            'px_src'           : _px_src,         # 'LTP' (real) or 'BS' (modelled)
             'rv_iv'            : _rv_iv,          # realized/implied vol ratio (>1 = cheap premium)
             'rv_iv_src'        : _rv_iv_src,      # 'chain' (real ATM-IV) or 'vix' (SENSEX proxy)
             'entry_delta'      : round(_delta, 3) if _delta is not None else None,
@@ -3313,6 +3339,8 @@ class TradingBot:
             pnl_pct = (current_opt - pos['entry_price']) / pos['entry_price']
             if pnl_pct > pos['highest_pnl_pct']:
                 pos['highest_pnl_pct'] = pnl_pct
+            if pnl_pct < pos.get('lowest_pnl_pct', 0.0):
+                pos['lowest_pnl_pct'] = pnl_pct
 
             # ── Rolling option-price history (for rapid-spike exit) ───────────
             # Append current LTP every polling cycle; keep a fixed-length window
@@ -3508,6 +3536,7 @@ class TradingBot:
                     'exit_price'       : round(current_opt, 2),
                     'pnl_pct'          : round(pnl_pct * 100, 2),
                     'max_pnl_pct'      : round(pos.get('highest_pnl_pct', 0.0) * 100, 2),
+                    'min_pnl_pct'      : round(pos.get('lowest_pnl_pct', 0.0) * 100, 2),
                     'costs'            : round(costs, 2),
                     'pnl_net'          : round(pnl_net, 2),
                     'exit_reason'      : exit_reason,
@@ -3532,6 +3561,7 @@ class TradingBot:
                     'composite_score'  : pos.get('composite_score'),
                     'size_reason'      : pos.get('size_reason', ''),
                     # ── Option-buyer entry-quality pack (v1.7.3) ──────────
+                    'px_src'           : pos.get('px_src'),
                     'rv_iv'            : pos.get('rv_iv'),
                     'rv_iv_src'        : pos.get('rv_iv_src'),
                     'entry_delta'      : pos.get('entry_delta'),
