@@ -3190,9 +3190,12 @@ class TradingBot:
                 or src not in getattr(config, 'RV_IV_GATE_SRC', ('chain',))
                 or rv < getattr(config, 'RV_IV_MAX', 0.70)):
             return False
+        _blocking = bool(getattr(config, 'RV_IV_GATE_BLOCKING', True))
         self.logger.info(
             f"  [RV-IV GATE] {self.instrument} {signal.get('type')} "
-            f"path={signal.get('path')} BLOCKED \u2014 rv_iv {rv:.3f} >= "
+            f"path={signal.get('path')} "
+            f"{'BLOCKED' if _blocking else 'SHADOW (not blocking)'} "
+            f"— rv_iv {rv:.3f} >= "
             f"{getattr(config, 'RV_IV_MAX', 0.70)} "
             f"(HV={hv*100:.2f}% IV={iv:.2f}% src={src}) \u2014 realised vol has "
             f"already caught up to implied; forward-move expectancy sits in "
@@ -3212,9 +3215,15 @@ class TradingBot:
                     rv_iv=round(rv, 3), hv=round(hv * 100, 3), iv=round(iv, 3),
                     src=src, index=signal.get('price'),
                     adx=signal.get('adx'), chase_pos=signal.get('chase_pos'),
+                    blocking=_blocking,
                 )) + '\n')
         except Exception as exc:
             self.logger.debug(f"  [RV-IV GATE] blocked-log write failed: {exc}")
+        if not _blocking:
+            # Shadowed: the trade PROCEEDS, so its own trade record is the
+            # evidence. Writing a counterfactual here as well would
+            # double-count one signal across both books.
+            return False
         counterfactual.record(self, signal.get('type'), float(signal['price']),
                               'RV_IV', f'rv_iv {rv:.3f} >= '
                               f'{getattr(config, "RV_IV_MAX", 0.70)}', hv,

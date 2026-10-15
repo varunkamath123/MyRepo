@@ -136,7 +136,8 @@ def record(bot, direction: str, index_px: float, gate: str, reason: str,
             instrument=bot.instrument, date=day, gate=gate, reason=reason,
             type=direction, strike=strike, symbol=sym, px_src=src,
             entry_time=now, entry_price=float(px), entry_index=float(index_px),
-            lot_size=bot.lot_size, peak_pct=0.0, extra=(extra or {}),
+            lot_size=bot.lot_size, peak_pct=0.0, trough_pct=0.0,
+            extra=(extra or {}),
         ))
         bot.logger.info(
             f"  [COUNTERFACTUAL] {bot.instrument} {direction} blocked by {gate} "
@@ -218,7 +219,17 @@ def mark(bot, index_px: float, hv: float, force_close: bool = False) -> None:
                         0.01) / 365
                 cur = bs_price(pos['type'], index_px, pos['strike'], T, hv)
             pnl_pct = (cur - pos['entry_price']) / pos['entry_price']
-            pos['peak_pct'] = max(pos['peak_pct'], pnl_pct)
+            pos['peak_pct']   = max(pos['peak_pct'], pnl_pct)
+            # Trough as well as peak. Added Oct 15 2026: the 25% stop is the
+            # single largest drain in the real book (-Rs39,567 over 15 trades)
+            # and it cannot be replayed without knowing how far a position
+            # actually went against us -- a trade stopped at -25% might have
+            # recovered or might have gone to -60%, and only the trough tells
+            # them apart. min_pnl_pct was added to the LIVE position path the
+            # same day, but both engines run with PATH_*_LIVE=False, so no
+            # position is ever opened and that field would have collected
+            # nothing. This is the path that is actually running.
+            pos['trough_pct'] = min(pos['trough_pct'], pnl_pct)
             minutes = (now - pos['entry_time']).total_seconds() / 60.0
             why = _exit_reason(pos, pnl_pct, minutes, force_close)
             if not why:
@@ -237,6 +248,7 @@ def mark(bot, index_px: float, hv: float, force_close: bool = False) -> None:
                 exit_index=round(index_px, 2),
                 pnl_pct=round(pnl_pct * 100, 2),
                 peak_pct=round(pos['peak_pct'] * 100, 2),
+                min_pnl_pct=round(pos['trough_pct'] * 100, 2),
                 costs=round(costs, 2), pnl_net=round(pnl_net, 2),
                 exit_reason=why, px_src=pos['px_src'], **pos.get('extra', {}),
             ))

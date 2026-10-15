@@ -1618,7 +1618,18 @@ PATH_REV_ENABLED            = True    # enable reversal detection (logs paper si
 # REV fades exhaustion and does not consult direction at all -- that is by
 # design, and on trending days the design is simply wrong. Set True again only
 # with evidence from the REV_OFF counterfactual, not on a hunch.
-PATH_REV_LIVE               = False
+# PAPER-ON, not live-money-on. PAPER_TRADE_MODE=True above makes
+# options_bot's self.live False unconditionally, so no real order can be
+# placed regardless of this flag. What this controls is whether the path
+# TAKES A PAPER TRADE or merely writes a counterfactual record.
+#
+# Back on Oct 15 2026. Stopping it on Oct 13 cost real evidence for no
+# capital benefit: on Oct 15 alone, a +1.44% up day, four blocked signals
+# would all have won (+Rs10,825 total, every one exiting on the trailing
+# stop), two of them stopped solely because these switches were off.
+# Exits are where this book's P&L lives and the 25% stop is the only
+# untested lever left, so the real exit path has to actually run.
+PATH_REV_LIVE               = True     # paper trades; see PAPER_TRADE_MODE
 # START was '12:00', a fixed outer-bound guess unrelated to the actual exhaustion
 # condition. Diagnostic (Aug 8 2026, causal replay w/ multi-day ADX warm-up,
 # 236 eligible days): 142/236 (60%) first crossed score>=3 BEFORE 12:00; of
@@ -1733,7 +1744,7 @@ PATH_TREND_ENABLED       = True
 # With both REV and TREND off, NO engine books a trade. That is deliberate:
 # REBUILD_PLAN.md Phase 0. The book freezes at -Rs9,664 over 41 trades and the
 # archive keeps accumulating.
-PATH_TREND_LIVE          = False
+PATH_TREND_LIVE          = True     # paper trades; see PATH_REV_LIVE note
 PATH_TREND_START         = '09:45'  # after OR forms (6 bars)
 PATH_TREND_END           = '13:00'  # leave >=90min runway to 14:30 force-close
 PATH_TREND_MIN_ADX       = 22       # lower than REV's 30 -- catches the trend while building
@@ -2144,7 +2155,18 @@ COUNTERFACTUAL_ENABLED = True
 PATH_MR_SHADOW_ENABLED = True
 
 RV_IV_GATE_ENABLED = True
-RV_IV_MAX          = 0.70          # block entries at or above this ratio
+# SHADOW as of Oct 15 2026 -- rv_iv is still computed and logged, but it no
+# longer refuses a trade. The gate's LIVE record is 7 wrong out of 9: the nine
+# signals it actually stopped would have made +Rs6,050, the largest forgone
+# total of any gate in the counterfactual book. That contradicts the
+# taken-trade evidence, where trades with rv_iv >= 0.70 lost in BOTH
+# chronological halves (-Rs17,880 / -Rs4,260, win 28% vs 54%). Both
+# measurements are real and they disagree, so stop picking between them on
+# n=9. Shadowed, every high-rv_iv signal becomes a REAL paper trade with a
+# real outcome rather than a simulated one, which is the only way the
+# disagreement gets settled. Set back to True to re-arm.
+RV_IV_GATE_BLOCKING = False        # True = refuse the trade; False = log only
+RV_IV_MAX          = 0.70          # the ratio at or above which it fires
 RV_IV_GATE_SRC     = ('chain',)    # only gate when ATM-IV came from the real chain
 
 # ─── Post-11 Scorer Thresholds ───────────────────────────────────────────────
