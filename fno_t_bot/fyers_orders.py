@@ -206,38 +206,56 @@ def get_quotable_expiry(fyers, instrument: str, underlying_price: float,
     atm = atm_strike(instrument, underlying_price)
     tried = []
     throttled = False
-    # One bare quote per candidate. get_ltp() helpfully retries the
-    # alternate Oct/Nov/Dec month-code convention, which doubles the quote
-    # count and is pointless here: build_option_symbol already emits the
-    # right convention, and the thing under test is the EXPIRY. SENSEX spent
+    # Bare fyers.quotes(), not get_ltp(): get_ltp retries the alternate
+    # Oct/Nov/Dec month-code convention, which doubles the quote count and
+    # is pointless here, because build_option_symbol already emits the
+    # right convention and the thing under test is the EXPIRY. SENSEX spent
     # 18 quotes that way on Oct 15 2026 and hit the broker's rate limit
-    # mid-probe.
+    # mid-probe. Budget now: at most 4 candidates x 3 strikes, short-
+    # circuiting on the first leg that quotes, so the common case is one.
+    # 'strike_gap', the same key atm_strike() uses -- NOT 'strike_step',
+    # which does not exist in config and silently defaulted every
+    # instrument to 50. Real listed spacing is 50 for NIFTY but 100 for
+    # BANKNIFTY and SENSEX, so a 50 step probed BANKNIFTY strikes that are
+    # never listed (55750, 55850) and wasted two of its three probes.
+    step = int(config.INSTRUMENTS[instrument]['strike_gap'])
     for e in expiry_candidates(instrument, limit=4):
-        sym = build_option_symbol(instrument, atm, 'PUT', e)
         tried.append(e)
-        try:
-            r = fyers.quotes({'symbols': sym}) or {}
-            d0 = (r.get('d') or [{}])[0]
-            lp = (d0.get('v') or {}).get('lp')
-            # A rate limit is NOT evidence that a contract is unlisted.
-            # Reading it as one is how this logged 'Option data will be
-            # EMPTY' for a contract that was listed and quoting at 708.10.
-            code = r.get('code') or d0.get('code')
-            msg = str(r.get('message') or d0.get('errmsg') or '').lower()
-            if code == 429 or 'limit reached' in msg:
-                throttled = True
-                break
-            if lp:
-                _QUOTABLE_EXPIRY_CACHE[ck] = e
-                if logger and len(tried) > 1:
-                    logger.info(
-                        f"  [EXPIRY] {instrument}: "
-                        f"{', '.join(str(t) for t in tried[:-1])} not listed "
-                        f"\u2014 using {e} ({(e - today).days} DTE)"
-                    )
-                return e
-        except Exception:
-            continue
+        lp = None
+        # Probe a NEIGHBOURHOOD, not a single strike. One strike proves
+        # nothing: on Oct 15 2026 BANKNIFTY's only listed expiry (Oct 27)
+        # quoted at 55800 for 524.50 while 55750 and 55850 both returned
+        # nothing, so a single-strike probe one step off would have declared
+        # that expiry unlisted and pushed the instrument to Nov 24. The
+        # codebase already draws this distinction in resolve_quotable_option:
+        # a dead STRIKE is a one-strike problem, a dead NEIGHBOURHOOD is a
+        # wrong expiry. Any leg quoting is sufficient proof the expiry exists.
+        for k in (0, 1, -1):
+            sym = build_option_symbol(instrument, atm + k * step, 'PUT', e)
+            try:
+                r = fyers.quotes({'symbols': sym}) or {}
+                d0 = (r.get('d') or [{}])[0]
+                lp = (d0.get('v') or {}).get('lp')
+                code = r.get('code') or d0.get('code')
+                msg = str(r.get('message') or d0.get('errmsg') or '').lower()
+                if code == 429 or 'limit reached' in msg:
+                    throttled = True
+                    break
+                if lp:
+                    break
+            except Exception:
+                continue
+        if throttled:
+            break
+        if lp:
+            _QUOTABLE_EXPIRY_CACHE[ck] = e
+            if logger and len(tried) > 1:
+                logger.info(
+                    f"  [EXPIRY] {instrument}: "
+                    f"{', '.join(str(t) for t in tried[:-1])} not listed "
+                    f"\u2014 using {e} ({(e - today).days} DTE)"
+                )
+            return e
     fb = get_next_expiry(instrument)
     if throttled:
         # Do NOT cache a throttled result. Nothing was learned, and caching

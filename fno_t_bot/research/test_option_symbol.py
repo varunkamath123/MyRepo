@@ -370,6 +370,53 @@ ck('and that IS cached, since it was actually established',
    ('NIFTY', thu) in _fo._QUOTABLE_EXPIRY_CACHE, True)
 _fo._QUOTABLE_EXPIRY_CACHE.clear()
 
+print('\n--- a dead STRIKE must not be mistaken for a dead EXPIRY ---')
+# Found live Oct 15 2026: BANKNIFTY's only listed expiry (Oct 27) quoted at
+# strike 55800 for 524.50 while 55750 and 55850 both returned nothing. A
+# single-strike probe landing one step off would have declared that expiry
+# unlisted and pushed the instrument to the Nov 24 monthly. The same run
+# showed NIFTY Oct 20 dead across 3 consecutive strikes (0/3), which is what
+# a genuinely unlisted expiry looks like.
+import config as _cfg
+
+_nstep = int(_cfg.INSTRUMENTS['NIFTY'].get('strike_step', 50) or 50)
+
+# only the strike one step ABOVE the ATM quotes
+_up = _fo.build_option_symbol('NIFTY', 23000 + _nstep, 'PUT', _dt.date(2026, 10, 20))
+e, f = _quotable(thu, [_up])
+ck('an expiry proven by the strike one step UP is accepted',
+   e, _dt.date(2026, 10, 20))
+
+# only the strike one step BELOW quotes
+_dn = _fo.build_option_symbol('NIFTY', 23000 - _nstep, 'PUT', _dt.date(2026, 10, 20))
+e, f = _quotable(thu, [_dn])
+ck('an expiry proven by the strike one step DOWN is accepted',
+   e, _dt.date(2026, 10, 20))
+
+# the ATM itself still wins immediately, without spending neighbour probes
+_atm20 = _fo.build_option_symbol('NIFTY', 23000, 'PUT', _dt.date(2026, 10, 20))
+e, f = _quotable(thu, [_atm20])
+ck('a quoting ATM short-circuits on the first probe', (e, len(f.asked)),
+   (_dt.date(2026, 10, 20), 1))
+
+# a dead NEIGHBOURHOOD is still treated as the wrong expiry — the NIFTY case
+e, f = _quotable(thu, [_oct27])
+ck('a dead neighbourhood still rolls to the next expiry',
+   e, _dt.date(2026, 10, 27))
+ck('and it spent neighbour probes to establish that', len(f.asked) >= 3, True)
+ck('while staying inside the probe budget', len(f.asked) <= 12, True)
+
+# the throttle check must still win over the neighbourhood walk
+_fo._QUOTABLE_EXPIRY_CACHE.clear()
+_lg = _Rec()
+_q = _Quota([_up], budget=0)
+e = _at(thu, lambda: _fo.get_quotable_expiry(_q, 'NIFTY', 23000.0, _lg))
+ck('a 429 on the first neighbour aborts rather than walking on',
+   (e, len(_q.asked)), (_expiry_on(thu), 1))
+ck('and still reports it as unverified, not empty',
+   any('rate-limited' in m for _, m in _lg.msgs), True)
+_fo._QUOTABLE_EXPIRY_CACHE.clear()
+
 print('\n--- one expiry per instrument per session, used by EVERY path ---')
 # Before this, six call sites in options_bot each called get_next_expiry()
 # independently. On Oct 15 2026 that meant the premium recorder archived the
