@@ -75,11 +75,23 @@ def get_next_expiry(instrument: str) -> date:
     #
     # The monthly is always listed, so that is the correct fallback rather
     # than a weekly a further week out.
-    nearest = today
-    while nearest.weekday() != target_wday:
-        nearest += timedelta(days=1)
-    if (nearest - today).days >= min_days:
-        return nearest
+    # Walk forward to the next target weekday with enough runway. The Oct 12
+    # 2026 version of this checked ONLY the nearest target weekday and, if that
+    # was inside min_days, jumped straight to the monthly -- skipping the
+    # intervening weekly entirely. On Thu Oct 15 that made SENSEX ask for the
+    # Oct 29 monthly (14 DTE) when the Oct 22 weekly (7 DTE) was listed and
+    # quoting, so it recorded the wrong contract for three sessions: different
+    # theta, different delta, different economics. Restored to the forward walk.
+    #
+    # This function is DATE ARITHMETIC ONLY and cannot know what the exchange
+    # has actually listed -- NIFTY had no Oct 16/20/22 weekly at all while Nov 3
+    # quoted fine. Deciding what is tradeable is get_quotable_expiry()'s job;
+    # this is its candidate generator and its no-broker fallback.
+    check = today
+    for _ in range(21):
+        if check.weekday() == target_wday and (check - today).days >= min_days:
+            return check
+        check += timedelta(days=1)
 
     for month_offset in range(3):
         raw_month = today.month + month_offset
@@ -135,6 +147,82 @@ def build_option_symbol(instrument: str, strike: int,
     return f"{prefix}{exp_str}{strike}{opt_type}"
 
 
+
+
+_QUOTABLE_EXPIRY_CACHE = {}
+
+
+def expiry_candidates(instrument: str, limit: int = 8) -> list:
+    """Plausible expiries in date order: each target weekday, plus the next two
+    monthlies. Superset of get_next_expiry, which returns only the first."""
+    import calendar as _cal
+    inst = config.INSTRUMENTS[instrument]
+    twd = inst['expiry_weekday']
+    min_days = config.MIN_DAYS_TO_EXPIRY
+    today = datetime.now(IST).date()
+    out = []
+    d = today
+    for _ in range(60):
+        if d.weekday() == twd and (d - today).days >= min_days:
+            out.append(d)
+            if len(out) >= limit:
+                break
+        d += timedelta(days=1)
+    for off in range(3):
+        rm = today.month + off
+        yr = today.year + (rm - 1) // 12
+        mon = ((rm - 1) % 12) + 1
+        last = date(yr, mon, _cal.monthrange(yr, mon)[1])
+        m = last - timedelta(days=(last.weekday() - twd) % 7)
+        if (m - today).days >= min_days and m not in out:
+            out.append(m)
+    return sorted(set(out))
+
+
+def get_quotable_expiry(fyers, instrument: str, underlying_price: float,
+                        logger=None):
+    """The nearest expiry the broker will actually quote.
+
+    Date arithmetic alone has been wrong twice in four days (see the module
+    docstring for this patch). This asks instead: build a candidate list, probe
+    an ATM strike on each, return the first that returns a price. Cached per
+    instrument per day, so it costs a handful of quotes once a session.
+
+    Falls back to get_next_expiry() when there is no broker session, so
+    backtests and unit tests behave exactly as before.
+    """
+    if not fyers:
+        return get_next_expiry(instrument)
+    today = datetime.now(IST).date()
+    ck = (instrument, today)
+    if ck in _QUOTABLE_EXPIRY_CACHE:
+        return _QUOTABLE_EXPIRY_CACHE[ck]
+    atm = atm_strike(instrument, underlying_price)
+    tried = []
+    for e in expiry_candidates(instrument):
+        sym = build_option_symbol(instrument, atm, 'PUT', e)
+        tried.append(e)
+        try:
+            if get_ltp(fyers, sym, retries=0):
+                _QUOTABLE_EXPIRY_CACHE[ck] = e
+                if logger and len(tried) > 1:
+                    logger.info(
+                        f"  [EXPIRY] {instrument}: "
+                        f"{', '.join(str(t) for t in tried[:-1])} not listed — "
+                        f"using {e} ({(e - today).days} DTE)"
+                    )
+                return e
+        except Exception:
+            continue
+    fb = get_next_expiry(instrument)
+    if logger:
+        logger.error(
+            f"  [EXPIRY] {instrument}: NONE of "
+            f"{', '.join(str(t) for t in tried)} quoted — falling back to {fb}. "
+            f"Option data for this instrument will be EMPTY."
+        )
+    _QUOTABLE_EXPIRY_CACHE[ck] = fb
+    return fb
 
 def resolve_quotable_option(fyers, instrument: str, ideal_strike: int,
                             option_type: str, expiry, max_steps: int = 2):

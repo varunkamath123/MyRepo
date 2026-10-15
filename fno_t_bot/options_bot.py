@@ -2727,7 +2727,7 @@ class TradingBot:
                                           get_next_expiry, get_ltp)
                 _fb_sym   = build_option_symbol(self.instrument, strike,
                                                 signal['type'],
-                                                get_next_expiry(self.instrument))
+                                                self._expiry())
                 _fb_price = get_ltp(self.fyers, _fb_sym)
                 if _fb_price is None:
                     break   # LTP unavailable — proceed with current strike as-is
@@ -2818,7 +2818,7 @@ class TradingBot:
                                               get_next_expiry, get_ltp)
                     _alt_prem = get_ltp(self.fyers, build_option_symbol(
                         self.instrument, _alt_strike, signal['type'],
-                        get_next_expiry(self.instrument)))
+                        self._expiry()))
                 else:
                     _alt_prem = bs_price(signal['type'], underlying, _alt_strike,
                                          config.DAYS_TO_EXPIRY / 365, hv)
@@ -2897,7 +2897,7 @@ class TradingBot:
             try:
                 from fyers_orders import (build_option_symbol, get_next_expiry,
                                           get_ltp, resolve_quotable_option)
-                _expiry       = get_next_expiry(self.instrument)
+                _expiry       = self._expiry()
                 option_symbol = build_option_symbol(
                     self.instrument, strike, signal['type'], _expiry
                 )
@@ -3196,6 +3196,52 @@ class TradingBot:
                                          path=signal.get('path')))
         return True
 
+    def _expiry(self):
+        """The expiry this instrument should trade today, validated once.
+
+        Every expiry lookup in this class goes through here. Before Oct 15 2026
+        there were six independent call sites all calling get_next_expiry()
+        separately, which meant the premium recorder could archive one contract
+        while enter_trade priced another -- and on Oct 15 that is exactly what
+        happened, because no October NIFTY weekly after Oct 13 was listed at
+        all while the Oct 27 monthly quoted fine.
+
+        The worst of those call sites was the DTE override, which writes
+        config.DAYS_TO_EXPIRY and therefore sets T in every Black-Scholes price
+        this process computes. Pointed at an unlisted Oct 20 contract it
+        reported 5 DTE for an instrument whose real nearest tradeable expiry
+        was 12 days out: T wrong by 2.4x, on a pricing path this project has
+        already measured at 41-123% error even when T is right.
+
+        Falls back to date arithmetic whenever there is no broker session or no
+        usable spot, so backtests and unit tests are unaffected.
+        """
+        try:
+            from fyers_orders import get_quotable_expiry, get_next_expiry
+            if not getattr(self, 'fyers', None):
+                return get_next_expiry(self.instrument)
+            # Only a rough spot is needed -- it just picks the ATM strike to
+            # probe with. Last bar close first, a live index quote second.
+            spot = None
+            for src in (lambda: float(self._idx_closes.iloc[-1]),
+                        lambda: float(self.fyers.quotes(
+                            {'symbols': self.inst_cfg['index_symbol']}
+                        )['d'][0]['v']['lp'])):
+                try:
+                    v = src()
+                    if v and v > 0:
+                        spot = v
+                        break
+                except Exception:
+                    continue
+            if not spot:
+                return get_next_expiry(self.instrument)
+            return get_quotable_expiry(self.fyers, self.instrument, spot,
+                                       self.logger)
+        except Exception:
+            from fyers_orders import get_next_expiry
+            return get_next_expiry(self.instrument)
+
     def _quote_option(self, strike: int, opt_type: str, underlying: float,
                       hv: float) -> tuple:
         """Real traded premium for one leg, Black-Scholes only as fallback.
@@ -3206,9 +3252,9 @@ class TradingBot:
         T = config.DAYS_TO_EXPIRY / 365
         px, sym, src = bs_price(opt_type, underlying, strike, T, hv), None, 'BS'
         try:
-            from fyers_orders import build_option_symbol, get_next_expiry, get_ltp
+            from fyers_orders import build_option_symbol, get_ltp
             sym = build_option_symbol(self.instrument, strike, opt_type,
-                                      get_next_expiry(self.instrument))
+                                      self._expiry())
             if self.fyers and sym:
                 ltp = get_ltp(self.fyers, sym)
                 if ltp and ltp > 0:
@@ -4493,8 +4539,9 @@ class TradingBot:
         # NIFTY monthly-Monday (~13d mid-month); BNF monthly-Wed (~14d); SENSEX weekly-Fri (~2d).
         # Each instrument runs in its own process, so mutating config here is safe.
         try:
-            from fyers_orders import get_next_expiry as _gte
-            _exp_date   = _gte(self.instrument)
+            # Validated, not assumed: this writes config.DAYS_TO_EXPIRY and
+            # therefore T for every Black-Scholes price in this process.
+            _exp_date   = self._expiry()
             _actual_dte = max((_exp_date - datetime.now(IST).date()).days, 1)
             _old_dte    = config.DAYS_TO_EXPIRY
             config.DAYS_TO_EXPIRY = _actual_dte
@@ -5107,7 +5154,7 @@ class TradingBot:
                                 if self.live and self.fyers:
                                     from fyers_orders import (build_option_symbol,
                                                               get_next_expiry, get_ltp)
-                                    _nm_expiry = get_next_expiry(self.instrument)
+                                    _nm_expiry = self._expiry()
                                     _nm_sym    = build_option_symbol(
                                         self.instrument, _nm_strike,
                                         _nm_dir, _nm_expiry)

@@ -132,11 +132,17 @@ def _futures(instrument: str) -> list:
 def _symbols(bot, spot: float) -> tuple:
     """(option symbols, [(label, symbol)] extras). Empty on any failure."""
     try:
-        from fyers_orders import build_option_symbol, get_next_expiry
+        from fyers_orders import (build_option_symbol, get_next_expiry,
+                                  get_quotable_expiry)
         n = int(getattr(config, 'PREMIUM_REC_STRIKES', 4))
         gap = bot.strike_gap
         atm = int(round(spot / gap) * gap)
-        exp = get_next_expiry(bot.instrument)
+        # Ask the broker which expiry is listed rather than trusting date
+        # maths. NIFTY logged 75 snapshots a day with ZERO legs for three
+        # sessions because Oct 16/20/22 weeklies are simply not listed
+        # while Nov 3 is -- and no amount of calendar logic predicts that.
+        exp = get_quotable_expiry(bot.fyers, bot.instrument, spot,
+                                  getattr(bot, 'logger', None))
         opts = []
         for i in range(-n, n + 1):
             k = atm + i * gap
