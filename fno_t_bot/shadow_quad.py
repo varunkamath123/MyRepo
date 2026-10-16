@@ -207,10 +207,53 @@ def evaluate(bot, df, oc, spot) -> dict | None:
         if vix_ok and abs(score) >= thr:
             direction = 'CALL' if score > 0 else 'PUT'
 
+        # ── Magnitude context, added Oct 16 2026 ───────────────────────
+        # The quad votes on DIRECTION only, and direction has no measured edge
+        # in this book. What DOES separate is whether the day can deliver a
+        # move big enough to pay for the option at all: split by trailing
+        # realised vol at entry, the share of 240min windows clearing an
+        # IV-adjusted break-even runs 23.4% in the bottom quintile against
+        # 50.0% in the top -- a +26.6 point gap that is monotone across all
+        # five and holds in both chronological halves (+26.1 / +30.4).
+        #
+        # Splitting by IV instead collapses to +12 and is non-monotone, which
+        # is the tell: IV rises only 1.34x across those quintiles while the
+        # actual excursion rises 2.3x, so implied under-responds to realised.
+        # That gap is the whole opportunity, and a fitted GARCH does NOT
+        # capture it better -- it came last in a walk-forward contest against
+        # this same plain trailing estimator (n=901).
+        #
+        # Logged, not acted on. It makes the pairing measurable: does a quad
+        # fire on a high-vol day behave differently from one on a dead day?
+        # Nothing can answer that until both fields sit on the same record.
+        _hv = _impl = _ratio = None
+        try:
+            _h = df['HV'].iloc[-1] if 'HV' in df.columns else None
+            _hv = round(float(_h), 4) if _h == _h and _h is not None else None
+        except Exception:
+            pass
+        try:
+            _iv = float((oc or {}).get('atm_iv') or 0) or None
+            if _iv:
+                _impl = round(_iv / (252 ** 0.5), 4)      # implied 1-session move %
+                if _hv:
+                    _ratio = round(_hv / _impl, 3)        # realised vs implied
+        except Exception:
+            pass
+
         return dict(
             instrument=bot.instrument, spot=round(float(spot), 2),
             score=score, direction=direction, fired=bool(direction),
             vix=vix, vix_ok=vix_ok,
+            # date was only ever recoverable from the FILENAME, which made
+            # every evaluator reconstruct it with a regex. Put it on the row.
+            # _late('IST') not the module-level IST: this module is
+            # imported by options_bot BEFORE options_bot defines IST, so
+            # the module-level name is bound to None and a naive
+            # datetime would stamp the host's timezone, not IST.
+            date=(datetime.now(_late('IST')) if _late('IST')
+                  else datetime.now()).strftime('%Y-%m-%d'),
+            hv=_hv, impl_daily=_impl, rv_iv_fwd=_ratio,
             votes=dict(adx=a_v, pcr=p_v, maxpain=m_v, wall=w_v),
             why=dict(adx=a_d, pcr=p_d, maxpain=m_d, wall=w_d),
             raw=dict(adx=adx, di_plus=di_p, di_minus=di_m,

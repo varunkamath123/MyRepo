@@ -49,9 +49,22 @@ ck('target at +2 ATR', 'Target' in (SF._exit_reason(dict(pos), 57000 + 165, now)
 p2 = dict(pos); SF._exit_reason(p2, 57000 + 130, now)          # arm trail
 ck('trail arms then fires', 'Trail' in (SF._exit_reason(p2, 57000 + 60, now) or ''),
    str(SF._exit_reason(p2, 57000 + 60, now)))
-ck('force close respected',
+# Derived from config, not hardcoded. This asserted 14:35 back when
+# FORCE_CLOSE_TIME was "14:30"; the setting later moved to "15:00" and the
+# assertion silently became wrong -- it was asserting that a force-close fires
+# 25 minutes BEFORE the force-close time. It went unnoticed because this file
+# had no sys.exit, so it reported "1 failed" and still exited 0, and the suite
+# runner trusted the exit code.
+_fct = getattr(config, 'FORCE_CLOSE_TIME', '15:00')
+_fh, _fm = (int(x) for x in _fct.split(':'))
+ck('force close respected at FORCE_CLOSE_TIME',
    'Force-Close' in (SF._exit_reason(dict(pos), 57010.0,
-                                     dt.datetime(2026, 9, 2, 14, 35)) or ''))
+                                     dt.datetime(2026, 9, 2, _fh, _fm)) or ''),
+   f'FORCE_CLOSE_TIME={_fct}')
+ck('and NOT a minute before it',
+   SF._exit_reason(dict(pos), 57010.0,
+                   dt.datetime(2026, 9, 2, _fh, _fm) - dt.timedelta(minutes=1))
+   is None)
 
 print()
 print('=' * 74); print('3. BACKTEST — all local sessions, index points'); print('=' * 74)
@@ -130,3 +143,4 @@ if rows:
 
 print()
 print('=' * 74); print(f'RESULT: {P} passed, {F} failed'); print('=' * 74)
+sys.exit(1 if F else 0)
