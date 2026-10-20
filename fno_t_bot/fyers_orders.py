@@ -149,6 +149,38 @@ def build_option_symbol(instrument: str, strike: int,
 
 
 
+import time as _t
+
+
+def _is_rate_limited(msg: str) -> bool:
+    """Is this broker error a rate limit, or a genuinely missing contract?
+
+    The first version tested `'limit reached' in msg`, which does NOT match
+    what Fyers actually returns:
+
+        You've reached the Standard plan limit of 5,000 requests/day
+        You've reached the Standard plan limit of 5 requests/second
+
+    That is 'reached ... limit of', not 'limit reached'. So on Oct 19 2026
+    every throttled quote fell through to the 'expiry genuinely not listed'
+    branch, and get_quotable_expiry logged 'NONE of ... quoted -- Option data
+    for this instrument will be EMPTY' about SENSEX 2026-10-22, a contract
+    verified quoting at 708.10 four days earlier -- then CACHED that wrong
+    answer for the rest of the session.
+
+    Substring-matching a vendor error string is fragile by nature, so this
+    casts a wide net and errs toward 'throttled'. Mistaking a missing contract
+    for a throttle costs one wasted re-probe; mistaking a throttle for a
+    missing contract silently empties a whole day of data.
+    """
+    m = (msg or '').lower()
+    if not m:
+        return False
+    if 'rate limit' in m or 'too many request' in m:
+        return True
+    return 'limit' in m and ('reached' in m or 'exceed' in m or 'request' in m)
+
+
 _QUOTABLE_EXPIRY_CACHE = {}
 
 
@@ -238,9 +270,12 @@ def get_quotable_expiry(fyers, instrument: str, underlying_price: float,
                 lp = (d0.get('v') or {}).get('lp')
                 code = r.get('code') or d0.get('code')
                 msg = str(r.get('message') or d0.get('errmsg') or '').lower()
-                if code == 429 or 'limit reached' in msg:
+                if code == 429 or _is_rate_limited(msg):
                     throttled = True
                     break
+                # The 5-requests/second cap is separate from the daily one, and
+                # this walks up to 12 sequential quotes with nothing between.
+                _t.sleep(0.25)
                 if lp:
                     break
             except Exception:

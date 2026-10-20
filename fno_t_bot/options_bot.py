@@ -119,6 +119,44 @@ def bs_delta(option_type: str, S: float, K: float,
 
 # ─── Bot ─────────────────────────────────────────────────────────────────────
 
+def _shared_history(fyers, symbol: str, from_date, to_date, logger=None,
+                    max_age_sec: int = 60):
+    """history() for a series every instrument needs, fetched once per minute.
+
+    The three bots run as separate processes, so the cache is a file keyed by
+    symbol with an mtime freshness check rather than anything in memory.
+
+    Every failure path falls through to a direct fetch. A cache that can break
+    the thing it caches is worse than no cache, and this one sits in front of
+    the VIX series that two live gates depend on.
+    """
+    import json as _j, os as _o, tempfile as _tf, time as _tm
+    key = "".join(c if c.isalnum() else "_" for c in symbol)
+    path = _o.path.join(config.LOG_DIRECTORY, f".cache_hist_{key}.json")
+    try:
+        if _o.path.exists(path) and (_tm.time() - _o.path.getmtime(path)) < max_age_sec:
+            with open(path, encoding="utf-8") as fh:
+                return _j.load(fh)
+    except Exception:
+        pass
+    resp = fyers.history({
+        "symbol": symbol, "resolution": "5", "date_format": "1",
+        "range_from": from_date, "range_to": to_date, "cont_flag": "1",
+    })
+    try:
+        if isinstance(resp, dict) and resp.get("s") == "ok":
+            _o.makedirs(config.LOG_DIRECTORY, exist_ok=True)
+            # atomic replace: three processes write this concurrently and a
+            # half-written file would be read back as corrupt JSON
+            fd, tmp = _tf.mkstemp(dir=config.LOG_DIRECTORY, suffix=".tmp")
+            with _o.fdopen(fd, "w", encoding="utf-8") as fh:
+                _j.dump(resp, fh)
+            _o.replace(tmp, path)
+    except Exception as exc:
+        if logger:
+            logger.debug(f"  [HIST-CACHE] write failed for {symbol}: {exc}")
+    return resp
+
 class TradingBot:
 
     def __init__(self, instrument: str):
@@ -514,14 +552,14 @@ class TradingBot:
             # Silent fail: VIX unavailable leaves df unchanged — both filters dormant.
             if config.USE_VIX_FILTER:
                 try:
-                    _vix_resp = self.fyers.history({
-                        "symbol"     : "NSE:INDIAVIX-INDEX",
-                        "resolution" : "5",
-                        "date_format": "1",
-                        "range_from" : from_date,
-                        "range_to"   : to_date,
-                        "cont_flag"  : "1",
-                    })
+                    # Shared across the three bot processes. India VIX is a
+                    # single series and all three were fetching it every
+                    # minute: 1,125 calls/day for one number. That is 15% of
+                    # the Fyers Standard daily cap, which Oct 19 2026 blew at
+                    # 14:43 -- costing the last 47 minutes of exit pricing.
+                    _vix_resp = _shared_history(
+                        self.fyers, "NSE:INDIAVIX-INDEX", from_date, to_date,
+                        getattr(self, "logger", None))
                     if _vix_resp.get('s') == 'ok' and _vix_resp.get('candles'):
                         _vdf = pd.DataFrame(
                             _vix_resp['candles'],

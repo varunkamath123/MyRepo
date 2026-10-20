@@ -417,6 +417,50 @@ ck('and still reports it as unverified, not empty',
    any('rate-limited' in m for _, m in _lg.msgs), True)
 _fo._QUOTABLE_EXPIRY_CACHE.clear()
 
+print('\n--- a throttle must never be read as "contract not listed" ---')
+# Oct 19 2026: the Fyers Standard plan cap (5,000 requests/day) was hit at
+# 14:43:59. The first version of the guard tested `'limit reached' in msg`,
+# but Fyers says "You've reached the Standard plan limit of 5,000
+# requests/day" -- 'reached ... limit of', not 'limit reached'. Every
+# throttled quote therefore fell through to the genuinely-unlisted branch and
+# the log claimed SENSEX 2026-10-22 was not listed and that "Option data for
+# this instrument will be EMPTY", four days after that exact contract was
+# verified quoting at 708.10. It then cached the wrong answer for the session.
+_rl = _fo._is_rate_limited
+for _m in ("You've reached the Standard plan limit of 5,000 requests/day",
+           "You've reached the Standard plan limit of 5 requests/second",
+           'request limit reached', 'Rate limit exceeded', 'Too many requests',
+           'RATE LIMIT'):
+    ck(f'throttle recognised: {_m[:38]!r}', _rl(_m), True)
+for _m in ('invalid symbol', '', None, 'no data found for this contract',
+           'symbol not found'):
+    ck(f'not a throttle: {str(_m)[:38]!r}', _rl(_m), False)
+
+# end to end: the real Fyers wording must reach the throttled branch
+class _PlanCap:
+    def __init__(self): self.asked = []
+    def quotes(self, req):
+        self.asked.append(req['symbols'])
+        return {'s': 'error',
+                'message': "You've reached the Standard plan limit of "
+                           "5,000 requests/day"}
+
+
+_fo._QUOTABLE_EXPIRY_CACHE.clear()
+_lg = _Rec()
+_cap = _PlanCap()
+_e = _at(thu, lambda: _fo.get_quotable_expiry(_cap, 'NIFTY', 23000.0, _lg))
+ck('the real plan-cap wording aborts after ONE probe', len(_cap.asked), 1)
+ck('and falls back to date math', _e, _expiry_on(thu))
+ck('reported as a WARNING, not an ERROR',
+   ([lv for lv, _ in _lg.msgs], any('rate-limited' in m for _, m in _lg.msgs)),
+   (['warn'], True))
+ck('and never claims the data will be EMPTY',
+   any('EMPTY' in m for _, m in _lg.msgs), False)
+ck('and is NOT cached, so the next call re-probes',
+   ('NIFTY', thu) in _fo._QUOTABLE_EXPIRY_CACHE, False)
+_fo._QUOTABLE_EXPIRY_CACHE.clear()
+
 print('\n--- one expiry per instrument per session, used by EVERY path ---')
 # Before this, six call sites in options_bot each called get_next_expiry()
 # independently. On Oct 15 2026 that meant the premium recorder archived the
