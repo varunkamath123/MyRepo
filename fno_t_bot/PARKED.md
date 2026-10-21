@@ -22,10 +22,25 @@ timers `fno_t_bot_ovn@{amo,entry,morning,reconcile}`, `fno_t_bot_weekly_analyzer
 (the daily token the new bot also uses), `fno_t_bot_datacollect` (nightly history
 the new bot reads for levels and baselines), `fno_t_bot_oi_eod`.
 
+## The trap that undid the parking, and the fix
+
+`systemctl disable --now` is **not** enough. The shared token job
+(`fno_t_bot_auth.service`) ends with
+
+    ExecStartPost=+/bin/systemctl restart --no-block fno_t_bot_nifty fno_t_bot_banknifty fno_t_bot_sensex
+
+so every morning's token refresh at 08:45 restarts the three parked bots, whatever
+their enabled state. Found on 2026-10-21 when enabling the new service triggered the
+auth job and all three came straight back. Fixed with a drop-in
+(`/etc/systemd/system/fno_t_bot_auth.service.d/override.conf`, kept in
+`bnf_breakout/deploy/fno_t_bot_auth.override.conf`) that clears `ExecStartPost`.
+Verified by running the auth job and confirming no `options_bot` process appears.
+
 ## To revive
 
 ```bash
 git checkout v2.0-parked-multistrategy-oct2026
+sudo rm /etc/systemd/system/fno_t_bot_auth.service.d/override.conf && sudo systemctl daemon-reload   # restores the post-auth restart
 sudo systemctl enable --now fno_t_bot_nifty fno_t_bot_banknifty fno_t_bot_sensex
 # and any of the timers above you want back
 ```

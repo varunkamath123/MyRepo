@@ -5,6 +5,8 @@ sudo /opt/trading_bot/deploy.sh                 # pulls the repo (includes bnf_b
 sudo mkdir -p /opt/trading_bot/bnf_state/logs
 sudo chown -R tradingbot:tradingbot /opt/trading_bot/bnf_state
 sudo cp /opt/trading_bot/repo/bnf_breakout/deploy/bnf_breakout.service /etc/systemd/system/
+sudo mkdir -p /etc/systemd/system/fno_t_bot_auth.service.d
+sudo cp /opt/trading_bot/repo/bnf_breakout/deploy/fno_t_bot_auth.override.conf \n        /etc/systemd/system/fno_t_bot_auth.service.d/override.conf   # REQUIRED: stops the daily token job restarting the parked bots
 sudo systemctl daemon-reload
 
 # dry check - makes NO API calls (reads local history, builds the day context)
