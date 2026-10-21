@@ -534,7 +534,67 @@ DYN_MAX_LOTS = 2
 # of ten variants tried. It has zero out-of-sample content and fails all three
 # REBUILD_PLAN.md rules (n>=30 per cohort, both halves, pre-registered). It is
 # recorded here as a hypothesis to test forward, NOT as a setting to adopt.
-LOT_SIZING_MODE        = 'fixed'
+# (LOT_SIZING_MODE is assigned ONCE, in the sizing block further down. It was set in
+#  two places on Oct 21 2026 and the later 'fixed' silently overrode this one.)
+
+# ── COMPOUNDING (Oct 21 2026) ───────────────────────────────────────────────
+# Position size follows the book's realised equity: it grows after wins and
+# shrinks after losses, with no setting to touch.
+#
+# WHY THIS WAS NEEDED. With LOT_SIZING_MODE='fixed' the bot placed the same
+# 1-lot trades at every account size. Run through the real _affordable_lots on
+# Oct 21's premiums: Rs1L -> 1/1/1 lots, Rs3L -> 3/3/3, Rs10L -> 12/11/11,
+# Rs30L -> 37/33/34 -- but 'fixed' ignored all of it, so a Rs1L account and a
+# Rs30L account behaved identically and nothing could compound.
+#
+#   book         = start capital + realised P&L since COMPOUND_FROM_DATE
+#   risk / trade = TARGET_RISK_PCT_OF_BOOK x book   (a percentage, so it scales)
+#   lots         = floor(risk / rupee-risk of one lot), at least 1, then clamped
+#                  by the hard caps below
+#
+# THE COST, stated plainly. Compounding is symmetric. A losing run de-levers the
+# book exactly when recovery would need size, and the three index bots enter
+# within seconds of each other (Oct 21: 34 seconds), so a correlated stop-out
+# costs about TARGET_RISK_PCT_OF_BOOK of the TOTAL book in one morning (each index
+# book is a third of the total, and all three stop together). At 8% per index
+# book that is ~5.5% of the total. PORTFOLIO_HEAT_PCT below caps it. This is
+# paper-only (PAPER_TRADE_MODE), so it risks no real
+# capital -- which makes it the right place to learn whether the REV edge is real,
+# because a book that compounds a non-edge shrinks visibly and fast.
+#
+# Paper fills assume the LTP with no market impact. At large lot counts that
+# flatters results; ABSOLUTE_MAX_LOTS is the only brake.
+COMPOUND_ENABLED         = True
+COMPOUND_FROM_DATE       = '2026-10-16'   # day the engines re-enabled with the real
+                                          # exit stack and trough logging; earlier
+                                          # history is BS-contaminated or pre-fix
+COMPOUND_FLOOR_PCT       = 0.25           # sizing book never below 25% of start
+TARGET_RISK_PCT_OF_BOOK  = 0.08           # risk 8% of the instrument's book / trade
+                                          # (~2.7% of the TOTAL book per trade). Pace, from
+                                          # the real Oct 21 books and premiums:
+                                          #    3% or 5% -> 1 lot each (the books are only
+                                          #                7-11% short of a 2nd lot, so
+                                          #                nothing would visibly change)
+                                          #    8%       -> 2 lots each; all 3 stopping
+                                          #                together = 5.5% of total book
+                                          #   10%       -> 3 lots each; 8.2% of total
+
+# ── Risk adjustment layered on top of compounding ──────────────────────────
+# Drawdown throttle: risk fraction falls linearly as a book drops below its own
+# high-water mark. Full throttle (down to the floor multiplier) at DD_THROTTLE_FULL.
+# A book 12.5% off its peak risks half the usual fraction.
+DD_THROTTLE_ENABLED      = True
+DD_THROTTLE_FULL         = 0.25
+DD_THROTTLE_MIN_MULT     = 0.25
+# Portfolio heat: NIFTY, BANKNIFTY and SENSEX entered within 34 seconds of each
+# other on Oct 21 and moved together, so they are one correlated bet. Cap the
+# total rupees at risk across all open positions at this fraction of the TOTAL
+# book. Sizes new entries DOWN to what the cap leaves; never blocks one, and
+# never goes below one lot.
+PORTFOLIO_HEAT_ENABLED   = True
+PORTFOLIO_HEAT_PCT       = 0.04          # of the TOTAL book; binds on the 3rd correlated entry
+
+
 TARGET_RISK_PER_TRADE  = 2500    # used by mode 'risk'; the median of the 41
                                  # booked trades was Rs2,422, with a 9.1x spread
                                  # (Rs654 to Rs5,980) nobody intended
@@ -568,7 +628,22 @@ TARGET_RISK_PER_TRADE  = 2500    # used by mode 'risk'; the median of the 41
 # multiplies whatever the engine's edge is, and the engine's edge is currently
 # indistinguishable from zero. Switch back to 'capital' when an engine has
 # earned it -- per REBUILD_PLAN.md that means confidence >= 60, not a good week.
-LOT_SIZING_MODE   = 'fixed'
+# CHANGED to 'risk' Oct 21 2026, at the user's explicit direction (asked for twice:
+# "I want it to compound over time" and "a dynamic risk adjusted lot sizing
+# strategy"). The Oct 13 revert above still describes the real cost: sizing
+# multiplies whatever the engine's edge is, and REV's edge is NOT yet established
+# (mean +Rs400/trade, 95% CI [-282, +1,125]; Rs20,008 total but only Rs6,517
+# without its best day and -Rs3,867 without its best two). The pre-registered
+# promotion rule (confidence >= 60) has NOT been met -- this is a decision to
+# proceed anyway, taken on PAPER money only (PAPER_TRADE_MODE), where a book that
+# compounds a non-edge shrinks visibly and costs nothing.
+#
+# What bounds it: risk per trade is a % of the CURRENT book (COMPOUND_*), cut by
+# a drawdown throttle (DD_THROTTLE_*), capped across the three correlated index
+# bots (PORTFOLIO_HEAT_*), and floored at one lot so it never silences the engine.
+# NOT used for sizing, by design: unified_score, rv_iv, conviction. They failed
+# their tests (unified_score inverted; rv_iv flips sign between halves).
+LOT_SIZING_MODE   = 'risk'
 ABSOLUTE_MAX_LOTS = 50      # hard stop regardless of capital or conviction
 MAX_DEPLOY_PCT    = 0.40    # max share of an instrument's capital in one position
                             # (the 25% stop understates gap damage, so the risk

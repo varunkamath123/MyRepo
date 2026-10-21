@@ -2816,16 +2816,51 @@ class TradingBot:
             # flat. What it does is even out the halves (-Rs5,692/-Rs6,193
             # versus -Rs1,717/-Rs7,947), which is exactly what a variance tool
             # should do and all it should be credited with.
-            _tgt = float(getattr(config, 'TARGET_RISK_PER_TRADE', 2500))
+            # Risk budget: a PERCENTAGE of the current compounding book when
+            # TARGET_RISK_PCT_OF_BOOK is set, else the fixed rupee target. A
+            # percentage is what makes size follow equity: Rs3,000 of risk on a Rs1L
+            # book becomes Rs9,000 on a Rs3L one without anyone touching a setting.
+            _pct = getattr(config, 'TARGET_RISK_PCT_OF_BOOK', None)
+            _book = 0.0
+            if _pct:
+                try:
+                    from capital_gate import get_sizing_book
+                    _book = float(get_sizing_book(self.instrument))
+                except Exception:
+                    _book = 0.0
+            _tgt = (_book * float(_pct) if (_pct and _book > 0)
+                    else float(getattr(config, 'TARGET_RISK_PER_TRADE', 2500)))
+            _why = f'book={_book:,.0f}'
+            _dd, _ddm = 0.0, 1.0
+            _heat = None
+            if _pct and _book > 0:
+                try:
+                    from capital_gate import drawdown_state, get_sizing_book
+                    import portfolio_heat
+                    _dd, _ddm = drawdown_state(self.instrument)
+                    _tgt *= _ddm
+                    _tot = sum(get_sizing_book(n) for n in config.INSTRUMENTS)
+                    _heat = portfolio_heat.headroom(self.instrument, _tot)
+                    if _heat is not None and _heat < _tgt:
+                        # Never BLOCK on heat -- only size down. One lot is the
+                        # floor (applied below), so a full book cannot silence
+                        # the engine and starve the data it exists to collect.
+                        _tgt = _heat
+                    _why += f' dd={_dd*100:.1f}% x{_ddm:.2f}'
+                    if _heat is not None:
+                        _why += f' heat_room=₹{_heat:,.0f}'
+                except Exception:
+                    pass
+            signal['size_reason'] = (str(signal.get('size_reason', '')) + ' | ' + _why).strip(' |')
             _one = float(_fb_price) * self.lot_size * max(_stop_pct, 0.01)
             if _one > 0:
                 _rl = max(1, min(int(getattr(config, 'ABSOLUTE_MAX_LOTS', 50)),
-                                 int(round(_tgt / _one))))
+                                 int(_tgt // _one if _pct else round(_tgt / _one))))
                 _rl = min(_rl, self._affordable_lots(float(_fb_price), _stop_pct) or 1)
                 if _rl != lots:
                     self.logger.info(
                         f"  [SIZE] {self.instrument}: {lots} → {_rl} lot(s) "
-                        f"equal-risk (1 lot risks ₹{_one:,.0f}, target "
+                        f"risk-sized [{_why}] (1 lot risks ₹{_one:,.0f}, target "
                         f"₹{_tgt:,.0f})"
                     )
                     lots         = _rl
@@ -3120,6 +3155,10 @@ class TradingBot:
             # ── Learning fields (recorded in trade_log → JSONL) ───────────
             'entry_adx'        : float(signal.get('adx', 0)),
             'lots'             : lots,
+            # Rupees lost if this position is stopped out. portfolio_heat sums this
+            # across the three bots so a new entry can see what the others hold.
+            'risk_inr'          : round(lots * self.lot_size * float(entry_price)
+                                        * float(_stop_pct), 2),
             'regime'           : getattr(getattr(self, '_daily_regime', None), 'regime', 'UNKNOWN'),
             'posture'          : getattr(getattr(self, '_daily_regime', None), 'posture', 'NORMAL'),
             # v1.6: conviction scores + sizing rationale — closes the data gap
@@ -3165,6 +3204,7 @@ class TradingBot:
         self.positions.append(position)
         self.trades_today += 1
         position['trade_no'] = self.trades_today   # stored for exit outcome lookup
+        self._publish_heat()
 
         # ── Learner: record entry prediction ─────────────────────────────────
         try:
@@ -3268,6 +3308,14 @@ class TradingBot:
                               extra=dict(rv_iv=round(rv, 3), src=src,
                                          path=signal.get('path')))
         return True
+
+    def _publish_heat(self) -> None:
+        """Tell the other two bots how much this one has at risk. Never raises."""
+        try:
+            import portfolio_heat
+            portfolio_heat.publish(self.instrument, self.positions, self.lot_size)
+        except Exception:
+            pass
 
     def _expiry(self):
         """The expiry this instrument should trade today, validated once.
@@ -3697,6 +3745,7 @@ class TradingBot:
 
         for idx in reversed(to_close):
             self.positions.pop(idx)
+        self._publish_heat()
 
     def _update_morning_trend(self, df: 'pd.DataFrame') -> None:
         """Track peak ADX and peak |DI+ − DI−| during the ORB window.
