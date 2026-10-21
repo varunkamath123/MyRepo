@@ -47,6 +47,19 @@ def is_rate_limited(msg) -> bool:
     return 'limit' in m and ('reached' in m or 'exceed' in m or 'request' in m)
 
 
+def is_auth_error(resp) -> bool:
+    """Does this reply mean 'your token is no good', as opposed to a throttle or a
+    missing contract? Fyers v3 uses -8 (expired), -15/-17 (invalid) and -16 (could
+    not authenticate); the message is checked too because codes are not stable."""
+    if not isinstance(resp, dict):
+        return False
+    if resp.get('code') in (-8, -15, -16, -17, 401):
+        return True
+    m = str(resp.get('message') or resp.get('errmsg') or '').lower()
+    return ('token' in m and ('expire' in m or 'invalid' in m)) or 'could not authenticate' in m \
+        or 'unauthor' in m
+
+
 class TokenError(RuntimeError):
     pass
 
@@ -179,6 +192,7 @@ def atm_strike(spot: float, c=cfg) -> int:
 class Broker:
     def __init__(self, fyers, budget: ApiBudget, logger=None, c=cfg):
         self.f, self.budget, self.log, self.c = fyers, budget, logger, c
+        self.auth_failed = False          # set by an auth reply; the runner reloads the client
         self._expiry = None                       # (date, expiry) cache
 
     def _say(self, level: str, msg: str):
@@ -187,6 +201,8 @@ class Broker:
 
     def _call(self, label: str, fn, essential: bool = False):
         """The ONLY route to the API. Returns (response|None, status)."""
+        if self.f is None:
+            return None, 'no client'
         ok, why = self.budget.allow(essential)
         if not ok:
             return None, why
@@ -198,6 +214,10 @@ class Broker:
             self._say('error', f'[API] {label}: exception {e}')
             return None, f'exception: {e}'
         self.budget.record(label)
+        if isinstance(resp, dict) and resp.get('s') != 'ok' and is_auth_error(resp):
+            self.auth_failed = True
+            self._say('error', f"[API] {label}: AUTH ERROR ({str(resp.get('message'))[:90]}) - client will be reloaded")
+            return None, 'auth_error'
         if isinstance(resp, dict) and resp.get('s') != 'ok':
             msg = resp.get('message') or resp.get('errmsg') or ''
             if resp.get('code') == 429 or resp.get('code') == -360 or is_rate_limited(msg):

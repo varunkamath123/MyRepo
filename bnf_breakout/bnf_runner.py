@@ -67,7 +67,8 @@ def _atomic_write(path: str, obj) -> None:
 
 class Runner:
     def __init__(self, broker, c=cfg, clock=None, sleep=time.sleep, history=None,
-                 state_dir=None, log_dir=None, logger=None, is_holiday=None):
+                 state_dir=None, log_dir=None, logger=None, is_holiday=None,
+                 reload_client=None):
         self.b, self.c, self.sleep = broker, c, sleep
         self.clock = clock or (lambda: datetime.now(IST))
         self.state_dir = state_dir or c.STATE_DIR
@@ -75,6 +76,8 @@ class Runner:
         self.log = logger or logging.getLogger('bnf')
         self._history = history                    # injected in tests
         self._holiday_fn = is_holiday                # injected in tests; None = NSE calendar
+        self._reload = reload_client                 # builds a fresh Fyers client from today's token
+        self._client_day = None
         self.ctx = None
         self.day = None
         self.state = None
@@ -272,10 +275,35 @@ class Runner:
             self._last_note = 'market closed'
             return min(900.0, 60.0 if now.strftime('%H:%M') > '15:35' else 300.0)
 
+        if not self._ensure_client(now, day):
+            return 120.0
+
         pos = self.state.get('position')
         if pos:
             return self._manage(now, pos)
         return self._scan(now)
+
+    def _ensure_client(self, now: datetime, day: str) -> bool:
+        """A client built at start-up holds the token of the day the service started.
+        The shared auth job writes a new one every morning, so rebuild on the first
+        market-open step of each day, and again after any auth reply. Without a
+        client nothing is traded and nothing is priced."""
+        if self._reload is None:
+            return True
+        if getattr(self.b, 'auth_failed', False):
+            self._client_day = None
+            self.b.auth_failed = False
+        if self._client_day == day and self.b.f is not None:
+            return True
+        try:
+            self.b.f = self._reload()
+            self._client_day = day
+            self.log.info('[AUTH] Fyers client (re)built from the current token')
+            return True
+        except Exception as e:
+            self.log.error(f'[AUTH] cannot build a client yet: {e}')
+            self._last_note = f'no client: {e}'
+            return False
 
     # ── flat: look for a setup ────────────────────────────────────────────
     def _scan(self, now: datetime) -> float:
@@ -489,16 +517,17 @@ def main(argv: list) -> int:
             (log.info if ok else log.error)(f"[PREFLIGHT] {'OK  ' if ok else 'FAIL'} {name}: {detail}")
         return 0 if all(ok for _, ok, _ in checks) else 2
 
-    fyers, budget = None, None
-    while fyers is None:
-        try:
-            fyers = bnf_broker.make_client()
-        except bnf_broker.TokenError as e:
-            log.error(f'[AUTH] {e} - retrying in 10 minutes')
-            time.sleep(600)
+    try:
+        fyers = bnf_broker.make_client()
+    except bnf_broker.TokenError as e:
+        # not fatal: the runner rebuilds the client when the market opens, by which
+        # time the morning auth job has written today's token
+        log.warning(f'[AUTH] no usable token yet ({e}); will retry when the market opens')
+        fyers = None
     today = datetime.now(IST).strftime('%Y-%m-%d')
     budget = bnf_broker.ApiBudget(state_dir, cfg.MAX_API_CALLS_PER_DAY, cfg.API_MIN_GAP_SECONDS, today)
-    runner = Runner(bnf_broker.Broker(fyers, budget, log), logger=log)
+    runner = Runner(bnf_broker.Broker(fyers, budget, log), logger=log,
+                    reload_client=bnf_broker.make_client)
 
     checks = runner.preflight()
     for name, ok, detail in checks:

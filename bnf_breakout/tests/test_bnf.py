@@ -883,6 +883,70 @@ rig.go('09:40')
 eq('weekends are not treated as missing: only Mon-Wed are fetched', sorted(set(rig.ff.h_days)),
    ['2026-10-19', '2026-10-20', '2026-10-21'])
 
+
+# --- 8q. a long-running service must pick up each morning's token ---
+print('\n--- token handling ---')
+for code in (-8, -15, -16, -17, 401):
+    eq(f'Fyers auth code {code} is recognised as an auth error', BR.is_auth_error(dict(s='error', code=code)), True)
+eq('"token expired" wording is recognised', BR.is_auth_error(dict(s='error', message='Your token has expired')), True)
+eq('a daily-cap reply is NOT an auth error', BR.is_auth_error(dict(s='error', code=-360, message="You've reached the Standard plan limit")), False)
+eq('an unlisted-contract reply is NOT an auth error', BR.is_auth_error(dict(s='ok', d=[dict(v={})])), False)
+eq('a non-dict is not an auth error', BR.is_auth_error(None), False)
+
+ffA = FakeFyers()
+ffA.quote_reply = dict(s='error', code=-16, message='could not authenticate the user')
+brA = BR.Broker(ffA, BR.ApiBudget(tempfile.mkdtemp(), 100, 0.0, DAY, sleep=lambda s: None), None)
+eq('an auth reply is reported as auth_error, not mistaken for a missing quote', brA.quote('x', True)[1], 'auth_error')
+eq('...and flags the broker so the runner rebuilds the client', brA.auth_failed, True)
+brN = BR.Broker(None, BR.ApiBudget(tempfile.mkdtemp(), 100, 0.0, DAY, sleep=lambda s: None), None)
+eq('with no client at all, calls fail cleanly instead of raising', brN.quote('x', True), (None, 'no client'))
+
+built = []
+
+
+def fake_reload():
+    built.append(1)
+    c = FakeFyers()
+    c.today_str = DAY
+    c.premium['*'] = 400.0
+    return c
+
+
+rig = Rig(flat_tape(55800))
+rig.r._reload = fake_reload
+rig.r._client_day = None
+rig.broker.f = None                                   # the service started before today's token existed
+rig.go('09:40')
+eq('on the first market-open step of the day the client is built', len(built), 1)
+rig.go('09:45')
+eq('...and not rebuilt on every step', len(built), 1)
+eq('the new client is what the broker now uses', rig.broker.f is not None, True)
+rig.broker.auth_failed = True
+rig.go('09:50')
+eq('an auth reply triggers exactly one rebuild on the next step', len(built), 2)
+eq('...and clears the flag', rig.broker.auth_failed, False)
+rig.now = at('09:40', day='2026-10-23')
+rig.refresh()
+rig.r.step()
+eq('a new day rebuilds the client again (the morning token is new)', len(built), 3)
+
+failing = {'n': 0}
+
+
+def bad_reload():
+    failing['n'] += 1
+    raise BR.TokenError('token is dated yesterday; the morning auth job has not run')
+
+
+rig = Rig(flat_tape(55800))
+rig.r._reload = bad_reload
+rig.r._client_day = None
+rig.broker.f = None
+secs = rig.go('10:35')
+eq('with no usable token nothing is traded and nothing is called', (rig.r.state['position'], rig.budget.calls), (None, 0))
+ok('...it backs off and tries again later', secs >= 60, secs)
+ok('...and says why in the heartbeat', 'no client' in json.load(open(os.path.join(rig.dir, 'status.json')))['note'])
+
 # --- 8n. preflight ---
 rig = Rig(flat_tape(55800))
 names = {n: okk for n, okk, _ in rig.r.preflight()}
