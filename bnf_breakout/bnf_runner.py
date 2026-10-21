@@ -413,6 +413,14 @@ def main(argv: list) -> int:
         return 2
     log.info('BANKNIFTY breakout runner starting (PAPER ONLY, no order path exists)')
 
+    if '--preflight' in argv:
+        # A preflight must never need the API or a fresh token: it checks only what
+        # can be checked locally, so it can be run at any hour without side effects.
+        checks = Runner(None).preflight()
+        for name, ok, detail in checks:
+            (log.info if ok else log.error)(f"[PREFLIGHT] {'OK  ' if ok else 'FAIL'} {name}: {detail}")
+        return 0 if all(ok for _, ok, _ in checks) else 2
+
     fyers, budget = None, None
     while fyers is None:
         try:
@@ -427,8 +435,6 @@ def main(argv: list) -> int:
     checks = runner.preflight()
     for name, ok, detail in checks:
         (log.info if ok else log.error)(f"[PREFLIGHT] {'OK  ' if ok else 'FAIL'} {name}: {detail}")
-    if '--preflight' in argv:
-        return 0 if all(ok for _, ok, _ in checks) else 2
     hard = [n for n, ok, _ in checks if not ok and n in ('config', 'history')]
     if hard:
         log.error(f'[PREFLIGHT] refusing to trade: {hard}')
