@@ -103,3 +103,25 @@ import that logged ₹0 costs, and assertions that passed for any non-zero value
 Hence this design: **one series fetched once per closed bar, an option polled
 only while holding it, a persisted daily budget with exits exempt, a preflight
 that refuses to trade on bad inputs, and tests that compare values.**
+
+---
+
+## Addendum (2026-10-22): the other inputs to an option's price
+
+`research/iv_study.py` (120 sessions with chain ATM IV, one-hour non-overlapping
+windows) and `research/intraday_study.py` (420 sessions, in bps of spot).
+
+* **IV moves against the index (the leverage effect) and the effect is lopsided.**
+  BANKNIFTY: -0.68 vol points per +1% of index (rho -0.52, p~0); -1.24 on down
+  moves, -0.34 on up moves. A -0.4% hour adds ~+2.1% of premium through vega; a
+  +0.4% hour costs a call ~-2.0%. Real, but about one tenth of the delta effect
+  (~+28% for a 0.4% move) and roughly 0.06% of spot for the put/call difference
+  against ~0.08% of cost.
+* **IV drifts down while you wait.** In flat hours (|move| < 0.15%) BANKNIFTY IV
+  falls ~0.2 vol points an hour (-1.5% of premium), NIFTY ~0.4 (-3.8%), in every
+  hour of the day, on top of theta. A hidden cost of any slow trade.
+* **A cheap IV does not predict a rising IV** (rho -0.13, p=0.19 BNF; +0.08, p=0.44
+  NIFTY). No "buy cheap vol" effect at a 2-hour horizon.
+* **The morning does not predict the afternoon.** First 30 min -> last 30 min:
+  +1.4 bps +/- 1.9 (p=0.33); gap -> rest of day: -0.6 bps. All under 3 bps.
+
