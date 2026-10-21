@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import numpy as np
 
@@ -79,6 +79,7 @@ class Runner:
         self.state = None
         self.mark = None                           # last option mark (price, pct)
         self._last_note = ''
+        self._ctx_tried = None
 
     # ── persistence ───────────────────────────────────────────────────────
     @property
@@ -128,16 +129,73 @@ class Runner:
         return out
 
     # ── day setup ─────────────────────────────────────────────────────────
+    def _is_holiday(self, d: date) -> bool:
+        try:
+            if self.c.LEGACY_DIR not in sys.path:
+                sys.path.insert(0, self.c.LEGACY_DIR)
+            import nse_holidays
+            return bool(nse_holidays.is_nse_holiday(d))
+        except Exception:
+            return False
+
+    def _missing_days(self, sessions: list, today: str) -> list:
+        """Trading days between the last stored session and today with no file."""
+        if not sessions:
+            return []
+        d = date.fromisoformat(sessions[-1]['day']) + timedelta(days=1)
+        end = date.fromisoformat(today)
+        out = []
+        while d < end:
+            if d.weekday() < 5 and not self._is_holiday(d):
+                out.append(d.isoformat())
+            d += timedelta(days=1)
+        return out
+
+    def _build_ctx(self, day: str) -> dict:
+        """Build the day context from history, repairing any missing sessions.
+
+        The nightly collector runs after the close. On a day the API quota is
+        already spent it fails, and the 'previous session' read from the last file
+        would silently be two sessions old: wrong PDH/PDL, wrong volatility regime,
+        and no error anywhere. (Oct 21 2026 is exactly that day: the quota ran out
+        at 13:05 and the 15:33 backfill never happened.) So: find the holes, fill
+        them with one API request per missing day, and if that fails mark the
+        context stale so entries are refused instead of mis-set.
+        """
+        sessions = list(self._history if self._history is not None else
+                        bnf_data.load_history(self.c.HISTORY_DIR, before=day, last_n=90))
+        stale, reason = False, ''
+        if not sessions:
+            stale, reason = True, 'no history'
+        else:
+            missing = self._missing_days(sessions, day)
+            if len(missing) > 4:
+                stale, reason = True, f'{len(missing)} sessions missing from history'
+            else:
+                for m in missing:
+                    sess = self.b.get_day(m) if self.b else None
+                    if sess is None:
+                        stale, reason = True, f'session {m} missing and could not be fetched'
+                        break
+                    sessions.append(sess)
+                    self.log.info(f'[DAY] filled missing session {m} from the API ({len(sess["T"])} bars)')
+        ctx = S.build_day_context(sessions, n_bars=75, cfg=self.c)
+        ctx['stale'], ctx['stale_reason'] = stale, reason
+        ctx['n_sessions'] = len(sessions)
+        if stale:
+            self.log.error(f'[DAY] context is STALE: {reason} - no entries until it is repaired')
+        return ctx
+
     def _load_day(self, day: str):
-        sessions = self._history if self._history is not None else \
-            bnf_data.load_history(self.c.HISTORY_DIR, before=day, last_n=90)
-        self.ctx = S.build_day_context(sessions, n_bars=75, cfg=self.c)
+        self.ctx = self._build_ctx(day)
+        self._ctx_tried = self.clock()
         self.day = day
         self.state = self._load_state(day)
         self._save()
         hot = self.ctx.get('hot')
-        self.log.info(f"[DAY] {day}: {len(sessions)} prior sessions, PDH={self.ctx['pdh']} "
-                      f"PDL={self.ctx['pdl']} regime={'hot' if hot else 'cold' if hot is False else 'unknown'}")
+        self.log.info(f"[DAY] {day}: {self.ctx['n_sessions']} prior sessions, PDH={self.ctx['pdh']} "
+                      f"PDL={self.ctx['pdl']} regime={'hot' if hot else 'cold' if hot is False else 'unknown'}"
+                      f"{' STALE' if self.ctx.get('stale') else ''}")
 
     def preflight(self) -> list:
         """(check, ok, detail). A failing check means do NOT trade today."""
@@ -149,6 +207,11 @@ class Runner:
         ok = len(sessions) >= 25
         out.append(('history', ok, f'{len(sessions)} sessions, last '
                     f"{sessions[-1]['day'] if sessions else 'none'}"))
+        today = self.clock().strftime('%Y-%m-%d')
+        miss = self._missing_days(sessions, today) if sessions else []
+        out.append(('history recency', len(miss) <= 4,
+                    f"{len(miss)} trading day(s) missing before {today}: {miss[:4]} "
+                    f"({'the runner fetches these itself, 1 API request each' if miss else 'none'})"))
         ctx = S.build_day_context(sessions, 75, self.c) if sessions else {}
         out.append(('regime', ctx.get('hot') is not None,
                     f"hot={ctx.get('hot')} (unknown means <21 sessions)"))
@@ -216,6 +279,9 @@ class Runner:
     def _scan(self, now: datetime) -> float:
         wait = self._seconds_to_next_bar(now)
         hhmm = now.strftime('%H:%M')
+        if self.ctx.get('stale') and (now - self._ctx_tried).total_seconds() >= 600:
+            self.ctx = self._build_ctx(self.day)       # may have been a rate limit
+            self._ctx_tried = now
         if hhmm < self.c.ENTRY_START or hhmm > S._hhmm_add(self.c.ENTRY_END, self.c.BAR_MINUTES):
             self._last_note = 'outside entry window'
             return min(wait, 300.0)

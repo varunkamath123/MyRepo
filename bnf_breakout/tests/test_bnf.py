@@ -83,16 +83,19 @@ def mk_session(day, base=55000.0, step=25.0, vol=1.0e7, seed=0, n=75):
     return dict(day=day, T=HHMM[:n], O=O, H=H, L=L, C=C, V=V)
 
 
-def mk_history(k=40, last_scale=1.0):
-    out = []
-    d = date(2026, 8, 3)
-    for j in range(k):
-        while d.weekday() >= 5:
-            d += timedelta(days=1)
-        scale = last_scale if j == k - 1 else 1.0
-        out.append(mk_session(d.isoformat(), step=25.0 * scale, seed=j))
-        d += timedelta(days=1)
-    return out
+def mk_history(k=40, last_scale=1.0, end='2026-10-21'):
+    """k weekday sessions ENDING on `end`. The strategy now insists the last stored
+    session is the one immediately before the day it trades, so a fixture that ended
+    in September would (correctly) be rejected as stale."""
+    days = []
+    d = date.fromisoformat(end)
+    while len(days) < k:
+        if d.weekday() < 5:
+            days.append(d)
+        d -= timedelta(days=1)
+    days.reverse()
+    return [mk_session(dd.isoformat(), step=25.0 * (last_scale if j == k - 1 else 1.0), seed=j)
+            for j, dd in enumerate(days)]
 
 
 def flat_tape(base, n=75, rng_pts=6.0):
@@ -206,7 +209,12 @@ ok('a coil pressing PDH on volume in a hot regime enters', d.enter is True, d.ga
 eq('anticipating the break means buying a CALL toward resistance', d.direction, 1)
 eq('the thesis names the level it is pressing', d.thesis['level'], 'PDH')
 ok('invalidation sits below the coil for a CALL', d.thesis['invalidation'] < d.thesis['coil_lo'])
-eq('every gate reported', sorted(d.gates), ['capacity', 'coil', 'level', 'regime', 'volume', 'window'])
+eq('every gate reported', sorted(d.gates), ['capacity', 'coil', 'context', 'level', 'regime', 'volume', 'window'])
+eq('a fresh context passes its gate', d.gates['context'], (True, 'fresh'))
+stale_day = dict(entry_day(), stale=True, stale_reason='session 2026-10-21 missing and could not be fetched')
+dstale = S.evaluate_entry(bars, 29, stale_day, st0, cfg0)
+eq('a stale context blocks entry, and says why', (dstale.enter, dstale.blocked_by(), dstale.gates['context'][1]),
+   (False, ['context'], 'session 2026-10-21 missing and could not be fetched'))
 
 dA = S.evaluate_entry(bars, 29, entry_day(), st0, mk_cfg(DIRECTION='away', LEVELS=('PDH', 'PDL')))
 eq("DIRECTION='away' fades the level: a PUT at resistance", dA.direction, -1)
@@ -494,7 +502,14 @@ class FakeFyers:
 
     def history(self, req):
         self.h_calls += 1
-        return dict(s='ok', candles=self.candles)
+        self.h_days = getattr(self, 'h_days', []) + [req.get('range_from')]
+        # a forced reply applies only to PAST days: failing today's bars as well would
+        # make every "refused because the context is stale" test pass for the wrong
+        # reason (no bars at all), which is what the first version of them did
+        if (getattr(self, 'history_reply', None) is not None
+                and req.get('range_from') != getattr(self, 'today_str', None)):
+            return self.history_reply
+        return dict(s='ok', candles=getattr(self, 'by_day', {}).get(req.get('range_from'), self.candles))
 
     def quotes(self, req):
         sym = req['symbols']
@@ -575,6 +590,7 @@ class Rig:
         self.dir = tempfile.mkdtemp()
         self.tape = tape_bars
         self.ff = FakeFyers()
+        self.ff.today_str = DAY
         self.ff.premium['*'] = premium
         self.now = at('09:55')
         self.cfgkw = dict(RELAXED)
@@ -784,6 +800,70 @@ if os.path.exists(pth):
 eq('a position left over from yesterday is recorded as abandoned, not silently dropped',
    [x['kind'] for x in ab], ['abandoned'])
 eq('...and the new day starts clean', rig.r.state['trades_today'] >= 0 and rig.r.state['date'], '2026-10-23')
+
+
+# --- 8p. the previous session must really be the previous session ---
+def day_candles(day, base=55000.0):
+    y, mo, d_ = (int(x) for x in day.split('-'))
+    out = []
+    for i in range(75):
+        op = datetime(y, mo, d_, 9, 15, tzinfo=IST) + timedelta(minutes=5 * i)
+        px = base + 3 * i
+        out.append([op.timestamp(), px, px + 8, px - 8, px, 1.0e7])
+    return out
+
+
+h_gap = mk_history(40, end='2026-10-19')           # the 20th and 21st are missing
+rig = Rig(flat_tape(55800))
+rig.hist = h_gap
+rig.ff.by_day = {'2026-10-20': day_candles('2026-10-20'), '2026-10-21': day_candles('2026-10-21', 55800.0)}
+rig.build()
+rig.go('09:40')
+eq('two missing sessions are fetched, one API request each', sorted(set(rig.ff.h_days)), ['2026-10-20', '2026-10-21'])
+eq('...and the context is NOT stale afterwards', rig.r.ctx['stale'], False)
+eq('...and PDH now comes from the session that was fetched, not from Oct 19',
+   rig.r.ctx['pdh'], max(8 + 55800.0 + 3 * i for i in range(75)))
+eq('...counted under its own label in the API budget', rig.budget.by_label.get('day'), 2)
+
+rig = Rig(flat_tape(55800))
+rig.hist = mk_history(40, end='2026-10-19')
+rig.ff.history_reply = dict(s='ok', candles=[])
+rig.build()
+rig.go('10:35')
+eq('if the missing session cannot be fetched the context is stale', rig.r.ctx['stale'], True)
+eq('...so a setup that would otherwise fire is REFUSED', rig.r.state['position'], None)
+dd_ = rig.decisions()
+eq('...and the decision log names the context gate as the ONLY blocker', dd_[-1]['blocked_by'] if dd_ else None, ['context'])
+
+rig.ff.history_reply = None
+rig.ff.by_day = {'2026-10-20': day_candles('2026-10-20'), '2026-10-21': day_candles('2026-10-21')}
+rig.go('10:50')
+ok('a stale context is retried after 10 minutes and repairs itself', rig.r.ctx['stale'] is False, rig.r.ctx.get('stale_reason'))
+ok('...and once repaired, the very same kind of setup IS taken (the refusal was the context, not the tape)',
+   rig.r.state['position'] is not None)
+
+rig = Rig(flat_tape(55800))
+rig.hist = mk_history(40, end='2026-10-12')           # 7 missing weekdays
+rig.build()
+rig.go('09:40')
+eq('a gap too long to repair cheaply is stale WITHOUT spending API calls', (rig.r.ctx['stale'], rig.budget.calls), (True, 0))
+
+rig = Rig(flat_tape(55800))
+rig.hist = mk_history(40, end='2026-10-19')
+rig.ff.history_reply = dict(s='error', code=-360, message="You've reached the Standard plan limit of 5,000 requests/day.")
+rig.build()
+rig.go('09:40')
+eq('a daily-cap reply while repairing leaves it stale rather than guessing', rig.r.ctx['stale'], True)
+
+# Saturday/Sunday are not missing sessions
+rig = Rig(flat_tape(55800))
+rig.hist = mk_history(40, end='2026-10-16')           # Friday; Oct 19 is Monday
+rig.ff.by_day = {'2026-10-19': day_candles('2026-10-19'), '2026-10-20': day_candles('2026-10-20'),
+                 '2026-10-21': day_candles('2026-10-21')}
+rig.build()
+rig.go('09:40')
+eq('weekends are not treated as missing: only Mon-Wed are fetched', sorted(set(rig.ff.h_days)),
+   ['2026-10-19', '2026-10-20', '2026-10-21'])
 
 # --- 8n. preflight ---
 rig = Rig(flat_tape(55800))

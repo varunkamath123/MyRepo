@@ -217,6 +217,27 @@ class Broker:
             return None, st
         return bnf_data.candles_to_bars(resp.get('candles'), now, self.c.BAR_MINUTES), 'ok'
 
+    def get_day(self, day: str):
+        """One complete past session as a history-shaped dict, or None.
+
+        The nightly collector runs after the close; on a day the API quota is
+        already spent it fails, and the 'previous session' the strategy reads
+        would silently be two sessions old. The runner calls this to fill such a
+        hole itself: one request per missing day.
+        """
+        resp, st = self._call('day', lambda: self.f.history(dict(
+            symbol=self.c.INDEX_SYMBOL, resolution='5', date_format='1',
+            range_from=day, range_to=day, cont_flag='1')), essential=False)
+        if resp is None or st != 'ok':
+            return None
+        y, m, d = (int(x) for x in day.split('-'))
+        end_of_day = datetime(y, m, d, 23, 59, tzinfo=bnf_data.IST)
+        b = bnf_data.candles_to_bars(resp.get('candles'), end_of_day, self.c.BAR_MINUTES)
+        if len(b['T']) < 60 or not bnf_data.bars_are_contiguous(b['T'], self.c.BAR_MINUTES):
+            return None
+        b['day'] = day
+        return b
+
     def quote(self, symbol: str, essential: bool = False):
         resp, st = self._call('quote', lambda: self.f.quotes(dict(symbols=symbol)), essential)
         if resp is None or st != 'ok':

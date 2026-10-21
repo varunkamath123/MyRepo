@@ -168,6 +168,12 @@ def evaluate_entry(bars: dict, i: int, day: dict, state: dict, cfg=cfg_default) 
     ct = bar_close_time(T[i], cfg)
     g['window'] = (cfg.ENTRY_START <= ct <= cfg.ENTRY_END, ct)
 
+    # A day whose "previous session" is not actually the previous session would
+    # trade off the wrong PDH/PDL and the wrong volatility regime, silently. The
+    # runner sets 'stale' when it cannot establish the context; refuse to trade.
+    g['context'] = (not day.get('stale', False),
+                    day.get('stale_reason') or 'fresh')
+
     cap_ok = (state.get('trades_today', 0) < cfg.MAX_TRADES_PER_DAY
               and state.get('open_positions', 0) < cfg.MAX_CONCURRENT_POSITIONS)
     lb = state.get('last_loss_bar')
