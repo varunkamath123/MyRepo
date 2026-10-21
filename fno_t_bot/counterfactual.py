@@ -193,6 +193,38 @@ def _exit_reason(pos, pnl_pct: float, minutes: float, force: bool) -> str | None
     return None
 
 
+def log_path(bot, kind: str, symbol, entry_price, cur, pnl_pct,
+             index_px, peak_pct=None, trough_pct=None, tag=None) -> None:
+    """Append one poll of a position's premium path. Never raises.
+
+    Added Oct 21 2026 so a trailing-stop replay is possible at all. The
+    5-minute premium archive cannot show what a 20-second trail saw: the
+    NIFTY trade's +14.49% peak is invisible in it. Costs no API requests --
+    the caller has already fetched `cur`.
+
+    kind is "live" (an open position) or "phantom" (counterfactual).
+    """
+    try:
+        if not getattr(config, 'POSITION_PATH_LOG_ENABLED', True):
+            return
+        now = datetime.now(_late('IST'))
+        p = os.path.join(_log_dir(),
+                         f'position_path_{bot.instrument}_{now.strftime("%Y-%m-%d")}.jsonl')
+        os.makedirs(_log_dir(), exist_ok=True)
+        with open(p, 'a', encoding='utf-8') as fh:
+            fh.write(json.dumps(dict(
+                ts=now.isoformat(timespec='seconds'), kind=kind,
+                instrument=bot.instrument, symbol=symbol, tag=tag,
+                entry=round(float(entry_price), 2), px=round(float(cur), 2),
+                pnl_pct=round(float(pnl_pct) * 100, 3),
+                peak_pct=(None if peak_pct is None else round(float(peak_pct) * 100, 3)),
+                trough_pct=(None if trough_pct is None else round(float(trough_pct) * 100, 3)),
+                index=round(float(index_px), 2),
+            )) + '\n')
+    except Exception:
+        pass
+
+
 def mark(bot, index_px: float, hv: float, force_close: bool = False) -> None:
     """Mark open phantoms against real premiums and close them on the live rules."""
     try:
@@ -230,6 +262,9 @@ def mark(bot, index_px: float, hv: float, force_close: bool = False) -> None:
             # position is ever opened and that field would have collected
             # nothing. This is the path that is actually running.
             pos['trough_pct'] = min(pos['trough_pct'], pnl_pct)
+            log_path(bot, 'phantom', pos.get('symbol'), pos['entry_price'], cur,
+                     pnl_pct, index_px, pos['peak_pct'], pos['trough_pct'],
+                     tag=(pos.get('extra') or {}).get('gate') or pos.get('gate'))
             minutes = (now - pos['entry_time']).total_seconds() / 60.0
             why = _exit_reason(pos, pnl_pct, minutes, force_close)
             if not why:

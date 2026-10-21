@@ -1629,6 +1629,12 @@ PATH_REV_ENABLED            = True    # enable reversal detection (logs paper si
 # stop), two of them stopped solely because these switches were off.
 # Exits are where this book's P&L lives and the 25% stop is the only
 # untested lever left, so the real exit path has to actually run.
+# Poll-level premium path for every open position and tracked phantom, written
+# to logs/position_path_<INST>_<date>.jsonl. Needed to replay trailing-stop
+# distances; the 5-minute premium archive cannot see what a 20s trail saw.
+# Costs no API requests (it records prices already fetched).
+POSITION_PATH_LOG_ENABLED   = True
+
 PATH_REV_LIVE               = True     # paper trades; see PAPER_TRADE_MODE
 # START was '12:00', a fixed outer-bound guess unrelated to the actual exhaustion
 # condition. Diagnostic (Aug 8 2026, causal replay w/ multi-day ADX warm-up,

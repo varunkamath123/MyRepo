@@ -3389,6 +3389,14 @@ class TradingBot:
             if pnl_pct < pos.get('lowest_pnl_pct', 0.0):
                 pos['lowest_pnl_pct'] = pnl_pct
 
+            # Poll-level premium path, for trailing-stop research. No extra API
+            # call: current_opt was fetched above. See counterfactual.log_path.
+            counterfactual.log_path(
+                self, 'live', pos.get('option_symbol'), pos['entry_price'],
+                current_opt, pnl_pct, current_price,
+                pos['highest_pnl_pct'], pos.get('lowest_pnl_pct', 0.0),
+                tag=pos.get('path'))
+
             # ── Rolling option-price history (for rapid-spike exit) ───────────
             # Append current LTP every polling cycle; keep a fixed-length window
             # so we can measure the N-bar return without unbounded memory growth.
