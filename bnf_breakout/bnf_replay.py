@@ -138,10 +138,13 @@ def summarise(label: str, trades: list, sessions_n: int) -> dict:
 
 
 def main(argv: list) -> None:
-    hist = next((a for a in argv if not a.startswith('--')), cfg.HISTORY_DIR)
-    seeds = 10
-    if '--random-seeds' in argv:
-        seeds = int(argv[argv.index('--random-seeds') + 1])
+    import argparse
+    ap = argparse.ArgumentParser(description='Replay the strategy over history vs a random baseline')
+    ap.add_argument('history_dir', nargs='?', default=cfg.HISTORY_DIR)
+    ap.add_argument('--random-seeds', type=int, default=10)
+    args = ap.parse_args(argv)
+    hist, seeds = args.history_dir, args.random_seeds
+
     probs = cfg.validate()
     if probs:
         print('CONFIG PROBLEMS:', probs)

@@ -596,6 +596,8 @@ class Rig:
         self.cfgkw = dict(RELAXED)
         self.cfgkw.update(cfgkw)
         self.c = mk_cfg(**self.cfgkw)
+        self.holidays = set()                       # dates the fake exchange is shut
+        self.holidays_fn = lambda d: d.isoformat() in self.holidays
         self.hist = mk_history(40)
         self.build()
 
@@ -603,7 +605,8 @@ class Rig:
         self.budget = BR.ApiBudget(self.dir, self.c.MAX_API_CALLS_PER_DAY, 0.0, DAY, sleep=lambda s: None)
         self.broker = BR.Broker(self.ff, self.budget, None, self.c)
         self.r = RN.Runner(self.broker, self.c, clock=lambda: self.now, sleep=lambda s: None,
-                           history=self.hist, state_dir=self.dir)
+                           history=self.hist, state_dir=self.dir,
+                           is_holiday=self.holidays_fn)
         self.refresh()
 
     def refresh(self):
@@ -854,6 +857,21 @@ rig.ff.history_reply = dict(s='error', code=-360, message="You've reached the St
 rig.build()
 rig.go('09:40')
 eq('a daily-cap reply while repairing leaves it stale rather than guessing', rig.r.ctx['stale'], True)
+
+# an exchange holiday is not a missing session either (Oct 20 2026 really was one)
+rig = Rig(flat_tape(55800))
+rig.hist = mk_history(40, end='2026-10-19')
+rig.holidays = {'2026-10-20'}
+rig.ff.by_day = {'2026-10-21': day_candles('2026-10-21')}
+rig.build()
+rig.go('09:40')
+eq('a holiday between the last file and today is not fetched', sorted(set(rig.ff.h_days)), ['2026-10-21'])
+eq('...and the context is not stale because of it', rig.r.ctx['stale'], False)
+
+rig = Rig(flat_tape(55800))
+rig.holidays = {DAY}
+rig.go('10:35')
+eq('on a holiday there are no API calls and no position', (rig.budget.calls, rig.r.state['position']), (0, None))
 
 # Saturday/Sunday are not missing sessions
 rig = Rig(flat_tape(55800))

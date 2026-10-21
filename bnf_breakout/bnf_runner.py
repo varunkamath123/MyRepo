@@ -67,13 +67,14 @@ def _atomic_write(path: str, obj) -> None:
 
 class Runner:
     def __init__(self, broker, c=cfg, clock=None, sleep=time.sleep, history=None,
-                 state_dir=None, log_dir=None, logger=None):
+                 state_dir=None, log_dir=None, logger=None, is_holiday=None):
         self.b, self.c, self.sleep = broker, c, sleep
         self.clock = clock or (lambda: datetime.now(IST))
         self.state_dir = state_dir or c.STATE_DIR
         self.log_dir = log_dir or os.path.join(self.state_dir, 'logs')
         self.log = logger or logging.getLogger('bnf')
         self._history = history                    # injected in tests
+        self._holiday_fn = is_holiday                # injected in tests; None = NSE calendar
         self.ctx = None
         self.day = None
         self.state = None
@@ -130,6 +131,13 @@ class Runner:
 
     # ── day setup ─────────────────────────────────────────────────────────
     def _is_holiday(self, d: date) -> bool:
+        """One source of truth for "is the exchange shut", used both to decide which
+        past sessions are genuinely missing and whether the market is open today.
+        Injectable so tests do not depend on which calendar the host happens to have
+        (a test that passed on one machine and failed on another is how this was
+        found: the host knew Oct 20 2026 was a holiday, the laptop did not)."""
+        if self._holiday_fn is not None:
+            return bool(self._holiday_fn(d))
         try:
             if self.c.LEGACY_DIR not in sys.path:
                 sys.path.insert(0, self.c.LEGACY_DIR)
@@ -137,6 +145,7 @@ class Runner:
             return bool(nse_holidays.is_nse_holiday(d))
         except Exception:
             return False
+
 
     def _missing_days(self, sessions: list, today: str) -> list:
         """Trading days between the last stored session and today with no file."""
@@ -221,18 +230,11 @@ class Runner:
 
     # ── time helpers ──────────────────────────────────────────────────────
     def _market_open(self, now: datetime) -> bool:
-        if now.weekday() >= 5:
+        if now.weekday() >= 5 or self._is_holiday(now.date()):
             return False
-        try:
-            if self.c.LEGACY_DIR not in sys.path:
-                sys.path.insert(0, self.c.LEGACY_DIR)
-            import nse_holidays
-            if nse_holidays.is_nse_holiday(now.date()):
-                return False
-        except Exception:
-            pass
         hhmm = now.strftime('%H:%M')
         return '09:10' <= hhmm <= '15:35'
+
 
     def _seconds_to_next_bar(self, now: datetime) -> float:
         m = self.c.BAR_MINUTES
