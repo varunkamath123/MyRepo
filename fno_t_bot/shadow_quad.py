@@ -233,11 +233,23 @@ def evaluate(bot, df, oc, spot) -> dict | None:
         except Exception:
             pass
         try:
+            # UNITS, which the first version of this got wrong on Oct 20 2026.
+            # df['HV'] is annualised vol as a FRACTION (0.1982 = 19.82%) while
+            # atm_iv is annualised vol as a PERCENT (14.86 = 14.86%). The first
+            # version divided the fraction by an implied ONE-DAY percent, which
+            # compared three different units at once and came out ~6x low --
+            # 0.219 where the real ratio was 1.39. Logging-only, so no trade was
+            # affected, but it would have corrupted the direction-x-magnitude
+            # pairing this field exists to make measurable.
+            #
+            # Use the convention already in options_bot (rv_iv = hv*100/iv), so
+            # this number is directly comparable to the rv_iv on every trade
+            # record rather than being a second, subtly different quantity.
             _iv = float((oc or {}).get('atm_iv') or 0) or None
             if _iv:
-                _impl = round(_iv / (252 ** 0.5), 4)      # implied 1-session move %
+                _impl = round(_iv / (252 ** 0.5), 4)   # implied 1-session move %
                 if _hv:
-                    _ratio = round(_hv / _impl, 3)        # realised vs implied
+                    _ratio = round(_hv * 100.0 / _iv, 3)  # realised/implied
         except Exception:
             pass
 
@@ -253,7 +265,11 @@ def evaluate(bot, df, oc, spot) -> dict | None:
             # datetime would stamp the host's timezone, not IST.
             date=(datetime.now(_late('IST')) if _late('IST')
                   else datetime.now()).strftime('%Y-%m-%d'),
-            hv=_hv, impl_daily=_impl, rv_iv_fwd=_ratio,
+            # hv_pct alongside hv so the record is self-describing: one is the
+            # raw fraction the frame carries, the other the percent everything
+            # else in this project quotes vol in.
+            hv=_hv, hv_pct=(round(_hv * 100.0, 3) if _hv else None),
+            atm_iv=_iv, impl_daily=_impl, rv_iv_fwd=_ratio,
             votes=dict(adx=a_v, pcr=p_v, maxpain=m_v, wall=w_v),
             why=dict(adx=a_d, pcr=p_d, maxpain=m_d, wall=w_d),
             raw=dict(adx=adx, di_plus=di_p, di_minus=di_m,
