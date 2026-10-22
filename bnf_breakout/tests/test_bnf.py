@@ -1116,6 +1116,40 @@ ok('bnf_strategy never imports the chain recorder', 'bnf_chain' not in src_strat
 ok('the runner uses the recorder only to trigger it and report status',
    src_runner_entry.count('self.chain.') == 2, src_runner_entry.count('self.chain.'))
 
+
+# --- 8s. start-up code that no simulated day exercises ---
+# `import logging.handlers` placed INSIDE _setup_logging made `logging` a local name for the
+# whole function, so the first line (logging.getLogger) raised UnboundLocalError. The service
+# crash-looped on the real host; every test passed, because none of them called main() or
+# _setup_logging(). These do.
+print('\n--- start-up path ---')
+import logging as _lg           # noqa: E402
+
+_ld = tempfile.mkdtemp()
+_lgr = RN._setup_logging(_ld)
+_lgr.info('start-up smoke line')
+for _h in _lgr.handlers:
+    _h.flush()
+ok('_setup_logging runs without raising and returns a logger', isinstance(_lgr, _lg.Logger))
+ok('...using a daily-rotating handler, not a file named for the launch date',
+   any(isinstance(h, _lg.handlers.TimedRotatingFileHandler) for h in _lgr.handlers))
+eq('...which writes to a stable file name', os.path.exists(os.path.join(_ld, 'bnf.log')), True)
+ok('...and the line actually landed in it', 'start-up smoke line' in open(os.path.join(_ld, 'bnf.log')).read())
+_lgr.handlers[:] = []
+
+# main() end to end for the paths that need no network: --preflight and --status
+import bnf_config as _bc        # noqa: E402
+_sd = tempfile.mkdtemp()
+_old = (_bc.STATE_DIR, _bc.HISTORY_DIR)
+_bc.STATE_DIR, _bc.HISTORY_DIR = _sd, tmpd           # tmpd = the 3-session history built earlier
+try:
+    rc = RN.main(['--preflight'])
+    eq('main --preflight runs to completion (exit 2 here: only 3 sessions of history)', rc, 2)
+    eq('main --status runs to completion', RN.main(['--status']), 0)
+finally:
+    _bc.STATE_DIR, _bc.HISTORY_DIR = _old
+    _lg.getLogger('bnf').handlers[:] = []
+
 # --- 8n. preflight ---
 rig = Rig(flat_tape(55800))
 names = {n: okk for n, okk, _ in rig.r.preflight()}

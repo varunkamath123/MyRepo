@@ -27,6 +27,7 @@ from __future__ import annotations
 import glob
 import json
 import logging
+import logging.handlers     # at MODULE level: inside a function it rebinds `logging` as a local
 import os
 import sys
 import time
@@ -502,7 +503,6 @@ def _setup_logging(log_dir: str):
     # Daily rotation. It used to be FileHandler(f"bnf_{start date}.log"): the name was fixed
     # when the SERVICE started, so a long-running process wrote every later day into a file
     # named for the day it was launched (Oct 22's lines sat in bnf_20261021.log).
-    import logging.handlers
     fh = logging.handlers.TimedRotatingFileHandler(os.path.join(log_dir, 'bnf.log'), when='midnight',
                                                    backupCount=90, encoding='utf-8')
     fh.setFormatter(fmt)
