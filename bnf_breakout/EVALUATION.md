@@ -73,3 +73,25 @@ That is why the two live in separate files. The decision log
 A PASS at n = 30 would overturn the conclusion of `LEARNINGS.md` #1–#3, and would
 be surprising. A FAIL is the expected outcome and is a *useful* one: it closes this
 family of ideas on a forward sample instead of an in-sample one.
+
+## Amendment 2026-10-22: OI / PCR entry gate (added at the owner's direction)
+
+**What changed.** An entry now also needs the option chain to agree with the trade:
+(a) PCR, z-scored against the same time of day on the previous 20 sessions, must lean the
+trade's way (CALL: PCR above its own norm; PUT: below), and (b) the biggest OI wall in the
+trade's path (call OI for a CALL, put OI for a PUT, within 1.5%) must be at least 0.5% away.
+No snapshot, or one older than 20 minutes, **blocks** the entry (`OI_ON_MISSING='block'`).
+
+**Evidence against it, stated up front.** `research/oi_pcr_adx_study.py` found no directional
+information in PCR, max-pain or skew, so the PCR half is an untested prior, not a finding.
+The wall half cannot be backtested at all (no historical per-strike OI). The replay therefore
+runs with the gate OFF and its numbers do not describe the live strategy any more.
+
+**Consequences for the verdict.**
+- Rule 1 applies: this is a config change, so the clock restarts. Only 1 trade existed.
+  Trades from 2026-10-22 count toward the n = 30.
+- The gate can only remove trades, so n = 30 will take longer than ~64 sessions.
+- Every setup it blocks is logged in `bnf_decisions_<date>.jsonl` with a `shadow` record
+  (would-be direction, thesis, entry price), so the gate itself can be scored: did the trades
+  it refused do worse than the ones it allowed? Judge it that way, not by total P&L alone.
+- If the gated book is no better than the ungated shadow over 30 setups, switch it off.

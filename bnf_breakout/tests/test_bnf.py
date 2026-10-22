@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import bnf_broker as BR          # noqa: E402
 import bnf_chain as CH           # noqa: E402
+import bnf_replay as RP          # noqa: E402
 import bnf_config                # noqa: E402
 import bnf_data as D             # noqa: E402
 import bnf_runner as RN          # noqa: E402
@@ -64,6 +65,9 @@ def approx(name, got, want, tol=1e-6):
 def mk_cfg(**kw):
     ns = types.SimpleNamespace(**{k: getattr(bnf_config, k) for k in dir(bnf_config) if k.isupper()})
     ns.validate = lambda: []
+    # The OI gate needs a chain snapshot that almost no test provides, so it is OFF unless a
+    # test asks for it. (Shipped config has it ON; test_oi_gate_ships_on checks that.)
+    ns.OI_GATE_ENABLED = False
     for k, v in kw.items():
         setattr(ns, k, v)
     return ns
@@ -210,7 +214,8 @@ ok('a coil pressing PDH on volume in a hot regime enters', d.enter is True, d.ga
 eq('anticipating the break means buying a CALL toward resistance', d.direction, 1)
 eq('the thesis names the level it is pressing', d.thesis['level'], 'PDH')
 ok('invalidation sits below the coil for a CALL', d.thesis['invalidation'] < d.thesis['coil_lo'])
-eq('every gate reported', sorted(d.gates), ['capacity', 'coil', 'context', 'level', 'regime', 'volume', 'window'])
+eq('every gate reported', sorted(d.gates), ['capacity', 'coil', 'context', 'level', 'oi', 'regime', 'volume', 'window'])
+eq('...and the OI gate says it is off when it is off', d.gates['oi'], (True, 'off'))
 eq('a fresh context passes its gate', d.gates['context'], (True, 'fresh'))
 stale_day = dict(entry_day(), stale=True, stale_reason='session 2026-10-21 missing and could not be fetched')
 dstale = S.evaluate_entry(bars, 29, stale_day, st0, cfg0)
@@ -1113,8 +1118,10 @@ eq('...with a chain block in status.json', sorted(hb2['chain']), ['fail', 'last_
 src_strategy = open(os.path.join(os.path.dirname(HERE), 'bnf_strategy.py'), encoding='utf-8').read()
 src_runner_entry = open(os.path.join(os.path.dirname(HERE), 'bnf_runner.py'), encoding='utf-8').read()
 ok('bnf_strategy never imports the chain recorder', 'bnf_chain' not in src_strategy)
-ok('the runner uses the recorder only to trigger it and report status',
-   src_runner_entry.count('self.chain.') == 2, src_runner_entry.count('self.chain.'))
+import re as _re            # noqa: E402
+_used = set(_re.findall(r'self\.chain\.(\w+)', src_runner_entry))
+ok('the runner touches the recorder only through trigger / status / snapshot',
+   _used <= {'trigger', 'status', 'snapshot'}, _used)
 
 
 # --- 8s. start-up code that no simulated day exercises ---
@@ -1149,6 +1156,233 @@ try:
 finally:
     _bc.STATE_DIR, _bc.HISTORY_DIR = _old
     _lg.getLogger('bnf').handlers[:] = []
+
+
+# --- 8t. the OI / PCR entry gate ---
+print('\n--- OI / PCR gate ---')
+
+
+def mk_snap(pcr=1.1, call_wall=(55300, 900_000), put_wall=(54700, 800_000), age=3.0, spot_grid=(53500, 56501),
+            ts='2026-10-22T12:10:00+05:30'):
+    """A chain with modest OI everywhere and one big wall on each side."""
+    strikes = {}
+    for k in range(spot_grid[0], spot_grid[1], 100):
+        strikes[str(k)] = [10_000, 14.0, 10_000, 15.0]
+    if call_wall:
+        strikes[str(call_wall[0])][0] = call_wall[1]
+    if put_wall:
+        strikes[str(put_wall[0])][2] = put_wall[1]
+    return dict(pcr=pcr, age_min=age, strikes=strikes, ts=ts)
+
+
+PRIOR = [1.0] * 10 + [1.2] * 10                      # mean 1.1, std 0.1
+cfgO = mk_cfg(OI_GATE_ENABLED=True)
+f = S.oi_features(mk_snap(pcr=1.3), 55000.0, PRIOR, cfgO)
+approx('PCR is z-scored against the prior sessions: (1.3 - 1.1) / 0.1 = 2', f['pcr_z'], 2.0, 1e-6)
+eq('fewer than OI_PCR_MIN_HISTORY prior sessions -> no z-score, not a guess',
+   S.oi_features(mk_snap(pcr=1.3), 55000.0, [1.0] * 5, cfgO)['pcr_z'], None)
+eq('the biggest CALL wall above spot', f['wall_up_strike'], 55300.0)
+approx('...and its distance as a % of spot', f['wall_up_pct'], 300 / 55000 * 100, 1e-6)
+eq('the biggest PUT wall below spot', f['wall_dn_strike'], 54700.0)
+approx('...and its distance', f['wall_dn_pct'], 300 / 55000 * 100, 1e-6)
+big = mk_snap(call_wall=None)
+big['strikes']['55100'][0] = 500_000
+big['strikes']['55400'][0] = 900_000
+eq('of several call walls the BIGGEST wins, not the nearest', S.oi_features(big, 55000.0, PRIOR, cfgO)['wall_up_strike'], 55400.0)
+far = mk_snap(call_wall=None, put_wall=None)
+far['strikes']['56000'][0] = 9_000_000                # 1.8% away, outside the 1.5% look-ahead
+eq('a wall beyond OI_WALL_LOOKAHEAD_PCT is ignored', S.oi_features(far, 55000.0, PRIOR, cfgO)['wall_up_strike'] != 56000.0, True)
+eq('no snapshot -> no features', S.oi_features(None, 55000.0, PRIOR, cfgO), None)
+
+# the gate inside evaluate_entry. coil_bars() presses PDH 56000 => a CALL toward resistance.
+bars_c = coil_bars()
+day_c = entry_day()
+cfgG = mk_cfg(OI_GATE_ENABLED=True, COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL'))
+
+
+def oi_feat(pcr_z=1.0, up=1.2, dn=1.2):
+    return dict(pcr=1.2, pcr_z=pcr_z, age_min=3.0, n_prior=20, wall_up_strike=56700.0, wall_up_pct=up,
+                wall_dn_strike=55000.0, wall_dn_pct=dn)
+
+
+def ev(oi, bars=bars_c, cfg_=cfgG, day_=day_c):
+    return S.evaluate_entry(bars, 29, day_, dict(st0, oi=oi), cfg_)
+
+
+d1 = ev(oi_feat())
+ok('PCR agrees and the way is clear -> enters', d1.enter is True, d1.gates)
+ok('...and the OI features travel with the thesis for the trade record', d1.thesis['oi']['pcr_z'] == 1.0)
+d2 = ev(oi_feat(pcr_z=-1.0))
+eq('PCR disagrees with the trade -> only the OI gate blocks', (d2.enter, d2.blocked_by()), (False, ['oi']))
+ok("...and says WHY: 'DISAGREES'", 'DISAGREES' in d2.gates['oi'][1], d2.gates['oi'])
+eq('...and the refusal still carries the would-be direction (for measuring the gate)', d2.direction, 1)
+ok('...and the would-be thesis', 'invalidation' in d2.thesis and d2.thesis['level'] == 'PDH')
+d3 = ev(oi_feat(up=0.3))
+eq('a big call wall 0.3% above blocks a CALL toward resistance', (d3.enter, d3.blocked_by()), (False, ['oi']))
+ok("...and says 'BLOCKS'", 'BLOCKS' in d3.gates['oi'][1], d3.gates['oi'])
+eq('a wall exactly at the clearance distance counts as clear (>=)', ev(oi_feat(up=0.5)).enter, True)
+eq('a wall just inside it does not', ev(oi_feat(up=0.4999)).enter, False)
+eq('a PUT-side wall nearby does NOT block a CALL', ev(oi_feat(dn=0.1)).enter, True)
+eq('no wall in range -> passes, and says so', ev(dict(oi_feat(), wall_up_pct=None, wall_up_strike=None)).gates['oi'][1].endswith('no wall in range'), True)
+eq('a direction-signed z below OI_PCR_Z_MIN blocks', ev(oi_feat(pcr_z=0.3), cfg_=mk_cfg(OI_GATE_ENABLED=True, OI_PCR_Z_MIN=0.5,
+   COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL'))).enter, False)
+eq('...and above it passes', ev(oi_feat(pcr_z=0.6), cfg_=mk_cfg(OI_GATE_ENABLED=True, OI_PCR_Z_MIN=0.5,
+   COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL'))).enter, True)
+
+# the mirror: a PUT toward support wants PCR BELOW its norm and a clear path DOWN
+sup_b = coil_bars(px=54020.0)
+dsup = S.evaluate_entry(sup_b, 29, day_c, dict(st0, oi=oi_feat(pcr_z=-1.0, dn=1.0)), cfgG)
+eq('a PUT toward support enters when PCR is below its norm and the way down is clear', (dsup.enter, dsup.direction), (True, -1))
+eq('...and is blocked when PCR is ABOVE its norm',
+   S.evaluate_entry(sup_b, 29, day_c, dict(st0, oi=oi_feat(pcr_z=+1.0, dn=1.0)), cfgG).blocked_by(), ['oi'])
+eq('...and when a put wall sits just below',
+   S.evaluate_entry(sup_b, 29, day_c, dict(st0, oi=oi_feat(pcr_z=-1.0, dn=0.2)), cfgG).blocked_by(), ['oi'])
+cfgAway = mk_cfg(OI_GATE_ENABLED=True, COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL'), DIRECTION='away')
+eq("with DIRECTION='away' (a PUT at resistance) the gate asks the PUT questions",
+   S.evaluate_entry(bars_c, 29, day_c, dict(st0, oi=oi_feat(pcr_z=-1.0, dn=1.0)), cfgAway).enter, True)
+
+# missing data
+eq("no chain data blocks by default ('block')", (ev(None).enter, ev(None).gates['oi']), (False, (False, 'no chain data')))
+eq("...and passes when OI_ON_MISSING='pass'",
+   ev(None, cfg_=mk_cfg(OI_GATE_ENABLED=True, OI_ON_MISSING='pass', COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL'))).enter, True)
+eq('PCR z unavailable (thin history) is treated as missing, not as agreement', ev(oi_feat(pcr_z=None)).enter, False)
+eq('...but the wall condition still applies on its own when PCR is switched off',
+   ev(oi_feat(pcr_z=None), cfg_=mk_cfg(OI_GATE_ENABLED=True, OI_USE_PCR=False, COIL_RATIO_MAX=0.812,
+                                      LEVELS=('PDH', 'PDL'))).enter, True)
+eq('OI_USE_PCR off: a disagreeing PCR no longer blocks',
+   ev(oi_feat(pcr_z=-2.0), cfg_=mk_cfg(OI_GATE_ENABLED=True, OI_USE_PCR=False, COIL_RATIO_MAX=0.812,
+                                      LEVELS=('PDH', 'PDL'))).enter, True)
+eq('OI_USE_WALLS off: a wall right on top no longer blocks',
+   ev(oi_feat(up=0.1), cfg_=mk_cfg(OI_GATE_ENABLED=True, OI_USE_WALLS=False, COIL_RATIO_MAX=0.812,
+                                  LEVELS=('PDH', 'PDL'))).enter, True)
+eq('gate disabled: it passes and says off', ev(None, cfg_=mk_cfg(OI_GATE_ENABLED=False, COIL_RATIO_MAX=0.812,
+   LEVELS=('PDH', 'PDL'))).gates['oi'], (True, 'off'))
+
+# the would-be thesis is ONLY carried when OI is the sole blocker
+dboth = S.evaluate_entry(bars_c, 29, entry_day(hot=False), dict(st0, oi=oi_feat(pcr_z=-1.0)), cfgG)
+eq('if another gate also fails, no would-be setup is reported', (dboth.direction, dboth.thesis), (0, {}))
+
+# config shipped
+import bnf_config as _bc2       # noqa: E402
+eq('the shipped config has the OI gate ON, as asked', _bc2.OI_GATE_ENABLED, True)
+eq('...blocking when data is missing', _bc2.OI_ON_MISSING, 'block')
+eq('...using both conditions', (_bc2.OI_USE_PCR, _bc2.OI_USE_WALLS), (True, True))
+ok('validate() rejects a gate that checks nothing',
+   any('gates nothing' in x for x in validate_with(OI_USE_PCR=False, OI_USE_WALLS=False)))
+ok("validate() rejects an unknown OI_ON_MISSING", any('OI_ON_MISSING' in x for x in validate_with(OI_ON_MISSING='maybe')))
+
+# chain recorder: latest snapshot, age, restart
+rec, d_ = mk_rec(lambda: fake_chain())
+eq('before any fetch there is no snapshot', rec.snapshot(at('09:20')), None)
+rec.trigger(at('09:20'), 55800.0)
+rec.wait()
+sn = rec.snapshot(at('09:30'))
+approx('a snapshot carries its age in minutes', sn['age_min'], 10.0, 0.05)
+eq('...and the PCR and strikes', (sn['pcr'], len(sn['strikes']) > 20), (1.12, True))
+rec2 = CH.ChainRecorder(d_, mk_cfg(), loader=lambda: fake_chain())
+sn2 = rec2.snapshot(at('09:35'))
+ok('after a restart the last snapshot is recovered from the file', sn2 is not None and abs(sn2['age_min'] - 15.0) < 0.05, sn2 and sn2['age_min'])
+
+# PCR history
+hd = tempfile.mkdtemp()
+hp = os.path.join(hd, 'oi_intraday.jsonl')
+with open(hp, 'w') as fh:
+    for dd_, pcrs in (('2026-10-19', (0.9, 1.0, 1.1)), ('2026-10-21', (1.2, 1.3, 1.4)), ('2026-10-22', (9.9, 9.9, 9.9))):
+        for k, hh in enumerate(('09:20', '10:00', '12:00')):
+            fh.write(json.dumps(dict(instrument='BANKNIFTY', ts_str=f'{dd_}T{hh}:00', pcr=pcrs[k])) + '\n')
+    fh.write(json.dumps(dict(instrument='NIFTY', ts_str='2026-10-21T10:00:00', pcr=5.5)) + '\n')
+ph = CH.PcrHistory(hp, 'BANKNIFTY')
+eq('PCR history: the last reading at or before the time, per prior session', ph.prior('2026-10-22', '10:30'), [1.0, 1.3])
+eq("...excludes the day itself", 9.9 in ph.prior('2026-10-22', '12:00'), False)
+eq("...ignores the other instrument", 5.5 in ph.prior('2026-10-22', '10:30'), False)
+eq('...honours n', ph.prior('2026-10-22', '10:30', n=1), [1.3])
+eq('a missing file gives an empty history, not an exception', CH.PcrHistory(os.path.join(hd, 'nope.jsonl'), 'BANKNIFTY').prior('2026-10-22', '10:00'), [])
+
+
+# the runner end to end
+class FakeChain:
+    def __init__(self, snap=None, age=3.0):
+        self.snap, self.age, self.calls = snap, age, 0
+
+    def trigger(self, now, spot=None):
+        return False
+
+    def status(self):
+        return dict(ok=1, fail=0, last_ok=None, last_error=None)
+
+    def snapshot(self, now):
+        self.calls += 1
+        if self.snap is None:
+            return None
+        return dict(self.snap, age_min=self.age, ts=now.isoformat(timespec='seconds'))
+
+
+class FakeHist:
+    def prior(self, day, hhmm, n=20):
+        return [1.0] * 15
+
+
+def oi_rig(snap, age=3.0, **kw):
+    r_ = Rig(flat_tape(55800), OI_GATE_ENABLED=True, **kw)
+    r_.r.chain = FakeChain(snap, age)
+    r_.r.pcr_hist = FakeHist()
+    return r_
+
+
+good = mk_snap(pcr=1.3, call_wall=(56600, 900_000), put_wall=(55000, 900_000), spot_grid=(54000, 57001))
+rig = oi_rig(good)
+rig.go('10:35')
+ok('PCR above its norm and a clear path: the CALL is taken', rig.r.state['position'] is not None)
+eq('...the OI features are on the position\'s thesis', rig.r.state['position']['thesis']['oi']['pcr_z'] > 1, True)
+dd2 = rig.decisions()[-1]
+eq('...and in the decision log', dd2['oi']['wall_up_strike'], 56600.0)
+
+bad = mk_snap(pcr=0.8, call_wall=(56600, 900_000), put_wall=(55000, 900_000), spot_grid=(54000, 57001))
+rig = oi_rig(bad)
+rig.go('10:35')
+eq('PCR below its norm: the same CALL is refused', rig.r.state['position'], None)
+dd3 = rig.decisions()[-1]
+eq('...blocked by the OI gate alone', dd3['blocked_by'], ['oi'])
+eq('...and the refusal is logged with the direction it would have taken', dd3['shadow']['direction'], 1)
+ok('...with the thesis fields a later replay needs', {'invalidation', 'coil_hi', 'coil_lo', 'atr', 'entry_px'} <= set(dd3['shadow']))
+
+near_wall = mk_snap(pcr=1.3, call_wall=(55900, 900_000), put_wall=(55000, 900_000), spot_grid=(54000, 57001))
+rig = oi_rig(near_wall)
+rig.go('10:35')
+eq('a call wall 0.18% overhead: the CALL is refused', rig.r.state['position'], None)
+
+rig = Rig(flat_tape(55800), OI_GATE_ENABLED=True)
+rig.go('10:35')
+eq('gate on but no recorder at all: refused, not silently unfiltered', rig.r.state['position'], None)
+eq('...and the log says there was no chain data', rig.decisions()[-1]['gates']['oi'][1], 'no chain data')
+rig = Rig(flat_tape(55800), OI_GATE_ENABLED=True, OI_ON_MISSING='pass')
+rig.go('10:35')
+ok("...with OI_ON_MISSING='pass' it trades without the filter", rig.r.state['position'] is not None)
+
+rig = oi_rig(good, age=45.0)
+rig.go('10:35')
+eq('a snapshot older than OI_MAX_SNAPSHOT_AGE_MIN is treated as missing', rig.r.state['position'], None)
+eq('...and is reported as such', rig.decisions()[-1]['gates']['oi'][1], 'no chain data')
+
+rig = Rig(flat_tape(55800))                           # gate OFF (test default)
+fc = FakeChain(good)
+rig.r.chain = fc
+rig.go('10:35')
+eq('with the gate off the snapshot is never even read', fc.calls, 0)
+ok('...and the trade is taken as before', rig.r.state['position'] is not None)
+
+# replay: the gate cannot be replayed, so replay turns it off (otherwise every setup would block)
+eq('the replay config switches the OI gate off', RP._ReplayCfg().OI_GATE_ENABLED, False)
+hist40 = mk_history(40)
+t_off, g_off = RP.run(hist40, 'strategy')
+ok('the replay evaluated bars (so a quiet result is not an artefact of a blocked gate)', g_off['evaluated'] > 100, g_off['evaluated'])
+t_on, g_on = RP.run(hist40, 'strategy', c=mk_cfg(OI_GATE_ENABLED=True))
+eq('...whereas leaving the gate on with no history blocks every setup', len(t_on), 0)
+asked = []
+RP.run(hist40[:25], 'strategy', c=mk_cfg(OI_GATE_ENABLED=True, REQUIRE_HOT_REGIME=False, VOLUME_MODE='off',
+                                          COIL_RATIO_MAX=99.0, LEVEL_PROX_PCT=50.0),
+       oi_provider=lambda day, hhmm: (asked.append((day, hhmm)) or None))
+ok('replay can be given an OI provider, which is asked per bar with (day, time)', len(asked) > 10 and len(asked[0][1]) == 5, asked[:2])
 
 # --- 8n. preflight ---
 rig = Rig(flat_tape(55800))

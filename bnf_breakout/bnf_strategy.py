@@ -138,6 +138,70 @@ def nearest_levels(levels: dict, px: float):
     return (min(above) if above else (None, None)), (max(below) if below else (None, None))
 
 
+# ── open interest / PCR ─────────────────────────────────────────────────────
+def oi_features(snap, spot: float, pcr_prior: list, cfg=cfg_default):
+    """Turn a chain snapshot into the numbers the OI gate uses. Pure.
+
+    snap:      {pcr, age_min, strikes: {"55800": [call_oi, call_iv, put_oi, put_iv], ...}}
+    pcr_prior: PCR at the same time of day on the previous sessions (oldest first).
+    Returns None when there is no snapshot.
+    """
+    if not snap:
+        return None
+    pcr = snap.get('pcr')
+    out = dict(pcr=pcr, age_min=snap.get('age_min'), pcr_z=None, n_prior=len(pcr_prior),
+               wall_up_strike=None, wall_up_pct=None, wall_dn_strike=None, wall_dn_pct=None)
+    if pcr is not None and len(pcr_prior) >= cfg.OI_PCR_MIN_HISTORY:
+        a = np.asarray(pcr_prior, float)
+        out['pcr_z'] = float((pcr - a.mean()) / (a.std() + 1e-9))
+    look = cfg.OI_WALL_LOOKAHEAD_PCT / 100.0
+    best_up, best_dn = (0.0, None), (0.0, None)
+    for ks, v in (snap.get('strikes') or {}).items():
+        try:
+            k, call_oi, put_oi = float(ks), float(v[0]), float(v[2])
+        except Exception:
+            continue
+        if spot < k <= spot * (1 + look) and call_oi > best_up[0]:
+            best_up = (call_oi, k)
+        if spot * (1 - look) <= k < spot and put_oi > best_dn[0]:
+            best_dn = (put_oi, k)
+    if best_up[1] is not None:
+        out['wall_up_strike'], out['wall_up_pct'] = best_up[1], (best_up[1] - spot) / spot * 100
+    if best_dn[1] is not None:
+        out['wall_dn_strike'], out['wall_dn_pct'] = best_dn[1], (spot - best_dn[1]) / spot * 100
+    return out
+
+
+def _oi_gate(oi, direction: int, cfg) -> tuple:
+    """(passed, detail). Missing data blocks or passes per OI_ON_MISSING, and says so."""
+    if not cfg.OI_GATE_ENABLED:
+        return True, 'off'
+    miss_ok = (cfg.OI_ON_MISSING == 'pass')
+    if oi is None:
+        return miss_ok, 'no chain data'
+    parts, ok = [], True
+    if cfg.OI_USE_PCR:
+        z = oi.get('pcr_z')
+        if z is None:
+            ok &= miss_ok
+            parts.append(f"pcr n/a ({oi.get('n_prior', 0)} prior sessions)")
+        else:
+            agree = direction * z >= cfg.OI_PCR_Z_MIN
+            ok &= agree
+            parts.append(f"pcr_z {z:+.2f} {'agrees' if agree else 'DISAGREES'}")
+    if cfg.OI_USE_WALLS:
+        dist = oi.get('wall_up_pct') if direction > 0 else oi.get('wall_dn_pct')
+        strike = oi.get('wall_up_strike') if direction > 0 else oi.get('wall_dn_strike')
+        if dist is None:
+            parts.append('no wall in range')
+        else:
+            clear = dist >= cfg.OI_WALL_CLEAR_PCT
+            ok &= clear
+            parts.append(f"wall {strike:.0f}@{dist:.2f}% {'clear' if clear else 'BLOCKS'}")
+    return bool(ok), ' | '.join(parts)
+
+
+
 # ── entry ───────────────────────────────────────────────────────────────────
 @dataclass
 class EntryDecision:
@@ -195,6 +259,7 @@ def evaluate_entry(bars: dict, i: int, day: dict, state: dict, cfg=cfg_default) 
     g['level'] = (near <= cfg.LEVEL_PROX_PCT,
                   f"{up_n or '-'}@{du:.3f}% / {dn_n or '-'}@{dd:.3f}%")
     lvl_name, lvl_val = (up_n, up) if toward > 0 else (dn_n, dn)
+    direction = toward if cfg.DIRECTION == 'toward' else -toward
 
     cr = compression_ratio(H, L, i, cfg.COIL_BARS)
     g['coil'] = (cr is not None and cr <= cfg.COIL_RATIO_MAX,
@@ -213,23 +278,30 @@ def evaluate_entry(bars: dict, i: int, day: dict, state: dict, cfg=cfg_default) 
             ok = rel >= cfg.VOL_REL_MIN if cfg.VOLUME_MODE == 'participate' else rel <= cfg.VOL_REL_MAX_DRYUP
             g['volume'] = (ok, f'{rel:.2f}x')
 
-    ok_all = all(ok for ok, _ in g.values())
-    if not ok_all:
-        return EntryDecision(False, 0, {}, g)
+    g['oi'] = _oi_gate(state.get('oi'), direction, cfg)
 
-    direction = toward if cfg.DIRECTION == 'toward' else -toward
-    lo = i - cfg.COIL_BARS + 1
-    coil_hi, coil_lo = float(np.max(H[lo:i + 1])), float(np.min(L[lo:i + 1]))
-    buf = cfg.THESIS_BREAK_BUFFER_PCT / 100
-    if cfg.DIRECTION == 'toward':
-        inv = coil_lo * (1 - buf) if direction > 0 else coil_hi * (1 + buf)
-    else:                                   # fading: the level must HOLD
-        inv = lvl_val * (1 - buf) if direction > 0 else lvl_val * (1 + buf)
-    thesis = dict(level=lvl_name, level_value=lvl_val, direction=direction,
-                  coil_hi=coil_hi, coil_lo=coil_lo, invalidation=float(inv),
-                  atr=atr(H, L, i, 14), entry_bar=i, entry_px=px,
-                  mode=cfg.DIRECTION)
-    return EntryDecision(True, direction, thesis, g)
+    def _thesis():
+        lo = i - cfg.COIL_BARS + 1
+        coil_hi, coil_lo = float(np.max(H[lo:i + 1])), float(np.min(L[lo:i + 1]))
+        buf = cfg.THESIS_BREAK_BUFFER_PCT / 100
+        if cfg.DIRECTION == 'toward':
+            inv = coil_lo * (1 - buf) if direction > 0 else coil_hi * (1 + buf)
+        else:                               # fading: the level must HOLD
+            inv = lvl_val * (1 - buf) if direction > 0 else lvl_val * (1 + buf)
+        return dict(level=lvl_name, level_value=lvl_val, direction=direction,
+                    coil_hi=coil_hi, coil_lo=coil_lo, invalidation=float(inv),
+                    atr=atr(H, L, i, 14), entry_bar=i, entry_px=px,
+                    mode=cfg.DIRECTION, oi=state.get('oi'))
+
+    fails = [k for k, (ok, _) in g.items() if not ok]
+    if fails == ['oi']:
+        # Everything else said "enter". Carry the would-be direction and thesis on the
+        # refusal so the runner can log it, and the gate's effect can be measured later
+        # (research/oi_gate_shadow.py) instead of being taken on faith.
+        return EntryDecision(False, direction, _thesis(), g)
+    if fails:
+        return EntryDecision(False, 0, {}, g)
+    return EntryDecision(True, direction, _thesis(), g)
 
 
 # ── exits ───────────────────────────────────────────────────────────────────

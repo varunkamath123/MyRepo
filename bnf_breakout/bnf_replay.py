@@ -61,8 +61,21 @@ def _close(pos: dict, dec: dict, s: dict, i: int, c=cfg) -> dict:
                 worst_adv=pos['worst_adv'])
 
 
-def run(sessions: list, mode: str = 'strategy', seed: int = 0, c=cfg) -> tuple:
+class _ReplayCfg:
+    """The config with the OI gate off: no historical strike-level OI exists, so the gate cannot
+    be replayed, and leaving it on would block every setup ('no chain data')."""
+
+    def __init__(self, base=cfg):
+        self.__dict__.update({k: getattr(base, k) for k in dir(base) if k.isupper()})
+        self.OI_GATE_ENABLED = False
+
+    def validate(self):
+        return cfg.validate()
+
+
+def run(sessions: list, mode: str = 'strategy', seed: int = 0, c=None, oi_provider=None) -> tuple:
     """Returns (trades, gate_stats)."""
+    c = c if c is not None else _ReplayCfg()
     rng = random.Random(seed)
     trades, gate_pass, gate_only_fail, n_eval = [], Counter(), Counter(), 0
     for k in range(1, len(sessions)):
@@ -103,6 +116,8 @@ def run(sessions: list, mode: str = 'strategy', seed: int = 0, c=cfg) -> tuple:
                     state['trades_today'] += 1
                     state['open_positions'] = 1
                 continue
+            if oi_provider is not None:
+                state['oi'] = oi_provider(s['day'], S.bar_close_time(s['T'][i], c))
             d = S.evaluate_entry(bars, i, ctx, state, c)
             if c.ENTRY_START <= S.bar_close_time(s['T'][i], c) <= c.ENTRY_END:
                 n_eval += 1
@@ -145,6 +160,7 @@ def main(argv: list) -> None:
     args = ap.parse_args(argv)
     hist, seeds = args.history_dir, args.random_seeds
 
+    print('  (the OI/PCR gate is OFF in replay: no historical strike-level OI exists to replay it)')
     probs = cfg.validate()
     if probs:
         print('CONFIG PROBLEMS:', probs)
@@ -182,7 +198,7 @@ def main(argv: list) -> None:
     print('\n--- which gate blocks entries? (config-vs-strategy diagnosis) ---')
     ev = gates['evaluated']
     print(f'  {ev} bar evaluations inside the entry window with no open position')
-    for g in ('window', 'capacity', 'regime', 'level', 'coil', 'volume'):
+    for g in ('window', 'context', 'capacity', 'regime', 'level', 'coil', 'volume'):
         p = gates['passed'].get(g, 0)
         print(f'    {g:9} passes {100 * p / max(ev, 1):5.1f}%   '
               f'is the ONLY failing gate on {gates["only_fail"].get(g, 0):5d} bars')

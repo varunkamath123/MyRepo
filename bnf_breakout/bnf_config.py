@@ -103,6 +103,37 @@ DIRECTION = 'toward'              # 'toward' = anticipate the break (the thesis)
                                   # flipping this one word is the first thing to
                                   # try if paper results disappoint.
 
+# ── OI / PCR entry gate (added 2026-10-23 at the user's direction) ─────────────
+# The setup is "coil against a level, anticipate the break". Two ideas from positioning:
+#   WALLS  Option writers defend the biggest open-interest strikes (call writers cap a rally,
+#          put writers floor a fall). A break toward a level needs ROOM; if the biggest OI wall
+#          on the side being traded toward sits within OI_WALL_CLEAR_PCT, expect rejection.
+#   PCR    Put-writing is read as support. The trade direction must agree with PCR measured
+#          against ITS OWN recent history (z-score at the same time of day over the prior
+#          OI_PCR_HISTORY_SESSIONS sessions), because raw PCR is near-constant (the parked
+#          quad voted bullish on it 61% of the time and bearish 4%).
+#
+# HONEST STATUS. research/oi_pcr_adx_study.py found NO directional or magnitude information in
+# PCR, max-pain or skew over the next hour (follow-the-sign means -1.3..+1.7 bps against ~8 bps
+# of cost, 121 sessions), and the parked quad built on them fired 88 CALLs to 1 PUT. WALLS CANNOT
+# BE BACKTESTED at all: no strike-level OI history exists before the recorder began. So this gate
+# is a theory-driven filter with no supporting evidence, switched on because it was asked for.
+# Expect it to cut the trade count, which lengthens the time to a verdict; every setup it blocks
+# is logged with its would-be direction so its effect can be measured (research/oi_gate_shadow.py).
+OI_GATE_ENABLED = True
+OI_USE_PCR = True
+OI_USE_WALLS = True
+OI_PCR_Z_MIN = 0.0                # direction-signed PCR z must be >= this (CALL: z>=+min, PUT: z<=-min)
+OI_WALL_CLEAR_PCT = 0.5           # the biggest wall toward the trade must be farther than this (% of spot)
+OI_WALL_LOOKAHEAD_PCT = 1.5       # walls are searched within this distance of spot
+OI_MAX_SNAPSHOT_AGE_MIN = 20      # a chain snapshot older than this is treated as missing
+OI_ON_MISSING = 'block'           # 'block' | 'pass'. Block, so the test only counts trades where
+                                  # the condition could actually be evaluated, and it is VISIBLE
+                                  # in the decision log. 'pass' would silently trade unfiltered.
+OI_PCR_HISTORY_SESSIONS = 20
+OI_PCR_MIN_HISTORY = 10
+
+
 # ── exits ───────────────────────────────────────────────────────────────────
 # Hard risk limit on the option premium.
 HARD_STOP_PREMIUM_PCT = 0.25      # ORIGIN: the parked system's stop. Its trough
@@ -208,6 +239,10 @@ def validate() -> list:
         p.append('API_MIN_GAP_SECONDS would breach 5 requests/second')
     if CHAIN_RECORD_EVERY_MIN < 5:
         p.append('CHAIN_RECORD_EVERY_MIN under 5 would hammer NSE, which rate-limits')
+    if OI_ON_MISSING not in ('block', 'pass'):
+        p.append("OI_ON_MISSING must be 'block' or 'pass'")
+    if OI_GATE_ENABLED and not (OI_USE_PCR or OI_USE_WALLS):
+        p.append('OI_GATE_ENABLED with neither OI_USE_PCR nor OI_USE_WALLS gates nothing')
     if PAPER_TRADE_MODE is not True:
         p.append('this package has no live path; PAPER_TRADE_MODE must be True')
     if not set(LEVELS) <= {'PDH', 'PDL', 'ORH', 'ORL', 'DAYH', 'DAYL'}:

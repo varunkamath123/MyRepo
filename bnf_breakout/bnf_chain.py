@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Option-chain recorder: LOGGING ONLY. Nothing here is read by any decision.
+"""Option-chain recorder. Logs the chain; ALSO supplies the latest snapshot to the OI entry
+gate when OI_GATE_ENABLED (it was logging-only until 2026-10-23; see bnf_config).
 
 WHY RECORD IT AT ALL. The research (`research/oi_pcr_adx_study.py`) found no directional
 or magnitude information in PCR, max-pain or IV skew. So this is not a signal and must
@@ -67,6 +68,7 @@ class ChainRecorder:
         self.fail = 0
         self.last_error = ''
         self.last_ok_ts = None
+        self._latest = None                 # (datetime, record) of the last good snapshot
 
     # ── scheduling ────────────────────────────────────────────────────────
     def slot_for(self, now: datetime):
@@ -118,6 +120,8 @@ class ChainRecorder:
                 fh.write(json.dumps(rec) + '\n')
             self.ok += 1
             self.last_ok_ts = now.isoformat(timespec='seconds')
+            with self._lock:
+                self._latest = (now, rec)
         except Exception as e:
             self.fail += 1
             self.last_error = str(e)[:160]
@@ -153,6 +157,32 @@ class ChainRecorder:
                     columns=['call_oi', 'call_iv', 'put_oi', 'put_iv'], n_strikes=len(strikes),
                     strikes=strikes)
 
+    def snapshot(self, now: datetime):
+        """The latest good snapshot with its age in minutes, or None. After a restart the
+        in-memory copy is gone, so fall back to the last line of today's file."""
+        with self._lock:
+            latest = self._latest
+        rec, ts = None, None
+        if latest is not None:
+            ts, rec = latest
+        else:
+            try:
+                p = os.path.join(self.dir, f'bnf_chain_{now:%Y-%m-%d}.jsonl')
+                with open(p, encoding='utf-8') as fh:
+                    last = None
+                    for ln in fh:
+                        if ln.strip():
+                            last = ln
+                rec = json.loads(last) if last else None
+                ts = datetime.fromisoformat(rec['ts']) if rec else None
+            except Exception:
+                rec, ts = None, None
+        if rec is None or ts is None:
+            return None
+        out = dict(rec)
+        out['age_min'] = (now - ts).total_seconds() / 60.0
+        return out
+
     def status(self) -> dict:
         return dict(ok=self.ok, fail=self.fail, last_ok=self.last_ok_ts, last_error=self.last_error or None)
 
@@ -163,3 +193,44 @@ def _f(x):
         return None if v != v else round(v, 4)
     except Exception:
         return None
+
+
+class PcrHistory:
+    """PCR at a given time of day on previous sessions, read from the oi_intraday.jsonl the
+    recorder (and, before Oct 21, the parked bots) append to. Same source, same computation,
+    so today's PCR and its history are comparable."""
+
+    def __init__(self, path: str, instrument: str):
+        self.path, self.instrument = path, instrument
+        self._by_day = {}
+        self._loaded = 0.0
+
+    def _load(self):
+        if time.time() - self._loaded < 600:
+            return
+        by = {}
+        try:
+            with open(self.path, encoding='utf-8', errors='ignore') as fh:
+                for ln in fh:
+                    try:
+                        d = json.loads(ln)
+                    except Exception:
+                        continue
+                    if d.get('instrument') != self.instrument or d.get('pcr') is None:
+                        continue
+                    ts = d.get('ts_str') or ''
+                    by.setdefault(ts[:10], []).append((ts[11:16], float(d['pcr'])))
+        except Exception:
+            pass
+        for k in by:
+            by[k].sort()
+        self._by_day, self._loaded = by, time.time()
+
+    def prior(self, day: str, hhmm: str, n: int = 20) -> list:
+        self._load()
+        out = []
+        for d in sorted(k for k in self._by_day if k < day)[-n:]:
+            v = [p for t, p in self._by_day[d] if t <= hhmm]
+            if v:
+                out.append(v[-1])
+        return out

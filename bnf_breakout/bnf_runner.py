@@ -70,7 +70,7 @@ def _atomic_write(path: str, obj) -> None:
 class Runner:
     def __init__(self, broker, c=cfg, clock=None, sleep=time.sleep, history=None,
                  state_dir=None, log_dir=None, logger=None, is_holiday=None,
-                 reload_client=None, chain=None):
+                 reload_client=None, chain=None, pcr_hist=None):
         self.b, self.c, self.sleep = broker, c, sleep
         self.clock = clock or (lambda: datetime.now(IST))
         self.state_dir = state_dir or c.STATE_DIR
@@ -80,7 +80,8 @@ class Runner:
         self._holiday_fn = is_holiday                # injected in tests; None = NSE calendar
         self._reload = reload_client                 # builds a fresh Fyers client from today's token
         self._client_day = None
-        self.chain = chain                           # ChainRecorder or None (logging only)
+        self.chain = chain                           # ChainRecorder or None
+        self.pcr_hist = pcr_hist                     # PcrHistory or None
         self._last_spot = None
         self.ctx = None
         self.day = None
@@ -345,13 +346,23 @@ class Runner:
         self.state['last_bar_idx'] = i
         self._save()
 
+        oi = self._oi_state(now, float(bars['C'][i]))
         d = S.evaluate_entry(bars, i, self.ctx, dict(
             trades_today=self.state['trades_today'], open_positions=0,
-            last_loss_bar=self.state.get('last_loss_bar')), self.c)
-        self._append(f'bnf_decisions_{self.day}.jsonl', dict(
+            last_loss_bar=self.state.get('last_loss_bar'), oi=oi), self.c)
+        rec = dict(
             ts=now.isoformat(timespec='seconds'), bar=i, t=T[i], close=float(bars['C'][i]),
             enter=d.enter, blocked_by=d.blocked_by(),
-            gates={k: [bool(ok), det] for k, (ok, det) in d.gates.items()}))
+            gates={k: [bool(ok), det] for k, (ok, det) in d.gates.items()}, oi=oi)
+        if not d.enter and d.thesis:
+            # blocked ONLY by the OI gate: record what it would have done, so the gate can be
+            # judged against the trades it stopped (research/oi_gate_shadow.py)
+            rec['shadow'] = dict(direction=int(d.direction), level=d.thesis.get('level'),
+                                 level_value=d.thesis.get('level_value'),
+                                 invalidation=d.thesis.get('invalidation'),
+                                 coil_hi=d.thesis.get('coil_hi'), coil_lo=d.thesis.get('coil_lo'),
+                                 atr=d.thesis.get('atr'), entry_px=d.thesis.get('entry_px'))
+        self._append(f'bnf_decisions_{self.day}.jsonl', rec)
         if not d.enter:
             self._last_note = f"no setup ({','.join(d.blocked_by())})"
             return wait
@@ -359,6 +370,22 @@ class Runner:
         self.log.info(f"[SETUP] bar {i} {T[i]} direction={'CALL' if d.direction > 0 else 'PUT'} "
                       f"level={d.thesis['level']} gates={ {k: v[1] for k, v in d.gates.items()} }")
         return self._enter(now, bars, i, d, wait)
+
+    def _oi_state(self, now: datetime, spot: float):
+        """The OI/PCR features for this bar, or None if there is no usable snapshot."""
+        if not getattr(self.c, 'OI_GATE_ENABLED', False) or self.chain is None:
+            return None
+        try:
+            snap = self.chain.snapshot(now)
+            if not snap or snap.get('age_min') is None or snap['age_min'] > self.c.OI_MAX_SNAPSHOT_AGE_MIN:
+                return None
+            hhmm = str(snap['ts'])[11:16]
+            prior = (self.pcr_hist.prior(self.day, hhmm, self.c.OI_PCR_HISTORY_SESSIONS)
+                     if self.pcr_hist is not None else [])
+            return S.oi_features(snap, spot, prior, self.c)
+        except Exception as e:
+            self.log.warning(f'[OI] could not build OI features: {e}')
+            return None
 
     def _enter(self, now, bars, i, d, wait) -> float:
         spot = float(bars['C'][i])
@@ -547,8 +574,9 @@ def main(argv: list) -> int:
     budget = bnf_broker.ApiBudget(state_dir, cfg.MAX_API_CALLS_PER_DAY, cfg.API_MIN_GAP_SECONDS, today)
     chain = bnf_chain.ChainRecorder(os.path.join(state_dir, 'logs'), logger=log) \
         if cfg.CHAIN_RECORD_ENABLED else None
+    pcr_hist = bnf_chain.PcrHistory(cfg.CHAIN_LEGACY_HISTORY_FILE, cfg.INSTRUMENT)
     runner = Runner(bnf_broker.Broker(fyers, budget, log), logger=log,
-                    reload_client=bnf_broker.make_client, chain=chain)
+                    reload_client=bnf_broker.make_client, chain=chain, pcr_hist=pcr_hist)
 
     checks = runner.preflight()
     for name, ok, detail in checks:
