@@ -25,7 +25,8 @@ This is a testbed built to produce a clean forward verdict, not a claim of edge.
 | `bnf_broker.py` | Fyers adapter with a persisted API budget. Read-only. | the API behaviour changes |
 | `bnf_runner.py` | the live paper loop, state, logs, heartbeat | operations change |
 | `bnf_replay.py` | replays `bnf_strategy` over history vs a random baseline | you want to try a config |
-| `tests/test_bnf.py` | 196 assertions, incl. a simulated trading day | always, before deploying |
+| `bnf_chain.py` | records the option chain in a background thread. Logging only. | you want more fields recorded |
+| `tests/test_bnf.py` | 282 assertions, incl. a simulated trading day | always, before deploying |
 | `research/` | the pre-registered studies behind `LEARNINGS.md` | — |
 
 The strategy takes the config as its only parameter source, so the live runner and
@@ -48,7 +49,8 @@ Deployment: [`deploy/INSTALL.md`](deploy/INSTALL.md).
 | `bnf_decisions_<date>.jsonl` | every evaluated bar, every gate's state, enter or not |
 | `bnf_trades_<date>.jsonl` | each closed trade: thesis, entry gates, sizing, peak/trough, costs, API calls used |
 | `bnf_path_<date>.jsonl` | every premium poll while a position is open (for trail research) |
-| `bnf_<date>.log` | human-readable log |
+| `bnf_chain_<date>.jsonl` | option chain every 15 min: PCR, max-pain, ATM IV, skew, OI and IV by strike. **Logging only; nothing reads it.** Free (NSE's site, not Fyers). |
+| `bnf.log` | human-readable log, rotated daily at midnight |
 
 ## API budget (Fyers Standard plan: 5,000 requests/day, 5/second)
 

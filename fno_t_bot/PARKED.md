@@ -18,9 +18,12 @@ It was replaced by a single BANKNIFTY-only strategy in [`../bnf_breakout/`](../b
 
 `fno_t_bot_nifty`, `fno_t_bot_banknifty`, `fno_t_bot_sensex` (services) and the
 timers `fno_t_bot_ovn@{amo,entry,morning,reconcile}`, `fno_t_bot_weekly_analyzer`,
-`fno_t_bot_debrief`, `fno_t_bot_morning`. **Still scheduled:** `fno_t_bot_auth`
-(the daily token the new bot also uses), `fno_t_bot_datacollect` (nightly history
-the new bot reads for levels and baselines), `fno_t_bot_oi_eod`.
+`fno_t_bot_debrief`, `fno_t_bot_morning`, and (Oct 22) `fno_t_bot_oi_eod.timer`, which had
+been failing every day with `ImportError: cannot import name 'identify_levels' from
+'oi_levels'` because the new shadow `oi_levels.py` replaced the old module of the same name.
+**Still scheduled:** `fno_t_bot_auth` (the daily token the new bot also uses),
+`fno_t_bot_datacollect` (nightly history the new bot reads for levels and baselines),
+`mirofish_swarm` (08:45 sentiment note; logged, used by nothing).
 
 ## The trap that undid the parking, and the fix
 
