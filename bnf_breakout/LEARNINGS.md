@@ -125,3 +125,23 @@ windows) and `research/intraday_study.py` (420 sessions, in bps of spot).
 * **The morning does not predict the afternoon.** First 30 min -> last 30 min:
   +1.4 bps +/- 1.9 (p=0.33); gap -> rest of day: -0.6 bps. All under 3 bps.
 
+### Addendum 2 (2026-10-22): do OI/PCR/ADX/MiroFish predict anything?
+`research/oi_pcr_adx_study.py`, three decision times a session, next-60-minute outcome in bps.
+
+* **PCR, max-pain, IV skew: no directional information.** BANKNIFTY PCR z-score rho -0.04
+  (p=0.53), max-pain distance -0.02, skew -0.07; NIFTY the same. Follow-the-sign means are
+  -1.3 to +1.7 bps (+/-2.5), halves disagree. One magnitude hit (|PCR z| -> move size,
+  BANKNIFTY p=0.039) does not replicate on NIFTY (p=0.51) - one of ~14 tests.
+* **ADX/DI: no directional information on 420 sessions.** (+DI - -DI) follow-the-sign
+  -0.03 bps overall, +0.04 when ADX>=25, +0.73 in the top fifth (all +/-2-3). **ADX does predict
+  the next hour's high-low RANGE** (rho +0.13, p=4e-6) but not the net move (rho +0.03):
+  it is another trailing-volatility proxy, i.e. the volatility clustering already known.
+* **MiroFish pre-market sentiment, 11 sessions:** directional calls hit 50% (BANKNIFTY, n=4)
+  and 43% (NIFTY, n=7) against a 60% base rate of down sessions; its "bearish" days averaged
+  +0.06% / +0.22% (they rose); the big falls were on days it called neutral (-0.21% / -0.77%).
+  Far too few sessions to prove anything, and no sign of skill.
+* **Operational:** the daily OI-zones job (`oi_zones_eod.py`) has failed every day since
+  early October with `ImportError: cannot import name 'identify_levels' from 'oi_levels'` -
+  the new shadow `oi_levels.py` replaced the old module of the same name. And the 5-minute
+  OI/PCR/IV snapshots stopped on Oct 21 13:05 when the old bots were parked.
+
