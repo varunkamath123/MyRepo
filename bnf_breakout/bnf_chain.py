@@ -72,7 +72,7 @@ class ChainRecorder:
 
     # ── scheduling ────────────────────────────────────────────────────────
     def slot_for(self, now: datetime):
-        """15-minute slot number since 09:15, or None outside market hours."""
+        """Slot number (CHAIN_RECORD_EVERY_MIN minutes wide) since 09:15, or None outside market hours."""
         mins = now.hour * 60 + now.minute - (9 * 60 + 15)
         if mins < 0 or mins > 375:                    # 09:15 .. 15:30
             return None

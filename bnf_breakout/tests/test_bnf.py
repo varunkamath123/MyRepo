@@ -970,6 +970,7 @@ def fake_chain(spot=55800.0):
 
 def mk_rec(loader, **kw):
     d = tempfile.mkdtemp()
+    kw.setdefault('CHAIN_RECORD_EVERY_MIN', 15)         # the slot tests below are written for 15-minute slots
     c = mk_cfg(**kw)
     return CH.ChainRecorder(d, c, loader=loader), d
 
@@ -1007,6 +1008,15 @@ eq('...making two', len(chain_lines(d)), 2)
 eq('a trigger outside market hours does nothing', rec.trigger(at('15:45'), 55800.0), False)
 eq('...nor before the open', rec.trigger(at('08:00'), 55800.0), False)
 eq('the success counter', rec.status()['ok'], 2)
+
+# the SHIPPED cadence, and the property that motivated it
+import bnf_config as _bcc       # noqa: E402
+eq('shipped cadence is 5 minutes', _bcc.CHAIN_RECORD_EVERY_MIN, 5)
+r5 = CH.ChainRecorder(tempfile.mkdtemp(), _bcc, loader=lambda: fake_chain())
+eq('5-minute slots: 09:19 is slot 0, 09:20 is slot 1', (r5.slot_for(at('09:19')), r5.slot_for(at('09:20'))), (0, 1))
+worst = 2 * _bcc.CHAIN_RECORD_EVERY_MIN               # one failed slot, then the next succeeds just before it is read
+ok('one failed fetch cannot push the snapshot past the staleness limit that blocks entries',
+   worst < _bcc.OI_MAX_SNAPSHOT_AGE_MIN, (worst, _bcc.OI_MAX_SNAPSHOT_AGE_MIN))
 
 # never raises, and a failed slot is not retried until the next one
 calls = {'n': 0}

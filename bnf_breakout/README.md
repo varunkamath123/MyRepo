@@ -49,7 +49,7 @@ Deployment: [`deploy/INSTALL.md`](deploy/INSTALL.md).
 | `bnf_decisions_<date>.jsonl` | every evaluated bar, every gate's state, enter or not |
 | `bnf_trades_<date>.jsonl` | each closed trade: thesis, entry gates, sizing, peak/trough, costs, API calls used |
 | `bnf_path_<date>.jsonl` | every premium poll while a position is open (for trail research) |
-| `bnf_chain_<date>.jsonl` | option chain every 15 min: PCR, max-pain, ATM IV, skew, OI and IV by strike. The OI/PCR entry gate reads the latest snapshot. Free (NSE's site, not Fyers). |
+| `bnf_chain_<date>.jsonl` | option chain every 5 min: PCR, max-pain, ATM IV, skew, OI and IV by strike. The OI/PCR entry gate reads the latest snapshot. Free (NSE's site, not Fyers). |
 | `bnf.log` | human-readable log, rotated daily at midnight |
 
 ## API budget (Fyers Standard plan: 5,000 requests/day, 5/second)

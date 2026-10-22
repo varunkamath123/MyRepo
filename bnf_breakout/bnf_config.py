@@ -197,7 +197,7 @@ RATE_LIMIT_BACKOFF_SECONDS = 1800 # on a daily-cap error, wait half an hour
 # - event IV crush, strike/expiry choice, positioning near expiry - need it. Source is NSE's
 # public website, so it costs NO Fyers requests.
 CHAIN_RECORD_ENABLED = True
-CHAIN_RECORD_EVERY_MIN = 15
+CHAIN_RECORD_EVERY_MIN = 5            # 15 until 2026-10-22: one failed fetch then left a 30-min-old snapshot, past OI_MAX_SNAPSHOT_AGE_MIN (20), blocking entries
 CHAIN_STRIKES_EACH_SIDE = 15          # +/- 15 strikes of 100 = +/- 1,500 points around ATM
 CHAIN_FETCH_STALE_SEC = 180           # a fetch hung this long is abandoned so later slots run
 CHAIN_LEGACY_HISTORY_FILE = '/opt/trading_bot/live_bot/logs/oi_intraday.jsonl'
