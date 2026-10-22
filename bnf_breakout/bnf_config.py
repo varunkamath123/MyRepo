@@ -159,6 +159,20 @@ MAX_API_CALLS_PER_DAY = 3000      # 60% of the plan; entries stop scanning past
 API_MIN_GAP_SECONDS = 0.35        # stays under 5 requests/second
 RATE_LIMIT_BACKOFF_SECONDS = 1800 # on a daily-cap error, wait half an hour
 
+# ── option-chain recorder: LOGGING ONLY (bnf_chain.py) ───────────────────────
+# PCR, max-pain, IV skew and open interest by strike. research/oi_pcr_adx_study.py found no
+# directional or magnitude information in them, so NOTHING reads this. It is recorded
+# because it cannot be rebuilt later (Fyers deletes expired chains) and the untested ideas
+# - event IV crush, strike/expiry choice, positioning near expiry - need it. Source is NSE's
+# public website, so it costs NO Fyers requests.
+CHAIN_RECORD_ENABLED = True
+CHAIN_RECORD_EVERY_MIN = 15
+CHAIN_STRIKES_EACH_SIDE = 15          # +/- 15 strikes of 100 = +/- 1,500 points around ATM
+CHAIN_FETCH_STALE_SEC = 180           # a fetch hung this long is abandoned so later slots run
+CHAIN_LEGACY_HISTORY_FILE = '/opt/trading_bot/live_bot/logs/oi_intraday.jsonl'
+                                      # also continue the old 5-min file in its original shape
+
+
 # ── data & files ────────────────────────────────────────────────────────────
 HISTORY_DIR = '/opt/trading_bot/data/banknifty_5min'   # written by the nightly
                                                        # data collector; used for
@@ -192,6 +206,8 @@ def validate() -> list:
         p.append('STARTING_CAPITAL must be positive')
     if API_MIN_GAP_SECONDS < 0.2:
         p.append('API_MIN_GAP_SECONDS would breach 5 requests/second')
+    if CHAIN_RECORD_EVERY_MIN < 5:
+        p.append('CHAIN_RECORD_EVERY_MIN under 5 would hammer NSE, which rate-limits')
     if PAPER_TRADE_MODE is not True:
         p.append('this package has no live path; PAPER_TRADE_MODE must be True')
     if not set(LEVELS) <= {'PDH', 'PDL', 'ORH', 'ORL', 'DAYH', 'DAYL'}:

@@ -35,6 +35,7 @@ from datetime import date, datetime, timedelta
 import numpy as np
 
 import bnf_broker
+import bnf_chain
 import bnf_config as cfg
 import bnf_data
 import bnf_strategy as S
@@ -68,7 +69,7 @@ def _atomic_write(path: str, obj) -> None:
 class Runner:
     def __init__(self, broker, c=cfg, clock=None, sleep=time.sleep, history=None,
                  state_dir=None, log_dir=None, logger=None, is_holiday=None,
-                 reload_client=None):
+                 reload_client=None, chain=None):
         self.b, self.c, self.sleep = broker, c, sleep
         self.clock = clock or (lambda: datetime.now(IST))
         self.state_dir = state_dir or c.STATE_DIR
@@ -78,6 +79,8 @@ class Runner:
         self._holiday_fn = is_holiday                # injected in tests; None = NSE calendar
         self._reload = reload_client                 # builds a fresh Fyers client from today's token
         self._client_day = None
+        self.chain = chain                           # ChainRecorder or None (logging only)
+        self._last_spot = None
         self.ctx = None
         self.day = None
         self.state = None
@@ -275,6 +278,15 @@ class Runner:
             self._last_note = 'market closed'
             return min(900.0, 60.0 if now.strftime('%H:%M') > '15:35' else 300.0)
 
+        if self.chain is not None:
+            # logging only: starts a background fetch if this 15-minute slot is unrecorded
+            # and returns at once. It uses NSE's public site, not Fyers, so it neither
+            # needs a client nor spends quota, and it can never delay the loop below.
+            try:
+                self.chain.trigger(now, self._last_spot)
+            except Exception:
+                pass
+
         if not self._ensure_client(now, day):
             return 120.0
 
@@ -326,6 +338,7 @@ class Runner:
             self._last_note = 'bars not contiguous'
             return min(wait, 60.0)
         i = len(T) - 1
+        self._last_spot = float(bars['C'][i])
         if i <= self.state['last_bar_idx']:
             return wait                                   # nothing new yet
         self.state['last_bar_idx'] = i
@@ -475,6 +488,7 @@ class Runner:
                 trades_today=self.state.get('trades_today') if self.state else None,
                 in_position=bool(self.state and self.state.get('position')),
                 api_calls=getattr(bb, 'calls', None), api_budget=self.c.MAX_API_CALLS_PER_DAY,
+                chain=(self.chain.status() if self.chain is not None else None),
                 api_by_label=getattr(bb, 'by_label', None)))
         except Exception:
             pass
@@ -485,7 +499,12 @@ def _setup_logging(log_dir: str):
     lg = logging.getLogger('bnf')
     lg.setLevel(logging.INFO)
     fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-    fh = logging.FileHandler(os.path.join(log_dir, f"bnf_{datetime.now(IST):%Y%m%d}.log"), encoding='utf-8')
+    # Daily rotation. It used to be FileHandler(f"bnf_{start date}.log"): the name was fixed
+    # when the SERVICE started, so a long-running process wrote every later day into a file
+    # named for the day it was launched (Oct 22's lines sat in bnf_20261021.log).
+    import logging.handlers
+    fh = logging.handlers.TimedRotatingFileHandler(os.path.join(log_dir, 'bnf.log'), when='midnight',
+                                                   backupCount=90, encoding='utf-8')
     fh.setFormatter(fmt)
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
@@ -526,8 +545,10 @@ def main(argv: list) -> int:
         fyers = None
     today = datetime.now(IST).strftime('%Y-%m-%d')
     budget = bnf_broker.ApiBudget(state_dir, cfg.MAX_API_CALLS_PER_DAY, cfg.API_MIN_GAP_SECONDS, today)
+    chain = bnf_chain.ChainRecorder(os.path.join(state_dir, 'logs'), logger=log) \
+        if cfg.CHAIN_RECORD_ENABLED else None
     runner = Runner(bnf_broker.Broker(fyers, budget, log), logger=log,
-                    reload_client=bnf_broker.make_client)
+                    reload_client=bnf_broker.make_client, chain=chain)
 
     checks = runner.preflight()
     for name, ok, detail in checks:

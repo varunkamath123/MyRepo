@@ -22,6 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
 import bnf_broker as BR          # noqa: E402
+import bnf_chain as CH           # noqa: E402
 import bnf_config                # noqa: E402
 import bnf_data as D             # noqa: E402
 import bnf_runner as RN          # noqa: E402
@@ -946,6 +947,174 @@ secs = rig.go('10:35')
 eq('with no usable token nothing is traded and nothing is called', (rig.r.state['position'], rig.budget.calls), (None, 0))
 ok('...it backs off and tries again later', secs >= 60, secs)
 ok('...and says why in the heartbeat', 'no client' in json.load(open(os.path.join(rig.dir, 'status.json')))['note'])
+
+
+# --- 8r. the option-chain recorder: logging only, free, and unable to slow the loop ---
+print('\n--- option-chain recorder ---')
+import threading            # noqa: E402
+import time as _time        # noqa: E402
+
+
+def fake_chain(spot=55800.0):
+    rows = [dict(strike=k, call_oi=1000 + k % 700, call_iv=14.0 + (k - 55800) / 5000.0,
+                 put_oi=1500 + k % 500, put_iv=15.0 - (k - 55800) / 5000.0) for k in range(52000, 59601, 100)]
+    return dict(spot=spot, expiry='2026-10-27', all_expiries=['2026-10-27', '2026-11-24', '2026-12-29', 'x'],
+                pcr=1.12, max_pain=55700.0, atm_iv=14.2, iv_skew=1.3, total_call_oi=1_000_000,
+                total_put_oi=1_120_000, df=rows)
+
+
+def mk_rec(loader, **kw):
+    d = tempfile.mkdtemp()
+    c = mk_cfg(**kw)
+    return CH.ChainRecorder(d, c, loader=loader), d
+
+
+def chain_lines(d, day=DAY):
+    p = os.path.join(d, f'bnf_chain_{day}.jsonl')
+    return [json.loads(x) for x in open(p)] if os.path.exists(p) else []
+
+
+rec, d = mk_rec(lambda: fake_chain())
+eq('before the open there is no slot', rec.slot_for(at('09:10')), None)
+eq('09:15 is slot 0', rec.slot_for(at('09:15')), 0)
+eq('09:29 is still slot 0 (15-minute slots)', rec.slot_for(at('09:29')), 0)
+eq('09:30 is slot 1', rec.slot_for(at('09:30')), 1)
+eq('15:30 is the last slot', rec.slot_for(at('15:30')) is not None, True)
+eq('after the close there is no slot', rec.slot_for(at('15:35')), None)
+
+ok('a due slot starts a fetch', rec.trigger(at('09:20'), 55800.0) is True)
+rec.wait()
+l1 = chain_lines(d)
+eq('...and writes exactly one line', len(l1), 1)
+r0 = l1[0]
+eq('...carrying the summary fields', (r0['pcr'], r0['max_pain'], r0['atm_iv'], r0['iv_skew']), (1.12, 55700.0, 14.2, 1.3))
+eq('...the spot and expiry', (r0['spot'], r0['expiry']), (55800.0, '2026-10-27'))
+eq('...at most three expiries', len(r0['expiries']), 3)
+eq('...and only strikes within +/-15 strikes of ATM', (min(map(int, r0['strikes'])), max(map(int, r0['strikes']))), (54300, 57300))
+eq('...stored compactly as [call_oi, call_iv, put_oi, put_iv]', len(r0['strikes']['55800']), 4)
+eq('...with the column names recorded alongside', r0['columns'], ['call_oi', 'call_iv', 'put_oi', 'put_iv'])
+eq('the same slot is not recorded twice', rec.trigger(at('09:25'), 55800.0), False)
+rec.wait()
+eq('...so still one line', len(chain_lines(d)), 1)
+ok('the next slot is recorded', rec.trigger(at('09:31'), 55800.0) is True)
+rec.wait()
+eq('...making two', len(chain_lines(d)), 2)
+eq('a trigger outside market hours does nothing', rec.trigger(at('15:45'), 55800.0), False)
+eq('...nor before the open', rec.trigger(at('08:00'), 55800.0), False)
+eq('the success counter', rec.status()['ok'], 2)
+
+# never raises, and a failed slot is not retried until the next one
+calls = {'n': 0}
+
+
+def bad_loader():
+    calls['n'] += 1
+    raise RuntimeError('NSE blocked the request')
+
+
+rec, d = mk_rec(bad_loader)
+ok('a failing loader does not raise out of trigger()', rec.trigger(at('09:20')) is True)
+rec.wait()
+eq('...it is counted as a failure', (rec.status()['ok'], rec.status()['fail']), (0, 1))
+ok('...with the reason kept', 'NSE blocked' in rec.status()['last_error'])
+eq('...and writes no half-built line', chain_lines(d), [])
+rec.trigger(at('09:24'))
+rec.wait()
+eq('a failed slot is NOT retried within the same slot (NSE rate-limits)', calls['n'], 1)
+rec.trigger(at('09:31'))
+rec.wait()
+eq('...but the next slot tries again', calls['n'], 2)
+
+rec, d = mk_rec(lambda: None)
+rec.trigger(at('09:20'))
+rec.wait()
+eq('a None chain (market closed / blocked) is a failure, not an empty line', (rec.status()['fail'], chain_lines(d)), (1, []))
+rec, d = mk_rec(lambda: dict(spot=55800.0, df=[]))
+rec.trigger(at('09:20'))
+rec.wait()
+eq('a chain with no strikes is a failure too', rec.status()['fail'], 1)
+rec, d = mk_rec(lambda: fake_chain(), CHAIN_RECORD_ENABLED=False)
+eq('switched off in config, it never starts a fetch', rec.trigger(at('09:20')), False)
+
+# THE POINT OF THE THREAD: a hung web request must not delay the trading loop
+gate = threading.Event()
+started = []
+
+
+def hung_loader():
+    started.append(1)
+    gate.wait(30)
+    return fake_chain()
+
+
+rec, d = mk_rec(hung_loader)
+t0 = _time.monotonic()
+r_ = rec.trigger(at('09:20'))
+elapsed = _time.monotonic() - t0
+ok('trigger() returns immediately while the fetch hangs', r_ is True and elapsed < 0.5, elapsed)
+eq('a second trigger in the SAME slot does nothing', rec.trigger(at('09:21')), False)
+eq('...and in a later slot it still will not stack a second fetch on a hung one',
+   rec.trigger(at('09:31')), False)
+eq('only one fetch is in flight', len(started), 1)
+rec._started -= 1000                                   # pretend it has hung past CHAIN_FETCH_STALE_SEC
+ok('once the hung fetch is stale, the next slot is allowed to proceed', rec.trigger(at('09:46')) is True)
+gate.set()
+rec.wait(5)
+
+# the runner: triggers it, never depends on it, and survives it blowing up
+class Boom:
+    def trigger(self, now, spot=None):
+        raise RuntimeError('recorder exploded')
+
+    def status(self):
+        raise RuntimeError('status exploded')
+
+
+rig = Rig(flat_tape(55800))
+rig.r.chain = Boom()
+rig.go('10:35')
+ok('a recorder that raises cannot stop the runner trading', rig.r.state['position'] is not None)
+
+rig = Rig(flat_tape(55800))
+spy = []
+
+
+class Spy:
+    def trigger(self, now, spot=None):
+        spy.append((now.strftime('%H:%M'), spot))
+        return False
+
+    def status(self):
+        return dict(ok=0, fail=0)
+
+
+rig.r.chain = Spy()
+rig.go('09:40')
+rig.go('10:35')
+ok('the runner offers the recorder every market-hours step', len(spy) >= 2, spy)
+ok('...passing the last spot it knows once it has bars', spy[-1][1] is None or spy[-1][1] > 0)
+rig = Rig(flat_tape(55800))
+rig.r.chain = Spy()
+rig.now = datetime(2026, 10, 24, 11, 0, 0, tzinfo=IST)         # Saturday
+rig.refresh()
+spy.clear()
+rig.r.step()
+eq('on a weekend the recorder is not even offered a slot', spy, [])
+hb2 = None
+rig = Rig(flat_tape(55800))
+real_rec, _d = mk_rec(lambda: fake_chain())
+rig.r.chain = real_rec
+rig.go('09:40')
+real_rec.wait()
+hb2 = json.load(open(os.path.join(rig.dir, 'status.json')))
+eq('...with a chain block in status.json', sorted(hb2['chain']), ['fail', 'last_error', 'last_ok', 'ok'])
+
+# nothing in the DECISION code may consume the chain: it is logging only
+src_strategy = open(os.path.join(os.path.dirname(HERE), 'bnf_strategy.py'), encoding='utf-8').read()
+src_runner_entry = open(os.path.join(os.path.dirname(HERE), 'bnf_runner.py'), encoding='utf-8').read()
+ok('bnf_strategy never imports the chain recorder', 'bnf_chain' not in src_strategy)
+ok('the runner uses the recorder only to trigger it and report status',
+   src_runner_entry.count('self.chain.') == 2, src_runner_entry.count('self.chain.'))
 
 # --- 8n. preflight ---
 rig = Rig(flat_tape(55800))
