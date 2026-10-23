@@ -95,3 +95,16 @@ runs with the gate OFF and its numbers do not describe the live strategy any mor
   (would-be direction, thesis, entry price), so the gate itself can be scored: did the trades
   it refused do worse than the ones it allowed? Judge it that way, not by total P&L alone.
 - If the gated book is no better than the ungated shadow over 30 setups, switch it off.
+
+## Amendment 2026-10-24: OI gate switched to SHADOW (owner's call)
+
+`OI_GATE_BLOCKS = False`. The gate is still evaluated on every bar and its verdict is recorded
+(`oi_would_block` on each decision and on each trade's thesis), but it no longer refuses entries.
+Why: on Oct 23 (-1.2% day) the 'wall' rule blocked all 7 PUT setups, and the wall was a modest
+54,000 strike (26k put OI = 4.9% of total, 1.6x the next strike) with no size floor. Blocking left
+almost no trades to measure. The PCR half is also coincident rather than leading (PCR changes
+correlate 0.50 with the same snapshot's index move, 0.25 with the next).
+Consequence: the live trades are the ungated strategy again, so trades from this date count toward
+n = 30 as the base strategy. At the verdict, split the trades by `thesis.oi_would_block` and compare
+their P&L; only then decide whether the gate should block.
+

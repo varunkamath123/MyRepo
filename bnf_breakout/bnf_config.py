@@ -121,6 +121,12 @@ DIRECTION = 'toward'              # 'toward' = anticipate the break (the thesis)
 # Expect it to cut the trade count, which lengthens the time to a verdict; every setup it blocks
 # is logged with its would-be direction so its effect can be measured (research/oi_gate_shadow.py).
 OI_GATE_ENABLED = True
+OI_GATE_BLOCKS = False            # SHADOW (2026-10-24): evaluate and LOG the gate on every bar and on every
+                                  # taken trade, but do not block. True = it refuses entries. Switched to
+                                  # shadow after day 2: the gate blocked all 7 PUT setups on a -1.2% day
+                                  # (the 'wall' was a modest 54,000 strike, 4.9% of put OI) and left almost
+                                  # no trades to measure. Shadow keeps the trades flowing AND records what
+                                  # the gate would have said, so gated vs ungated P&L can be compared.
 OI_USE_PCR = True
 OI_USE_WALLS = True
 OI_PCR_Z_MIN = 0.0                # direction-signed PCR z must be >= this (CALL: z>=+min, PUT: z<=-min)

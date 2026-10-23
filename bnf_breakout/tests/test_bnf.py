@@ -68,6 +68,7 @@ def mk_cfg(**kw):
     # The OI gate needs a chain snapshot that almost no test provides, so it is OFF unless a
     # test asks for it. (Shipped config has it ON; test_oi_gate_ships_on checks that.)
     ns.OI_GATE_ENABLED = False
+    ns.OI_GATE_BLOCKS = True          # tests of the gate exercise blocking; shadow has its own tests
     for k, v in kw.items():
         setattr(ns, k, v)
     return ns
@@ -1272,9 +1273,27 @@ eq('gate disabled: it passes and says off', ev(None, cfg_=mk_cfg(OI_GATE_ENABLED
 dboth = S.evaluate_entry(bars_c, 29, entry_day(hot=False), dict(st0, oi=oi_feat(pcr_z=-1.0)), cfgG)
 eq('if another gate also fails, no would-be setup is reported', (dboth.direction, dboth.thesis), (0, {}))
 
+# shadow mode: same inputs, the gate fails, the trade is still taken and the verdict recorded
+cfgS = mk_cfg(OI_GATE_ENABLED=True, OI_GATE_BLOCKS=False, COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL'))
+dS = ev(oi_feat(pcr_z=-1.0), cfg_=cfgS)
+eq('SHADOW: a disagreeing PCR no longer stops the entry', (dS.enter, dS.blocked_by()), (True, []))
+eq('...but the decision says the gate would have blocked', dS.oi_would_block, True)
+ok('...and the gate detail says so', 'SHADOW: would block' in dS.gates['oi'][1], dS.gates['oi'])
+eq('...and the trade thesis carries the verdict for later scoring', (dS.thesis['oi_would_block'], 'DISAGREES' in dS.thesis['oi_detail']), (True, True))
+dS2 = ev(oi_feat(up=0.1), cfg_=cfgS)
+eq('SHADOW: a wall right overhead is recorded, not enforced', (dS2.enter, dS2.oi_would_block), (True, True))
+dS3 = ev(oi_feat(), cfg_=cfgS)
+eq('SHADOW: when the gate agrees, would_block is False', (dS3.enter, dS3.oi_would_block), (True, False))
+dS4 = ev(None, cfg_=cfgS)
+eq('SHADOW: no chain data -> enters, and records that the gate could not evaluate', (dS4.enter, dS4.oi_would_block), (True, True))
+eq('BLOCK mode is unchanged: the same disagreement refuses', (ev(oi_feat(pcr_z=-1.0)).enter, ev(oi_feat(pcr_z=-1.0)).oi_would_block), (False, True))
+eq('gate disabled: nothing is ever "would block"', ev(None, cfg_=mk_cfg(OI_GATE_ENABLED=False, COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL'))).oi_would_block, False)
+eq('SHADOW still refuses when ANOTHER gate fails', ev(oi_feat(), cfg_=cfgS, day_=entry_day(hot=False)).enter, False)
+
 # config shipped
 import bnf_config as _bc2       # noqa: E402
-eq('the shipped config has the OI gate ON, as asked', _bc2.OI_GATE_ENABLED, True)
+eq('the shipped config evaluates the OI gate', _bc2.OI_GATE_ENABLED, True)
+eq('...in SHADOW mode (logs the verdict, does not block) since 2026-10-24', _bc2.OI_GATE_BLOCKS, False)
 eq('...blocking when data is missing', _bc2.OI_ON_MISSING, 'block')
 eq('...using both conditions', (_bc2.OI_USE_PCR, _bc2.OI_USE_WALLS), (True, True))
 ok('validate() rejects a gate that checks nothing',
@@ -1355,6 +1374,13 @@ dd3 = rig.decisions()[-1]
 eq('...blocked by the OI gate alone', dd3['blocked_by'], ['oi'])
 eq('...and the refusal is logged with the direction it would have taken', dd3['shadow']['direction'], 1)
 ok('...with the thesis fields a later replay needs', {'invalidation', 'coil_hi', 'coil_lo', 'atr', 'entry_px'} <= set(dd3['shadow']))
+
+rig = oi_rig(bad, OI_GATE_BLOCKS=False)
+rig.go('10:35')
+ok('SHADOW through the runner: the setup the gate dislikes is still traded', rig.r.state['position'] is not None)
+dsh = rig.decisions()[-1]
+eq('...the decision log records that the gate would have blocked', (dsh['enter'], dsh['oi_would_block'], dsh['blocked_by']), (True, True, []))
+eq('...and the open position carries the verdict', rig.r.state['position']['thesis']['oi_would_block'], True)
 
 near_wall = mk_snap(pcr=1.3, call_wall=(55900, 900_000), put_wall=(55000, 900_000), spot_grid=(54000, 57001))
 rig = oi_rig(near_wall)

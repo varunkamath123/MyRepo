@@ -209,6 +209,7 @@ class EntryDecision:
     direction: int = 0                       # +1 CALL, -1 PUT
     thesis: dict = field(default_factory=dict)
     gates: dict = field(default_factory=dict)  # name -> (passed, detail)
+    oi_would_block: bool = False             # the OI gate failed but is in shadow mode (OI_GATE_BLOCKS False)
 
     def blocked_by(self) -> list:
         return [k for k, (ok, _) in self.gates.items() if not ok]
@@ -279,6 +280,11 @@ def evaluate_entry(bars: dict, i: int, day: dict, state: dict, cfg=cfg_default) 
             g['volume'] = (ok, f'{rel:.2f}x')
 
     g['oi'] = _oi_gate(state.get('oi'), direction, cfg)
+    oi_would_block = bool(cfg.OI_GATE_ENABLED and not g['oi'][0])
+    if oi_would_block and not cfg.OI_GATE_BLOCKS:
+        # SHADOW: the verdict is recorded (gate detail + would_block on the decision and on the
+        # trade's thesis) but does not stop the entry.
+        g['oi'] = (True, g['oi'][1] + ' [SHADOW: would block]')
 
     def _thesis():
         lo = i - cfg.COIL_BARS + 1
@@ -291,17 +297,18 @@ def evaluate_entry(bars: dict, i: int, day: dict, state: dict, cfg=cfg_default) 
         return dict(level=lvl_name, level_value=lvl_val, direction=direction,
                     coil_hi=coil_hi, coil_lo=coil_lo, invalidation=float(inv),
                     atr=atr(H, L, i, 14), entry_bar=i, entry_px=px,
-                    mode=cfg.DIRECTION, oi=state.get('oi'))
+                    mode=cfg.DIRECTION, oi=state.get('oi'),
+                    oi_would_block=oi_would_block, oi_detail=g['oi'][1])
 
     fails = [k for k, (ok, _) in g.items() if not ok]
     if fails == ['oi']:
         # Everything else said "enter". Carry the would-be direction and thesis on the
         # refusal so the runner can log it, and the gate's effect can be measured later
         # (research/oi_gate_shadow.py) instead of being taken on faith.
-        return EntryDecision(False, direction, _thesis(), g)
+        return EntryDecision(False, direction, _thesis(), g, oi_would_block=oi_would_block)
     if fails:
         return EntryDecision(False, 0, {}, g)
-    return EntryDecision(True, direction, _thesis(), g)
+    return EntryDecision(True, direction, _thesis(), g, oi_would_block=oi_would_block)
 
 
 # ── exits ───────────────────────────────────────────────────────────────────

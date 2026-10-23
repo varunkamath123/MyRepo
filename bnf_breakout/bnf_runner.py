@@ -353,7 +353,8 @@ class Runner:
         rec = dict(
             ts=now.isoformat(timespec='seconds'), bar=i, t=T[i], close=float(bars['C'][i]),
             enter=d.enter, blocked_by=d.blocked_by(),
-            gates={k: [bool(ok), det] for k, (ok, det) in d.gates.items()}, oi=oi)
+            gates={k: [bool(ok), det] for k, (ok, det) in d.gates.items()}, oi=oi,
+            oi_would_block=bool(d.oi_would_block))
         if not d.enter and d.thesis:
             # blocked ONLY by the OI gate: record what it would have done, so the gate can be
             # judged against the trades it stopped (research/oi_gate_shadow.py)
