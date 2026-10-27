@@ -64,7 +64,23 @@ CONFIDENCE_DECAY — fires green or red (changed Oct 14 2026):
   capital at stake) until the old rules close it. Each closed pair records
   real P&L (decay fired) vs not-fired P&L; the running "value of firing
   decay" total is in --status. Decay exits taken while green aren't tracked
-  since old and new rules agree there.
+  in that book since old and new rules agree there.
+
+  Oct 27 2026: the first closed pair came back at -28,023 (holding would have
+  recovered to +1,006), but a lone pair settles nothing, so the rule stays and
+  a second arm was added: EVERY decay exit (green or red) also keeps a copy
+  that only decays after 2 consecutive unsupported reads. --status compares
+  the live rule with that hysteresis rule on forward data.
+
+Blocked-read shadow book (blocked_shadow_state.json / blocked_shadow_trades.jsonl):
+  A read that clears the confidence bar but is stopped ONLY by the ADX or
+  SuperTrend-alignment gate opens a shadow position at the live price, tracked
+  under the live exit rules, no capital at stake (tagged ADX / ST / ADX+ST).
+  The ADX gate runs before Kronos, so the live path never saw the read behind
+  it -- evaluate_signal(diag=...) now takes that read (logging only; decisions
+  unchanged). daily_reads.jsonl logs every gate-chain evaluation. Rule fixed in
+  advance: no gate change on fewer than 30 closed trades per gate, and only if
+  the result holds in BOTH chronological halves (3 weeks of hindsight = n=3).
 
 Predicted target / risk:reward (instrumentation, not yet a gate):
   score_forecast() in core/candle_patterns.py already computes a price
@@ -166,6 +182,7 @@ class Position:
     predicted_target:      float = 0.0   # Kronos's predicted close at entry, for later calibration
     predicted_risk_reward: float = 0.0   # Kronos's predicted R:R at entry
     entry_confidence:      float = 0.0   # Kronos confidence at entry -- baseline for decay tracking
+    unsupported_streak:    int = 0       # consecutive daily reads that no longer support the position
 
 @dataclass
 class PaperState:
@@ -260,9 +277,13 @@ DECAY_CF_LOG  = Path(__file__).parent / "decay_cf_trades.jsonl"
 
 
 def _load_decay_cf() -> dict:
-    if DECAY_CF_FILE.exists():
-        return json.loads(DECAY_CF_FILE.read_text())
-    return {"open": {}, "closed": 0, "sum_real": 0.0, "sum_cf": 0.0}
+    cf = (json.loads(DECAY_CF_FILE.read_text()) if DECAY_CF_FILE.exists()
+          else {"open": {}, "closed": 0, "sum_real": 0.0, "sum_cf": 0.0})
+    # Second arm (added Oct 27 2026): EVERY decay exit, green or red, keeps a
+    # copy running under "decay only after 2 consecutive unsupported days", so
+    # a hysteresis rule can be compared with the live one on forward data.
+    cf.setdefault("two_day", {"open": {}, "closed": 0, "sum_real": 0.0, "sum_arm": 0.0})
+    return cf
 
 
 def _save_decay_cf(cf: dict):
@@ -272,6 +293,62 @@ def _save_decay_cf(cf: dict):
 def _log_decay_cf(record: dict):
     with open(DECAY_CF_LOG, "a") as f:
         f.write(json.dumps(record) + "\n")
+
+
+# ── Blocked-read shadow book + daily read log ───────────────────────────────
+# A read that clears the confidence bar but is stopped ONLY by a trend gate
+# (ADX >= MIN_ADX, SuperTrend alignment) opens a shadow position at the same
+# live price, tracked under the live exit rules, outside the real capital slot.
+# Purpose: hindsight on Oct 9-26 2026 showed 2 blocked winners and 1 passed
+# loser (n=3), too thin to retune a gate on; this builds the cohort forward.
+# Evaluation rule (fixed in advance): no gate change on fewer than 30 closed
+# trades per gate, and only if the result holds in BOTH chronological halves.
+# daily_reads.jsonl records every gate-chain evaluation (incl. the Kronos read
+# behind an ADX block, which the live path never consults).
+
+BLOCKED_STATE_FILE = Path(__file__).parent / "blocked_shadow_state.json"
+BLOCKED_TRADES_LOG = Path(__file__).parent / "blocked_shadow_trades.jsonl"
+DAILY_READS_LOG    = Path(__file__).parent / "daily_reads.jsonl"
+
+
+def _load_blocked() -> dict:
+    if BLOCKED_STATE_FILE.exists():
+        b = json.loads(BLOCKED_STATE_FILE.read_text())
+    else:
+        b = {}
+    b.setdefault("positions", {})   # instrument -> {"pos": asdict(Position), "blocked_by": "ADX"|"ST"|"ADX+ST"}
+    b.setdefault("stats", {})       # blocked_by -> {"n", "wins", "pnl"}
+    return b
+
+
+def _save_blocked(b: dict):
+    BLOCKED_STATE_FILE.write_text(json.dumps(b, indent=2))
+
+
+def _log_blocked(record: dict):
+    with open(BLOCKED_TRADES_LOG, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _log_daily_read(record: dict):
+    with open(DAILY_READS_LOG, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _blocked_by(d: dict, p: dict) -> Optional[str]:
+    """Which trend gate(s) ALONE stopped a confidence-clearing read, else None."""
+    if d.get("direction") not in ("LONG", "SHORT") or d.get("confidence") is None:
+        return None
+    if d["confidence"] < p["kronos_conf_min"]:
+        return None
+    aligned = ((d["direction"] == "LONG" and d.get("st") == "BULL") or
+               (d["direction"] == "SHORT" and d.get("st") == "BEAR"))
+    adx_ok = d.get("adx") is not None and d["adx"] >= MIN_ADX
+    if adx_ok and aligned:
+        return None
+    if not adx_ok and not aligned:
+        return "ADX+ST"
+    return "ST" if adx_ok else "ADX"
 
 
 # ── Data access: complete daily context + live entry price ────────────────────
@@ -340,7 +417,25 @@ def _log_trade(record: dict):
 
 # ── Signal evaluation ─────────────────────────────────────────────────────────
 
-def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float, float, float, Optional[dict]]:
+def _read_behind_adx_gate(instrument: str, ctx: pd.DataFrame, p: dict, d: dict):
+    """
+    The ADX gate runs BEFORE Kronos, so on a ranging day the live path never
+    sees Kronos's read at all. Take it anyway so a blocked read can be tracked
+    forward. Logging/shadow only -- never changes the live decision, and any
+    failure here is swallowed.
+    """
+    try:
+        direction, confidence, _, rr, tgt = get_signal(ctx, force_fallback=False)
+        d.update(direction=direction, confidence=float(confidence),
+                 risk_reward=float(rr), price_target=float(tgt))
+        log.info("[%s] (read behind ADX gate, shadow only) Kronos: %s conf=%.0f%% st=%s",
+                 instrument, direction, confidence * 100, d.get("st"))
+    except Exception as e:
+        log.warning("[%s] Could not take the Kronos read behind the ADX gate: %s", instrument, e)
+
+
+def evaluate_signal(instrument: str, df: pd.DataFrame,
+                    diag: Optional[dict] = None) -> tuple[str, float, float, float, Optional[dict]]:
     """
     Evaluate the full entry gate chain on complete daily context `df`.
     Returns (direction, confidence, risk_reward, price_target, miro_block);
@@ -355,33 +450,60 @@ def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float, floa
     would have had, plus the MiroFish score/reasons that vetoed it. This
     side channel exists only to seed a shadow trade (see cmd_daily_run) that
     tracks what would have happened had MiroFish not blocked the entry.
+
+    diag, when passed, is filled with what the gate chain saw: adx, st,
+    direction, confidence, risk_reward, price_target, and gate = the first gate
+    that failed (ADX / NEUTRAL / CONF / ST) or PASS. With diag supplied, an ADX
+    block also takes the Kronos read behind it (see _read_behind_adx_gate) so
+    cmd_daily_run can track it in the blocked-read shadow book. The return
+    value is identical with or without diag.
     """
     p = INSTRUMENT_PARAMS.get(instrument, _DEFAULT_PARAMS)
     ctx = df.copy()
+    d = diag if diag is not None else {}
+    d.update(adx=None, st=None, direction=None, confidence=None,
+             risk_reward=0.0, price_target=0.0, gate=None)
 
     adx = compute_adx(ctx)
+    d["adx"] = float(adx)
+    if diag is not None:
+        try:
+            d["st"] = supertrend(ctx, period=p["supertrend_period"], multiplier=p["supertrend_multiplier"])
+        except Exception:
+            pass
     if adx < MIN_ADX:
         log.info("[%s] Gate FAIL: ADX %.1f < %d (ranging market)", instrument, adx, MIN_ADX)
+        d["gate"] = "ADX"
+        if diag is not None:
+            _read_behind_adx_gate(instrument, ctx, p, d)
         return "NEUTRAL", 0.0, 0.0, 0.0, None
 
     direction, confidence, source, risk_reward, price_target = get_signal(ctx, force_fallback=False)
+    d.update(direction=direction, confidence=float(confidence),
+             risk_reward=float(risk_reward), price_target=float(price_target))
     log.info("[%s] Kronos: %s conf=%.0f%% src=%s adx=%.1f R:R=%.2f tgt=%.1f",
              instrument, direction, confidence * 100, source, adx, risk_reward, price_target)
 
     if direction == "NEUTRAL":
+        d["gate"] = "NEUTRAL"
         return "NEUTRAL", 0.0, 0.0, 0.0, None
     if confidence < p["kronos_conf_min"]:
         log.info("[%s] Gate FAIL: confidence %.0f%% < %.0f%%",
                  instrument, confidence * 100, p["kronos_conf_min"] * 100)
+        d["gate"] = "CONF"
         return "NEUTRAL", 0.0, 0.0, 0.0, None
 
     st = supertrend(ctx, period=p["supertrend_period"], multiplier=p["supertrend_multiplier"])
+    d["st"] = st
     if direction == "LONG" and st != "BULL":
         log.info("[%s] Gate FAIL: SuperTrend %s not aligned with LONG", instrument, st)
+        d["gate"] = "ST"
         return "NEUTRAL", 0.0, 0.0, 0.0, None
     if direction == "SHORT" and st != "BEAR":
         log.info("[%s] Gate FAIL: SuperTrend %s not aligned with SHORT", instrument, st)
+        d["gate"] = "ST"
         return "NEUTRAL", 0.0, 0.0, 0.0, None
+    d["gate"] = "PASS"
 
     mf = get_mirofish(instrument)
     if mf is not None:
@@ -415,17 +537,19 @@ def evaluate_signal(instrument: str, df: pd.DataFrame) -> tuple[str, float, floa
 # ── Exit check ────────────────────────────────────────────────────────────────
 
 def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
-               price: float, decay_requires_profit: bool = False,
+               price: float, decay_mode: str = "immediate",
                label: str = "") -> Optional[str]:
     """
     Return exit reason if the position should close at `price` (live), else None.
     Indicators/signal are computed on the complete daily context `df`; the P&L
     and stop/trail checks use the live `price`.
 
-    decay_requires_profit=False is the live rule (CONFIDENCE_DECAY fires
-    whether the position is green or red). True reproduces the OLD profit-gated
-    rule and exists only to drive the "decay had not fired" counterfactual
-    book (see decay_cf_* below); `label` tags its log lines.
+    decay_mode selects how CONFIDENCE_DECAY fires:
+      "immediate"   live rule -- the first unsupported daily read, green or red.
+      "profit_only" the OLD rule -- only while in profit (counterfactual book).
+      "two_day"     only after 2 consecutive unsupported reads (hysteresis arm).
+    pos.unsupported_streak counts consecutive unsupported reads and is mutated
+    here, like the trail state. `label` tags log lines of the shadow books.
     """
     p = INSTRUMENT_PARAMS.get(instrument, _DEFAULT_PARAMS)
 
@@ -480,11 +604,17 @@ def check_exit(instrument: str, pos: Position, df: pd.DataFrame,
         # Confidence decay: today's read no longer independently supports
         # holding at entry-quality conviction (weak same-direction, NEUTRAL,
         # or a sub-threshold opposing lean). Fires green or red (live rule,
-        # changed Oct 14 2026); the old profit-gated behaviour is only
-        # reachable via decay_requires_profit=True for the counterfactual.
+        # changed Oct 14 2026); the other decay_modes exist only to drive the
+        # shadow arms (old profit-gated rule, 2-consecutive-day hysteresis).
         still_supported = (direction == pos.direction and confidence >= p["kronos_conf_min"])
-        if not still_supported and (in_profit or not decay_requires_profit):
-            return "CONFIDENCE_DECAY"
+        if still_supported:
+            pos.unsupported_streak = 0
+        else:
+            pos.unsupported_streak += 1
+            if (decay_mode == "immediate"
+                    or (decay_mode == "profit_only" and in_profit)
+                    or (decay_mode == "two_day" and pos.unsupported_streak >= 2)):
+                return "CONFIDENCE_DECAY"
 
         if EXIT_ON_SUPERTREND_FLIP:
             if pos.direction == "LONG" and st == "BEAR":
@@ -538,6 +668,7 @@ def cmd_daily_run(instruments: list[str]):
     state = _load_state()
     shadow_state = _load_shadow_state()
     decay_cf = _load_decay_cf()
+    blocked = _load_blocked()
     today = date.today().isoformat()
 
     # Fetch context + live price once per instrument
@@ -571,6 +702,18 @@ def cmd_daily_run(instruments: list[str]):
                      f"{record['predicted_profit_inr']:+.0f}" if record['predicted_profit_inr'] is not None else "n/a",
                      pos.entry_date)
             _log_trade(record)
+            if reason == "CONFIDENCE_DECAY":
+                # Hysteresis arm: every decay exit (green or red) keeps a copy
+                # running that only decays after 2 consecutive unsupported
+                # reads. Today was unsupported day 1 (pos.unsupported_streak).
+                decay_cf["two_day"]["open"][inst] = {
+                    "pos":             asdict(pos),
+                    "real_exit_date":  today,
+                    "real_exit_price": price,
+                    "real_pnl_inr":    pnl,
+                }
+                log.info("[DECAY-2D][%s] arm opened (real exit %.1f, INR %+.0f); tracking the hold "
+                         "under the 2-consecutive-day rule", inst, price, pnl)
             if reason == "CONFIDENCE_DECAY" and pnl < 0:
                 # The old rule would have held this red position; keep a copy
                 # running under it so we can compare outcomes.
@@ -616,10 +759,12 @@ def cmd_daily_run(instruments: list[str]):
         if inst not in ctx:
             continue
         rec    = decay_cf["open"][inst]
+        if rec["real_exit_date"] == today:
+            continue        # opened this run: today's read already produced the decay exit
         cpos   = Position(**rec["pos"])
         price  = px[inst]
         reason = check_exit(inst, cpos, ctx[inst], price,
-                            decay_requires_profit=True, label="[DECAY-CF]")
+                            decay_mode="profit_only", label="[DECAY-CF]")
         if reason:
             cf_pnl, record = _close_position_record(inst, cpos, reason, price, today)
             value = rec["real_pnl_inr"] - cf_pnl        # > 0 => firing decay beat holding
@@ -648,6 +793,71 @@ def cmd_daily_run(instruments: list[str]):
                      inst, cpos.direction, cpos.entry_price, price,
                      pts * cpos.lot_size, rec["real_pnl_inr"])
 
+    # ── PASS 1c2: 2-consecutive-day decay arm (hysteresis, no capital) ──────
+    two = decay_cf["two_day"]
+    for inst in list(two["open"].keys()):
+        if inst not in ctx:
+            continue
+        rec    = two["open"][inst]
+        if rec["real_exit_date"] == today:
+            continue        # opened this run: today's unsupported read is already streak 1 -- don't count it twice
+        apos   = Position(**rec["pos"])
+        price  = px[inst]
+        reason = check_exit(inst, apos, ctx[inst], price,
+                            decay_mode="two_day", label="[DECAY-2D]")
+        if reason:
+            arm_pnl, record = _close_position_record(inst, apos, reason, price, today)
+            value = rec["real_pnl_inr"] - arm_pnl       # > 0 => the live rule beat the 2-day rule
+            two["closed"]   += 1
+            two["sum_real"] += rec["real_pnl_inr"]
+            two["sum_arm"]  += arm_pnl
+            record.update({
+                "event":           "DECAY_2D_CLOSE",
+                "real_exit_date":  rec["real_exit_date"],
+                "real_exit_price": rec["real_exit_price"],
+                "real_pnl_inr":    rec["real_pnl_inr"],
+                "arm_pnl_inr":     arm_pnl,
+                "live_vs_2d_inr":  value,
+            })
+            log.info("[DECAY-2D][%s] CLOSED via %s @ %.1f: 2-day rule INR %+.0f vs live rule INR %+.0f "
+                     "-> live rule was worth INR %+.0f", inst, reason, price, arm_pnl, rec["real_pnl_inr"], value)
+            _log_decay_cf(record)
+            del two["open"][inst]
+        else:
+            rec["pos"] = asdict(apos)
+            pts = ((price - apos.entry_price) if apos.direction == "LONG"
+                   else (apos.entry_price - price))
+            log.info("[DECAY-2D][%s] HOLD %s  entry=%.1f  live=%.1f  2-day unrealised INR %+.0f "
+                     "vs live-rule exit INR %+.0f  (unsupported streak %d)",
+                     inst, apos.direction, apos.entry_price, price, pts * apos.lot_size,
+                     rec["real_pnl_inr"], apos.unsupported_streak)
+
+    # ── PASS 1d: blocked-read shadow exits (live exit rules, no capital) ────
+    for inst in list(blocked["positions"].keys()):
+        if inst not in ctx:
+            continue
+        rec    = blocked["positions"][inst]
+        bpos   = Position(**rec["pos"])
+        price  = px[inst]
+        reason = check_exit(inst, bpos, ctx[inst], price, label="[BLOCKED-SHADOW]")
+        if reason:
+            bpnl, record = _close_position_record(inst, bpos, reason, price, today)
+            record.update({"event": "BLOCKED_SHADOW_EXIT", "blocked_by": rec["blocked_by"]})
+            s = blocked["stats"].setdefault(rec["blocked_by"], {"n": 0, "wins": 0, "pnl": 0.0})
+            s["n"] += 1
+            s["wins"] += 1 if bpnl > 0 else 0
+            s["pnl"] += bpnl
+            log.info("[BLOCKED-SHADOW][%s] EXIT %s @ %.1f  reason=%s  PnL INR %+.0f  blocked_by=%s  [held from %s]",
+                     inst, bpos.direction, price, reason, bpnl, rec["blocked_by"], bpos.entry_date)
+            _log_blocked(record)
+            del blocked["positions"][inst]
+        else:
+            rec["pos"] = asdict(bpos)
+            pts = ((price - bpos.entry_price) if bpos.direction == "LONG"
+                   else (bpos.entry_price - price))
+            log.info("[BLOCKED-SHADOW][%s] HOLD %s  entry=%.1f  live=%.1f  unrealised INR %+.0f  blocked_by=%s",
+                     inst, bpos.direction, bpos.entry_price, price, pts * bpos.lot_size, rec["blocked_by"])
+
     # ── PASS 2: entries -- real (slot-gated) or MiroFish shadow (not) ───────
     # Every instrument without an open real OR shadow position gets evaluated
     # regardless of whether another instrument holds the real slot -- this is
@@ -660,9 +870,20 @@ def cmd_daily_run(instruments: list[str]):
             continue
 
         real_slot_free = len(state.positions) == 0
-        direction, confidence, risk_reward, price_target, miro_block = evaluate_signal(inst, ctx[inst])
+        diag: dict = {}
+        direction, confidence, risk_reward, price_target, miro_block = evaluate_signal(inst, ctx[inst], diag)
         price = px[inst]
         lot   = LOT_SIZES.get(inst, 1)
+        try:    # instrumentation only -- must never break the real flow
+            _log_daily_read({
+                "date": today, "instrument": inst, "price": price,
+                "adx": diag.get("adx"), "supertrend": diag.get("st"),
+                "direction": diag.get("direction"), "confidence": diag.get("confidence"),
+                "gate": "MIRO" if miro_block is not None else diag.get("gate"),
+                "entered": direction != "NEUTRAL" and real_slot_free,
+            })
+        except Exception as e:
+            log.warning("[%s] daily read log failed: %s", inst, e)
 
         if direction != "NEUTRAL":
             if not real_slot_free:
@@ -730,12 +951,40 @@ def cmd_daily_run(instruments: list[str]):
                 "mirofish_reasons":      miro_block["mirofish_reasons"],
             })
 
+        else:
+            # NEUTRAL and not a MiroFish block: if a confidence-clearing read was
+            # stopped only by a trend gate (ADX / SuperTrend), track it forward.
+            try:
+                bb = _blocked_by(diag, INSTRUMENT_PARAMS.get(inst, _DEFAULT_PARAMS))
+                if bb and inst not in blocked["positions"]:
+                    bpos = Position(
+                        instrument=inst, direction=diag["direction"], entry_date=today,
+                        entry_price=price, lot_size=lot, hwm=price,
+                        trail_active=False, trail_stop=0.0,
+                        predicted_target=diag["price_target"], predicted_risk_reward=diag["risk_reward"],
+                        entry_confidence=diag["confidence"],
+                    )
+                    blocked["positions"][inst] = {"pos": asdict(bpos), "blocked_by": bb}
+                    log.info("[BLOCKED-SHADOW][%s] ENTRY %s @ %.1f  conf=%.0f%%  blocked_by=%s (adx=%.1f st=%s)",
+                             inst, diag["direction"], price, diag["confidence"] * 100, bb,
+                             diag["adx"], diag.get("st"))
+                    _log_blocked({
+                        "event": "BLOCKED_SHADOW_ENTRY", "instrument": inst,
+                        "direction": diag["direction"], "entry_date": today, "entry_price": price,
+                        "confidence": diag["confidence"], "blocked_by": bb,
+                        "adx": diag["adx"], "supertrend": diag.get("st"), "lot_size": lot,
+                    })
+            except Exception as e:
+                log.warning("[%s] blocked-read shadow entry failed: %s", inst, e)
+
     _save_state(state)
     _save_shadow_state(shadow_state)
     _save_decay_cf(decay_cf)
+    _save_blocked(blocked)
     print_status(state)
     print_shadow_status(shadow_state)
     print_decay_cf_status(decay_cf)
+    print_blocked_status(blocked)
 
 
 def cmd_morning_scan():
@@ -854,6 +1103,41 @@ def print_decay_cf_status(cf: dict):
         print(f"  TRACKING {inst:<10} {p['direction']}  entry={p['entry_price']:.1f}  "
               f"real exit {rec['real_exit_price']:.1f} on {rec['real_exit_date']} "
               f"(INR {rec['real_pnl_inr']:+,.0f})")
+    two = cf.get("two_day", {"open": {}, "closed": 0, "sum_real": 0.0, "sum_arm": 0.0})
+    print("  -- 2-DAY ARM: live rule vs 'decay only after 2 consecutive unsupported days' (all decay exits)")
+    if two["closed"]:
+        print(f"  Closed pairs : {two['closed']}   live INR {two['sum_real']:+,.0f}   "
+              f"2-day INR {two['sum_arm']:+,.0f}")
+        print(f"  Value of live rule vs 2-day: INR {two['sum_real'] - two['sum_arm']:+,.0f}   "
+              f"(positive = live rule better)")
+    else:
+        print("  No closed pairs yet.")
+    for inst, rec in two["open"].items():
+        p = rec["pos"]
+        print(f"  TRACKING {inst:<10} {p['direction']}  entry={p['entry_price']:.1f}  "
+              f"live exit {rec['real_exit_price']:.1f} on {rec['real_exit_date']} "
+              f"(INR {rec['real_pnl_inr']:+,.0f})  streak={p.get('unsupported_streak', 0)}")
+    print(sep)
+
+
+def print_blocked_status(b: dict):
+    sep = "=" * 60
+    print(f"\n{sep}")
+    print("  BLOCKED-READ SHADOW  (confidence-clearing reads the ADX / SuperTrend gate stopped)")
+    print("  Rule fixed in advance: no gate change before 30 closed trades per gate, and only")
+    print("  if the result holds in BOTH chronological halves.")
+    print(sep)
+    stats = b["stats"]
+    if stats:
+        for key in sorted(stats):
+            s = stats[key]
+            print(f"  {key:<8} closed {s['n']:>3}  wins {s['wins']:>3}  P&L INR {s['pnl']:+,.0f}")
+    else:
+        print("  No closed blocked-read trades yet.")
+    for inst, rec in b["positions"].items():
+        p = rec["pos"]
+        print(f"  OPEN {inst:<10} {p['direction']}  entry={p['entry_price']:.1f}  "
+              f"date={p['entry_date']}  blocked_by={rec['blocked_by']}")
     print(sep)
 
 
@@ -861,6 +1145,7 @@ def cmd_status():
     print_status(_load_state())
     print_shadow_status(_load_shadow_state())
     print_decay_cf_status(_load_decay_cf())
+    print_blocked_status(_load_blocked())
 
 
 def cmd_reset():

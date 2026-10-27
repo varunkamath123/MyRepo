@@ -22,6 +22,14 @@ Run:
     python backtest.py --out my_results.csv    # custom output path
 
 Output: per-trade log + summary metrics → stdout + CSV
+
+Fidelity to the live paper trader (Oct 27 2026): signals refresh daily and the
+CONFIDENCE_DECAY exit is on, as live. Still different from live: the backtest
+signals at a bar's close and enters the NEXT open / exits the next close, while
+live acts same-day at ~14:55 IST; instruments run independently (live holds one
+position across both); no MiroFish veto, news exit, or costs; and the input is
+yfinance real-volume bars while live Upstox index candles carry ZERO volume, which
+changes Kronos's output enough to flip results.
 """
 from __future__ import annotations
 
@@ -49,10 +57,15 @@ from config import INSTRUMENTS, MIN_ADX
 # ── Global defaults ───────────────────────────────────────────────────────────
 FORECAST_BARS        = 5       # daily bars ahead (1 week; enough for direction)
 MIN_CONTEXT_BARS     = 60      # minimum history bars before first signal
-SIGNAL_CACHE_BARS    = 3       # re-run Kronos every N bars to save CPU
+SIGNAL_CACHE_BARS    = 1       # re-run Kronos every N bars. Live refreshes DAILY (=1). The old default of 3
+                               # understated trade frequency and exit timing: on identical cached signals the
+                               # 3-year zero-volume result moved from -73.8k (3) to -258.6k (1). Use >1 only to
+                               # save CPU when a rough look is enough (real Kronos ~1.6 s/bar on EC2).
 
 EXIT_ON_KRONOS_REVERSAL  = True
 EXIT_ON_SUPERTREND_FLIP  = True
+EXIT_ON_CONFIDENCE_DECAY = True   # mirrors paper_trader's live rule (Oct 14 2026): fire on the first read that
+                                  # no longer supports the position, green or red
 
 # ── Per-instrument risk params ────────────────────────────────────────────────
 # Tuned separately based on 3-year Kronos backtest results.
@@ -369,6 +382,13 @@ def backtest_instrument(
                         _last_signal_bar = -999
                         continue
 
+                if EXIT_ON_CONFIDENCE_DECAY and not (_cached_dir == pos.direction and
+                                                     _cached_conf >= kronos_conf_min):
+                    _close(pos, i + 1, nxt_date, price, "CONFIDENCE_DECAY", trades)
+                    pos = None; hwm = trail_stop = 0.0; trail_active = False
+                    _last_signal_bar = -999
+                    continue
+
                 if EXIT_ON_SUPERTREND_FLIP:
                     if (pos.direction == "LONG"  and st == "BEAR") or \
                        (pos.direction == "SHORT" and st == "BULL"):
@@ -582,7 +602,16 @@ def main():
                         help="Years of history to download (default: 3)")
     parser.add_argument("--out", default="backtest_results_daily.csv",
                         help="CSV output path")
+    parser.add_argument("--no-decay", action="store_true",
+                        help="Disable the CONFIDENCE_DECAY exit (live bot has it on)")
+    parser.add_argument("--cache-bars", type=int, default=None,
+                        help="Re-run Kronos every N bars (default 1 = daily, like live)")
     args = parser.parse_args()
+    global EXIT_ON_CONFIDENCE_DECAY, SIGNAL_CACHE_BARS
+    if args.no_decay:
+        EXIT_ON_CONFIDENCE_DECAY = False
+    if args.cache_bars:
+        SIGNAL_CACHE_BARS = args.cache_bars
 
     valid = {**INSTRUMENTS, "SENSEX": {"lot_size": 20, "live": False}}
     instruments = [i.upper() for i in args.instruments if i.upper() in valid]
