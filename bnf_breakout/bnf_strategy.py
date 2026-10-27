@@ -185,7 +185,11 @@ def _oi_gate(oi, direction: int, cfg) -> tuple:
     parts, ok = [], True
     if cfg.OI_USE_PCR:
         z = oi.get('pcr_z')
-        if z is None:
+        if z is None and oi.get('pcr') is not None and oi.get('n_prior', 0) < cfg.OI_PCR_MIN_HISTORY:
+            # a history that is still building (a new source) is not a disagreement and not
+            # missing data: say so and judge on the walls alone
+            parts.append(f"pcr warming up ({oi.get('n_prior', 0)}/{cfg.OI_PCR_MIN_HISTORY} sessions)")
+        elif z is None:
             ok &= miss_ok
             parts.append(f"pcr n/a ({oi.get('n_prior', 0)} prior sessions)")
         else:

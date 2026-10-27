@@ -22,6 +22,7 @@ IT CANNOT RAISE. Every failure is counted, logged at most once an hour, and swal
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import sys
@@ -29,7 +30,9 @@ import threading
 import time
 from datetime import datetime
 
+import bnf_broker
 import bnf_config as cfg
+from bnf_data import IST
 
 
 def _rows(df) -> list:
@@ -56,8 +59,11 @@ def default_loader(c=cfg):
 
 
 class ChainRecorder:
-    def __init__(self, log_dir: str, c=cfg, loader=None, logger=None):
+    def __init__(self, log_dir: str, c=cfg, loader=None, logger=None, prefix: str = 'bnf_chain',
+                 needs_client: bool = False):
         self.dir, self.c, self.log = log_dir, c, logger
+        self.prefix = prefix
+        self.needs_client = needs_client    # True: the source uses the Fyers client, so trigger only once it exists
         self.loader = loader or (lambda: default_loader(c))
         self._last_slot = None
         self._thread = None
@@ -115,7 +121,7 @@ class ChainRecorder:
             if rec is None:
                 raise RuntimeError('empty chain (market closed, or NSE blocked/limited the request)')
             os.makedirs(self.dir, exist_ok=True)
-            p = os.path.join(self.dir, f'bnf_chain_{now:%Y-%m-%d}.jsonl')
+            p = os.path.join(self.dir, f'{self.prefix}_{now:%Y-%m-%d}.jsonl')
             with open(p, 'a', encoding='utf-8') as fh:
                 fh.write(json.dumps(rec) + '\n')
             self.ok += 1
@@ -151,6 +157,7 @@ class ChainRecorder:
             strikes[str(k)] = [int(r.get('call_oi') or 0), _f(r.get('call_iv')),
                                int(r.get('put_oi') or 0), _f(r.get('put_iv'))]
         return dict(ts=now.isoformat(timespec='seconds'), slot=slot, spot=px or None,
+                    source=str(chain.get('source') or 'nse'),
                     expiry=str(chain.get('expiry')), expiry_day=expiry_day, expiries=[str(x) for x in (chain.get('all_expiries') or [])[:3]],
                     pcr=_f(chain.get('pcr')), max_pain=_f(chain.get('max_pain')),
                     atm_iv=_f(chain.get('atm_iv')), iv_skew=_f(chain.get('iv_skew')),
@@ -168,7 +175,7 @@ class ChainRecorder:
             ts, rec = latest
         else:
             try:
-                p = os.path.join(self.dir, f'bnf_chain_{now:%Y-%m-%d}.jsonl')
+                p = os.path.join(self.dir, f'{self.prefix}_{now:%Y-%m-%d}.jsonl')
                 with open(p, encoding='utf-8') as fh:
                     last = None
                     for ln in fh:
@@ -247,3 +254,112 @@ class PcrHistory:
             if v:
                 out.append(v[-1])
         return out
+
+
+class FyersChainSource:
+    """Loader for ChainRecorder that reads the BROKER's option chain, for the series the bot trades.
+
+    Why: NSE's public page returns only the nearest expiry, so on that series' expiry day the gate
+    was reading a chain for a series the bot does not trade. Fyers lets us ask for an expiry.
+    Cost: one request per snapshot (~77/day at 5 minutes) plus one discovery call a day, from the
+    API budget under the label 'chain'. It has NO implied volatility (NSE's recorder keeps that).
+    """
+
+    def __init__(self, get_broker, c=cfg, today_fn=None):
+        self.get_broker, self.c = get_broker, c
+        self._today = today_fn or (lambda: datetime.now(IST).date())
+        self._ts = {}                       # (year, month) of the traded expiry -> epoch string
+
+    def _traded_expiry(self, b, today):
+        e = getattr(b, '_expiry', None)
+        if e and e[0] == today:
+            return e[1]
+        cands = bnf_broker.expiry_candidates(today, self.c)
+        return cands[0] if cands else None
+
+    @staticmethod
+    def _parse_expiries(expiry_data) -> list:
+        out = []
+        for e in expiry_data or []:
+            try:
+                d = datetime.strptime(str(e.get('date')), '%d-%m-%Y').date()
+                out.append((d, str(e.get('expiry'))))
+            except Exception:
+                continue
+        return out
+
+    def __call__(self):
+        b = self.get_broker()
+        if b is None or getattr(b, 'f', None) is None:
+            raise RuntimeError('no Fyers client yet')
+        today = self._today()
+        exp = self._traded_expiry(b, today)
+        if exp is None:
+            raise RuntimeError('no tradable expiry')
+        key = (exp.year, exp.month)
+        n = int(self.c.CHAIN_STRIKES_EACH_SIDE)
+        ts = self._ts.get(key)
+        data, st = b.option_chain(ts or '', n)
+        if data is None:
+            raise RuntimeError(f'fyers chain: {st}')
+        expiries = self._parse_expiries(data.get('expiryData'))
+        match = next(((d, e) for d, e in expiries if (d.year, d.month) == key), None)
+        if match is None:
+            raise RuntimeError(f'traded expiry {key} not in Fyers expiryData')
+        if ts is None:
+            self._ts[key] = match[1]
+            if expiries and (expiries[0][0].year, expiries[0][0].month) != key:
+                # the discovery call returned the NEAREST series; ask for the traded one
+                data, st = b.option_chain(match[1], n)
+                if data is None:
+                    raise RuntimeError(f'fyers chain: {st}')
+        rows, spot = {}, None
+        for r in data.get('optionsChain', []):
+            ot = r.get('option_type')
+            if ot not in ('CE', 'PE'):
+                if spot is None and r.get('ltp'):
+                    spot = float(r['ltp'])
+                continue
+            k = int(r.get('strike_price', 0))
+            row = rows.setdefault(k, dict(strike=k, call_oi=0, call_iv=None, put_oi=0, put_iv=None))
+            row['call_oi' if ot == 'CE' else 'put_oi'] = int(float(r.get('oi') or 0))
+        if not rows or not spot:
+            raise RuntimeError('fyers chain without strikes or spot')
+        co, po = float(data.get('callOi') or 0), float(data.get('putOi') or 0)
+        return dict(source='fyers', spot=spot, expiry=match[0].isoformat(),
+                    all_expiries=[d.isoformat() for d, _ in expiries],
+                    pcr=round(po / co, 3) if co else None, max_pain=None, atm_iv=None, iv_skew=None,
+                    total_call_oi=co, total_put_oi=po,
+                    df=[rows[k] for k in sorted(rows)])
+
+
+class ChainFilePcrHistory(PcrHistory):
+    """PCR history from the recorder's own daily files (`<prefix>_<date>.jsonl`). Used when the gate
+    reads the Fyers chain: its PCR is a different quantity (the traded series, all strikes) from the
+    NSE nearest-series PCR in oi_intraday.jsonl, so it needs its own history, which starts empty."""
+
+    def __init__(self, log_dir: str, prefix: str):
+        super().__init__(log_dir, '')
+        self.dir, self.prefix = log_dir, prefix
+
+    def _load(self):
+        if time.time() - self._loaded < 600:
+            return
+        by = {}
+        for p in sorted(glob.glob(os.path.join(self.dir, f'{self.prefix}_*.jsonl'))):
+            try:
+                with open(p, encoding='utf-8', errors='ignore') as fh:
+                    for ln in fh:
+                        try:
+                            d = json.loads(ln)
+                        except Exception:
+                            continue
+                        ts, pcr = str(d.get('ts') or ''), d.get('pcr')
+                        if pcr is None or len(ts) < 16:
+                            continue
+                        by.setdefault(ts[:10], []).append((ts[11:16], float(pcr)))
+            except Exception:
+                continue
+        for k in by:
+            by[k].sort()
+        self._by_day, self._loaded = by, time.time()

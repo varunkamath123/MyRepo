@@ -126,3 +126,13 @@ and a 'wall' that were artefacts. `OI_SKIP_ON_EXPIRY_DAY=True`: the gate passes 
 in shadow, so no trade is affected; the shadow verdict for the Oct 27 13:45 trade (`oi_would_block=true`)
 is an artefact and must be excluded when the shadow record is scored.
 
+## Note 2026-10-28: the OI gate now reads the BROKER's chain (owner's suggestion)
+
+`OI_SOURCE='fyers'`: the gate's PCR and OI walls come from Fyers' option chain for the series the bot trades
+(the next monthly on the nearest series' expiry day), ~77 calls/day from the API budget (label `chain`).
+NSE is still recorded in parallel (`bnf_chain_<date>.jsonl`) because only NSE has IV and skew. Fyers' PCR is a
+different quantity from the NSE PCR in `oi_intraday.jsonl` (traded series, all strikes), so it has its own
+history, starting empty: the PCR condition shows 'warming up' (passes) until 10 sessions exist; walls apply
+immediately. The gate is still in shadow, so no trade is affected. Shadow verdicts logged before 2026-10-29
+used the NSE nearest-series chain; do not pool them with later ones without noting the source.
+

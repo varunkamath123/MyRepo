@@ -137,6 +137,10 @@ OI_PCR_Z_MIN = 0.0                # direction-signed PCR z must be >= this (CALL
 OI_WALL_CLEAR_PCT = 0.5           # the biggest wall toward the trade must be farther than this (% of spot)
 OI_WALL_LOOKAHEAD_PCT = 1.5       # walls are searched within this distance of spot
 OI_MAX_SNAPSHOT_AGE_MIN = 20      # a chain snapshot older than this is treated as missing
+OI_SOURCE = 'fyers'              # 'fyers' | 'nse'. Where the GATE reads its chain from. 'fyers' = the broker's option
+                                  # chain for the series the bot actually TRADES (the next monthly on the nearest
+                                  # series' expiry day), ~77 calls/day. 'nse' = NSE's public page, which only ever
+                                  # returns the NEAREST expiry. NSE is still recorded either way (it alone has IV).
 OI_SKIP_ON_EXPIRY_DAY = True      # On the nearest series' expiry day the chain NSE gives us (nse_oi/jugaad returns only the
                                   # NEAREST expiry's rows) is the series that is expiring, not the one the bot trades
                                   # (the next monthly). Its PCR and OI collapse over the day (Oct 27: PCR 0.80 -> 0.60,
@@ -242,6 +246,8 @@ def validate() -> list:
         p.append('ENTRY_START must precede ENTRY_END')
     if ENTRY_END >= FORCE_CLOSE:
         p.append('ENTRY_END must precede FORCE_CLOSE')
+    if OI_SOURCE not in ('fyers', 'nse'):
+        p.append("OI_SOURCE must be 'fyers' or 'nse'")
     if DIRECTION not in ('toward', 'away'):
         p.append("DIRECTION must be 'toward' or 'away'")
     if VOLUME_MODE not in ('participate', 'dryup', 'off'):

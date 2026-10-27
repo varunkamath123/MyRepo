@@ -20,6 +20,7 @@ from __future__ import annotations
 import calendar
 import json
 import os
+import threading
 import time
 from datetime import date, datetime
 
@@ -194,6 +195,11 @@ class Broker:
         self.f, self.budget, self.log, self.c = fyers, budget, logger, c
         self.auth_failed = False          # set by an auth reply; the runner reloads the client
         self._expiry = None                       # (date, expiry) cache
+        # The chain recorder calls from a background thread while the main loop prices the
+        # position. The budget's counters are not thread-safe, so every budget operation
+        # (never the HTTP call itself, which would let a slow chain request delay an exit)
+        # happens under this lock.
+        self._lock = threading.Lock()
 
     def _say(self, level: str, msg: str):
         if self.log:
@@ -203,17 +209,20 @@ class Broker:
         """The ONLY route to the API. Returns (response|None, status)."""
         if self.f is None:
             return None, 'no client'
-        ok, why = self.budget.allow(essential)
-        if not ok:
-            return None, why
-        self.budget.pace()
+        with self._lock:
+            ok, why = self.budget.allow(essential)
+            if not ok:
+                return None, why
+            self.budget.pace()
         try:
             resp = fn()
         except Exception as e:
-            self.budget.record(label)
+            with self._lock:
+                self.budget.record(label)
             self._say('error', f'[API] {label}: exception {e}')
             return None, f'exception: {e}'
-        self.budget.record(label)
+        with self._lock:
+            self.budget.record(label)
         if isinstance(resp, dict) and resp.get('s') != 'ok' and is_auth_error(resp):
             self.auth_failed = True
             self._say('error', f"[API] {label}: AUTH ERROR ({str(resp.get('message'))[:90]}) - client will be reloaded")
@@ -222,7 +231,8 @@ class Broker:
             msg = resp.get('message') or resp.get('errmsg') or ''
             if resp.get('code') == 429 or resp.get('code') == -360 or is_rate_limited(msg):
                 secs = self.c.RATE_LIMIT_BACKOFF_SECONDS if 'day' in str(msg).lower() or resp.get('code') == -360 else 5
-                self.budget.block(secs)
+                with self._lock:
+                    self.budget.block(secs)
                 self._say('warning', f'[API] {label}: RATE LIMITED ({str(msg)[:90]}) - backing off {secs}s')
                 return None, 'rate_limited'
             return resp, f'error: {msg}'
@@ -257,6 +267,19 @@ class Broker:
             return None
         b['day'] = day
         return b
+
+    def option_chain(self, timestamp: str = '', strikecount: int = 15):
+        """Fyers option chain for the index. `timestamp` is an expiry epoch ('' = nearest).
+        Non-essential: it is the first call to go if the budget runs short.
+        Returns (data dict | None, status)."""
+        resp, st = self._call('chain', lambda: self.f.optionchain(dict(
+            symbol=self.c.INDEX_SYMBOL, strikecount=int(strikecount), timestamp=str(timestamp or ''))))
+        if resp is None or st != 'ok':
+            return None, st
+        data = resp.get('data')
+        if not isinstance(data, dict) or not data.get('optionsChain'):
+            return None, 'empty chain'
+        return data, 'ok'
 
     def quote(self, symbol: str, essential: bool = False):
         resp, st = self._call('quote', lambda: self.f.quotes(dict(symbols=symbol)), essential)

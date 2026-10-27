@@ -70,7 +70,7 @@ def _atomic_write(path: str, obj) -> None:
 class Runner:
     def __init__(self, broker, c=cfg, clock=None, sleep=time.sleep, history=None,
                  state_dir=None, log_dir=None, logger=None, is_holiday=None,
-                 reload_client=None, chain=None, pcr_hist=None):
+                 reload_client=None, chain=None, pcr_hist=None, chain_log=None):
         self.b, self.c, self.sleep = broker, c, sleep
         self.clock = clock or (lambda: datetime.now(IST))
         self.state_dir = state_dir or c.STATE_DIR
@@ -80,7 +80,8 @@ class Runner:
         self._holiday_fn = is_holiday                # injected in tests; None = NSE calendar
         self._reload = reload_client                 # builds a fresh Fyers client from today's token
         self._client_day = None
-        self.chain = chain                           # ChainRecorder or None
+        self.chain = chain                           # ChainRecorder the OI gate reads, or None
+        self.chain_log = chain_log                   # a second recorder that only LOGS (NSE: has IV), or None
         self.pcr_hist = pcr_hist                     # PcrHistory or None
         self._last_spot = None
         self.ctx = None
@@ -280,17 +281,24 @@ class Runner:
             self._last_note = 'market closed'
             return min(900.0, 60.0 if now.strftime('%H:%M') > '15:35' else 300.0)
 
-        if self.chain is not None:
-            # logging only: starts a background fetch if this 15-minute slot is unrecorded
-            # and returns at once. It uses NSE's public site, not Fyers, so it neither
-            # needs a client nor spends quota, and it can never delay the loop below.
-            try:
-                self.chain.trigger(now, self._last_spot)
-            except Exception:
-                pass
+        # Recorders that do not use the Fyers client (NSE's public page) start here, whether or not a
+        # client exists. Each starts a background fetch if this slot is unrecorded and returns at once,
+        # so none can delay the loop below.
+        for rec in (self.chain, self.chain_log):
+            if rec is not None and not getattr(rec, 'needs_client', False):
+                try:
+                    rec.trigger(now, self._last_spot)
+                except Exception:
+                    pass
 
         if not self._ensure_client(now, day):
             return 120.0
+
+        if self.chain is not None and getattr(self.chain, 'needs_client', False):
+            try:
+                self.chain.trigger(now, self._last_spot)     # the Fyers chain: needs the client built just above
+            except Exception:
+                pass
 
         pos = self.state.get('position')
         if pos:
@@ -518,6 +526,7 @@ class Runner:
                 in_position=bool(self.state and self.state.get('position')),
                 api_calls=getattr(bb, 'calls', None), api_budget=self.c.MAX_API_CALLS_PER_DAY,
                 chain=(self.chain.status() if self.chain is not None else None),
+                chain_log=(self.chain_log.status() if self.chain_log is not None else None),
                 api_by_label=getattr(bb, 'by_label', None)))
         except Exception:
             pass
@@ -573,11 +582,20 @@ def main(argv: list) -> int:
         fyers = None
     today = datetime.now(IST).strftime('%Y-%m-%d')
     budget = bnf_broker.ApiBudget(state_dir, cfg.MAX_API_CALLS_PER_DAY, cfg.API_MIN_GAP_SECONDS, today)
-    chain = bnf_chain.ChainRecorder(os.path.join(state_dir, 'logs'), logger=log) \
-        if cfg.CHAIN_RECORD_ENABLED else None
-    pcr_hist = bnf_chain.PcrHistory(cfg.CHAIN_LEGACY_HISTORY_FILE, cfg.INSTRUMENT)
-    runner = Runner(bnf_broker.Broker(fyers, budget, log), logger=log,
-                    reload_client=bnf_broker.make_client, chain=chain, pcr_hist=pcr_hist)
+    broker = bnf_broker.Broker(fyers, budget, log)
+    logs = os.path.join(state_dir, 'logs')
+    nse = bnf_chain.ChainRecorder(logs, logger=log) if cfg.CHAIN_RECORD_ENABLED else None
+    if cfg.CHAIN_RECORD_ENABLED and cfg.OI_SOURCE == 'fyers':
+        # the gate reads the broker's chain for the series the bot trades; NSE is still logged (it has IV)
+        chain = bnf_chain.ChainRecorder(logs, loader=bnf_chain.FyersChainSource(lambda: broker), logger=log,
+                                        prefix='bnf_chainf', needs_client=True)
+        chain_log = nse
+        pcr_hist = bnf_chain.ChainFilePcrHistory(logs, 'bnf_chainf')
+    else:
+        chain, chain_log = nse, None
+        pcr_hist = bnf_chain.PcrHistory(cfg.CHAIN_LEGACY_HISTORY_FILE, cfg.INSTRUMENT)
+    runner = Runner(broker, logger=log, reload_client=bnf_broker.make_client,
+                    chain=chain, pcr_hist=pcr_hist, chain_log=chain_log)
 
     checks = runner.preflight()
     for name, ok, detail in checks:

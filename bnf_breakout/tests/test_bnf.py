@@ -1444,6 +1444,173 @@ RP.run(hist40[:25], 'strategy', c=mk_cfg(OI_GATE_ENABLED=True, REQUIRE_HOT_REGIM
        oi_provider=lambda day, hhmm: (asked.append((day, hhmm)) or None))
 ok('replay can be given an OI provider, which is asked per bar with (day, time)', len(asked) > 10 and len(asked[0][1]) == 5, asked[:2])
 
+
+# --- 8u. the Fyers option-chain source for the OI gate ---
+print('\n--- Fyers chain source ---')
+import glob as _glob                # noqa: E402
+
+EXPS = [dict(date='27-10-2026', expiry='1793095800', expiry_flag='M'),
+        dict(date='24-11-2026', expiry='1795428600', expiry_flag='M'),
+        dict(date='29-12-2026', expiry='1798539000', expiry_flag='M')]
+
+
+def fy_chain_resp(spot=54000.0, call_oi=26_000_000, put_oi=14_000_000, which=1, wall=(54000, 500_000)):
+    """Shaped like the real response: an index row, then CE and PE rows per strike."""
+    rows = [dict(option_type='', strike_price=-1, ltp=spot, symbol='NSE:NIFTYBANK-INDEX')]
+    for k in range(int(spot // 100 * 100) - 1500, int(spot // 100 * 100) + 1501, 100):
+        rows.append(dict(option_type='CE', strike_price=k, oi=10_000 + (wall[1] if k == wall[0] else 0), ltp=100.0))
+        rows.append(dict(option_type='PE', strike_price=k, oi=12_000 + (wall[1] if k == wall[0] else 0), ltp=100.0))
+    return dict(s='ok', data=dict(callOi=call_oi, putOi=put_oi, expiryData=EXPS, optionsChain=rows, indiavixData={}))
+
+
+class FakeChainFyers:
+    def __init__(self, resp=None):
+        self.calls, self.resp = [], resp or fy_chain_resp()
+
+    def optionchain(self, d):
+        self.calls.append(dict(d))
+        return self.resp
+
+
+def mk_broker(ff, calls=100):
+    return BR.Broker(ff, BR.ApiBudget(tempfile.mkdtemp(), calls, 0.0, '2026-10-28', sleep=lambda s: None), None)
+
+
+TODAY = date(2026, 10, 28)                      # day after the Oct 27 monthly expiry: the trade series is Nov
+ffc = FakeChainFyers()
+brc = mk_broker(ffc)
+src = CH.FyersChainSource(lambda: brc, today_fn=lambda: TODAY)
+ch = src()
+eq('the chain is for the series the bot trades (Nov), not the nearest (Oct)', ch['expiry'], '2026-11-24')
+eq('...built from the broker, labelled as such', ch['source'], 'fyers')
+approx('PCR comes from the series totals: puts / calls', ch['pcr'], 14_000_000 / 26_000_000, 1e-3)
+eq('spot comes from the index row', ch['spot'], 54000.0)
+ok('strikes carry call and put OI', ch['df'][0]['call_oi'] > 0 and ch['df'][0]['put_oi'] > 0)
+eq('...and no IV (the broker does not provide it)', (ch['df'][0]['call_iv'], ch['atm_iv']), (None, None))
+eq('first call asks for the nearest series, to learn the expiry timestamps (then asks for the traded one)', len(ffc.calls), 2)
+eq('...the second call carries the Nov expiry epoch', ffc.calls[1]['timestamp'], '1795428600')
+eq('...and the strike count from config', ffc.calls[1]['strikecount'], bnf_config.CHAIN_STRIKES_EACH_SIDE)
+src()
+eq('after discovery it costs ONE call per snapshot', len(ffc.calls), 3)
+eq('...with the epoch cached', ffc.calls[2]['timestamp'], '1795428600')
+eq("every call is counted against the budget under the label 'chain'", brc.budget.by_label.get('chain'), 3)
+
+# on a day the nearest IS the traded series, discovery needs no second call
+ffn = FakeChainFyers()
+srcn = CH.FyersChainSource(lambda: mk_broker(ffn), today_fn=lambda: date(2026, 10, 12))
+srcn()
+eq('when the nearest series is the traded one, discovery is a single call', len(ffn.calls), 1)
+
+# it goes through the shared budget: refuses past it, backs off on a throttle, flags auth errors
+ffz = FakeChainFyers()
+brz = mk_broker(ffz, calls=0)
+raised = False
+try:
+    CH.FyersChainSource(lambda: brz, today_fn=lambda: TODAY)()
+except RuntimeError as e:
+    raised = 'budget' in str(e)
+ok('an exhausted budget refuses the chain call (it is not essential)', raised and not ffz.calls)
+ffr = FakeChainFyers(dict(s='error', code=429, message="You've reached the Standard plan limit of 5 requests/second"))
+raised = False
+try:
+    CH.FyersChainSource(lambda: mk_broker(ffr), today_fn=lambda: TODAY)()
+except RuntimeError as e:
+    raised = 'rate_limited' in str(e)
+ok('a throttle reply raises (the recorder counts a failure; it never trades on it)', raised)
+ffa = FakeChainFyers(dict(s='error', code=-16, message='Could not authenticate'))
+bra = mk_broker(ffa)
+try:
+    CH.FyersChainSource(lambda: bra, today_fn=lambda: TODAY)()
+except RuntimeError:
+    pass
+ok('an auth reply flags the broker so the runner rebuilds the client', bra.auth_failed is True)
+raised = False
+try:
+    CH.FyersChainSource(lambda: BR.Broker(None, BR.ApiBudget(tempfile.mkdtemp(), 9, 0.0, '2026-10-28'), None), today_fn=lambda: TODAY)()
+except RuntimeError as e:
+    raised = 'no Fyers client' in str(e)
+ok('no client yet -> a clean failure, no call', raised)
+bad = fy_chain_resp()
+bad['data']['expiryData'] = [EXPS[0]]
+raised = False
+try:
+    CH.FyersChainSource(lambda: mk_broker(FakeChainFyers(bad)), today_fn=lambda: TODAY)()
+except RuntimeError as e:
+    raised = 'not in Fyers expiryData' in str(e)
+ok('a traded expiry missing from the broker list fails loudly rather than reading the wrong series', raised)
+
+# the budget is safe across threads: 40 parallel chain calls are all counted
+ffp = FakeChainFyers()
+brp = mk_broker(ffp, calls=1000)
+ths = [threading.Thread(target=lambda: brp.option_chain('1795428600', 5)) for _ in range(40)]
+[t.start() for t in ths]
+[t.join() for t in ths]
+eq('concurrent chain calls are all counted (no lost updates)', brp.budget.calls, 40)
+
+# through the recorder: file naming, snapshot, PCR history from its own files
+ldir = tempfile.mkdtemp()
+recF = CH.ChainRecorder(ldir, mk_cfg(), loader=CH.FyersChainSource(lambda: mk_broker(FakeChainFyers()), today_fn=lambda: TODAY),
+                        prefix='bnf_chainf', needs_client=True)
+recF.trigger(at('10:00', day='2026-10-28'), 54000.0)
+recF.wait()
+fl = _glob.glob(os.path.join(ldir, 'bnf_chainf_2026-10-28.jsonl'))
+eq('the Fyers recorder writes its own file, not the NSE one', (len(fl), _glob.glob(os.path.join(ldir, 'bnf_chain_*.jsonl'))), (1, []))
+rec1 = json.loads(open(fl[0]).read().splitlines()[0])
+eq('...the record says where it came from and which series', (rec1['source'], rec1['expiry'], rec1['expiry_day']), ('fyers', '2026-11-24', False))
+sn = recF.snapshot(at('10:03', day='2026-10-28'))
+ok('...and snapshot() serves it with an age', sn is not None and abs(sn['age_min'] - 3.0) < 0.1 and 'strikes' in sn, sn and sn.get('age_min'))
+eq('needs_client is set on it', recF.needs_client, True)
+ok('...and not on the NSE recorder', CH.ChainRecorder(ldir, mk_cfg()).needs_client is False)
+
+hd2 = tempfile.mkdtemp()
+for dd_, vals in (('2026-10-26', (0.50, 0.55)), ('2026-10-27', (0.60, 0.65)), ('2026-10-28', (9.9,))):
+    with open(os.path.join(hd2, f'bnf_chainf_{dd_}.jsonl'), 'w') as fh:
+        for k, v in enumerate(vals):
+            fh.write(json.dumps(dict(ts=f'{dd_}T{10 + k}:00:00+05:30', pcr=v)) + '\n')
+ph2 = CH.ChainFilePcrHistory(hd2, 'bnf_chainf')
+eq('PCR history from the recorder files: last reading at or before the time, prior days only',
+   ph2.prior('2026-10-28', '10:30'), [0.50, 0.60])
+eq('...today is excluded', 9.9 in ph2.prior('2026-10-28', '23:00'), False)
+eq('...empty directory -> empty history', CH.ChainFilePcrHistory(tempfile.mkdtemp(), 'bnf_chainf').prior('2026-10-28', '10:00'), [])
+
+# the gate while a new history is still building
+fW = S.oi_features(mk_snap(pcr=0.5), 55000.0, [0.5] * 3, cfgO)
+eq('with 3 prior sessions there is no z', fW['pcr_z'], None)
+gW = S._oi_gate(fW, 1, cfgO)
+ok('...the gate treats it as warming up, not as missing or disagreeing', gW[0] is True and 'warming up' in gW[1], gW)
+fM = dict(fW, pcr=None)
+ok('...but a missing PCR is still missing', S._oi_gate(fM, 1, cfgO)[0] is False)
+fW2 = S.oi_features(mk_snap(pcr=0.5, call_wall=(55100, 900_000)), 55000.0, [0.5] * 3, cfgO)
+gW2 = S._oi_gate(fW2, 1, cfgO)
+ok('...and a wall right overhead still counts while PCR warms up', gW2[0] is False and 'BLOCKS' in gW2[1], gW2)
+
+# the runner: the Fyers recorder starts only once the client exists; the NSE one starts regardless
+class SpyRec:
+    def __init__(self, needs_client):
+        self.needs_client, self.triggers = needs_client, 0
+
+    def trigger(self, now, spot=None):
+        self.triggers += 1
+        return True
+
+    def status(self):
+        return dict(ok=0, fail=0, last_ok=None, last_error=None)
+
+    def snapshot(self, now):
+        return None
+
+
+rigS = Rig(flat_tape(55800))
+spyF, spyN = SpyRec(True), SpyRec(False)
+rigS.r.chain, rigS.r.chain_log = spyF, spyN
+rigS.go('10:35')
+ok('the NSE recorder is triggered by the runner', spyN.triggers > 0)
+ok('...and so is the Fyers recorder once the client exists', spyF.triggers > 0)
+stat = json.load(open(os.path.join(rigS.r.state_dir, 'status.json')))
+ok('the heartbeat reports both recorders', stat.get('chain') is not None and stat.get('chain_log') is not None, stat)
+eq("the shipped OI source is the broker's chain", bnf_config.OI_SOURCE, 'fyers')
+ok("validate() rejects an unknown OI_SOURCE", any('OI_SOURCE' in x for x in validate_with(OI_SOURCE='bloomberg')))
+
 # --- 8n. preflight ---
 rig = Rig(flat_tape(55800))
 names = {n: okk for n, okk, _ in rig.r.preflight()}
