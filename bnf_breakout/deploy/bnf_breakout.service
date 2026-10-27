@@ -1,0 +1,25 @@
+[Unit]
+Description=BANKNIFTY breakout strategy (PAPER ONLY - no order path exists)
+After=network.target fno_t_bot_auth.service
+Wants=fno_t_bot_auth.service
+# A crash loop must not hammer the Fyers API (Standard plan: 5,000 requests/day).
+StartLimitIntervalSec=3600
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=tradingbot
+# The Fyers SDK writes its own logs to a RELATIVE "logs/" directory, so the working
+# directory must be writable by the service user. The repo checkout is root-owned.
+WorkingDirectory=/opt/trading_bot/bnf_state
+EnvironmentFile=/opt/trading_bot/.env
+ExecStart=/opt/trading_bot/venv/bin/python /opt/trading_bot/repo/bnf_breakout/bnf_runner.py
+Restart=on-failure
+RestartSec=120
+StandardOutput=journal
+StandardError=journal
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

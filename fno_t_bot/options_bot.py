@@ -119,6 +119,44 @@ def bs_delta(option_type: str, S: float, K: float,
 
 # ─── Bot ─────────────────────────────────────────────────────────────────────
 
+def _shared_history(fyers, symbol: str, from_date, to_date, logger=None,
+                    max_age_sec: int = 60):
+    """history() for a series every instrument needs, fetched once per minute.
+
+    The three bots run as separate processes, so the cache is a file keyed by
+    symbol with an mtime freshness check rather than anything in memory.
+
+    Every failure path falls through to a direct fetch. A cache that can break
+    the thing it caches is worse than no cache, and this one sits in front of
+    the VIX series that two live gates depend on.
+    """
+    import json as _j, os as _o, tempfile as _tf, time as _tm
+    key = "".join(c if c.isalnum() else "_" for c in symbol)
+    path = _o.path.join(config.LOG_DIRECTORY, f".cache_hist_{key}.json")
+    try:
+        if _o.path.exists(path) and (_tm.time() - _o.path.getmtime(path)) < max_age_sec:
+            with open(path, encoding="utf-8") as fh:
+                return _j.load(fh)
+    except Exception:
+        pass
+    resp = fyers.history({
+        "symbol": symbol, "resolution": "5", "date_format": "1",
+        "range_from": from_date, "range_to": to_date, "cont_flag": "1",
+    })
+    try:
+        if isinstance(resp, dict) and resp.get("s") == "ok":
+            _o.makedirs(config.LOG_DIRECTORY, exist_ok=True)
+            # atomic replace: three processes write this concurrently and a
+            # half-written file would be read back as corrupt JSON
+            fd, tmp = _tf.mkstemp(dir=config.LOG_DIRECTORY, suffix=".tmp")
+            with _o.fdopen(fd, "w", encoding="utf-8") as fh:
+                _j.dump(resp, fh)
+            _o.replace(tmp, path)
+    except Exception as exc:
+        if logger:
+            logger.debug(f"  [HIST-CACHE] write failed for {symbol}: {exc}")
+    return resp
+
 class TradingBot:
 
     def __init__(self, instrument: str):
@@ -360,6 +398,7 @@ class TradingBot:
                     'lot_size'         : abs(qty),
                     'hv_at_entry'      : 0.18,  # fallback HV; trail/SL still works
                     'highest_pnl_pct'  : max(0.0, cur_pnl_pct),
+                    'lowest_pnl_pct'   : min(0.0, cur_pnl_pct),
                 }
                 self.positions.append(position)
                 self.trades_today += 1
@@ -513,14 +552,14 @@ class TradingBot:
             # Silent fail: VIX unavailable leaves df unchanged — both filters dormant.
             if config.USE_VIX_FILTER:
                 try:
-                    _vix_resp = self.fyers.history({
-                        "symbol"     : "NSE:INDIAVIX-INDEX",
-                        "resolution" : "5",
-                        "date_format": "1",
-                        "range_from" : from_date,
-                        "range_to"   : to_date,
-                        "cont_flag"  : "1",
-                    })
+                    # Shared across the three bot processes. India VIX is a
+                    # single series and all three were fetching it every
+                    # minute: 1,125 calls/day for one number. That is 15% of
+                    # the Fyers Standard daily cap, which Oct 19 2026 blew at
+                    # 14:43 -- costing the last 47 minutes of exit pricing.
+                    _vix_resp = _shared_history(
+                        self.fyers, "NSE:INDIAVIX-INDEX", from_date, to_date,
+                        getattr(self, "logger", None))
                     if _vix_resp.get('s') == 'ok' and _vix_resp.get('candles'):
                         _vdf = pd.DataFrame(
                             _vix_resp['candles'],
@@ -2727,7 +2766,7 @@ class TradingBot:
                                           get_next_expiry, get_ltp)
                 _fb_sym   = build_option_symbol(self.instrument, strike,
                                                 signal['type'],
-                                                get_next_expiry(self.instrument))
+                                                self._expiry())
                 _fb_price = get_ltp(self.fyers, _fb_sym)
                 if _fb_price is None:
                     break   # LTP unavailable — proceed with current strike as-is
@@ -2777,16 +2816,51 @@ class TradingBot:
             # flat. What it does is even out the halves (-Rs5,692/-Rs6,193
             # versus -Rs1,717/-Rs7,947), which is exactly what a variance tool
             # should do and all it should be credited with.
-            _tgt = float(getattr(config, 'TARGET_RISK_PER_TRADE', 2500))
+            # Risk budget: a PERCENTAGE of the current compounding book when
+            # TARGET_RISK_PCT_OF_BOOK is set, else the fixed rupee target. A
+            # percentage is what makes size follow equity: Rs3,000 of risk on a Rs1L
+            # book becomes Rs9,000 on a Rs3L one without anyone touching a setting.
+            _pct = getattr(config, 'TARGET_RISK_PCT_OF_BOOK', None)
+            _book = 0.0
+            if _pct:
+                try:
+                    from capital_gate import get_sizing_book
+                    _book = float(get_sizing_book(self.instrument))
+                except Exception:
+                    _book = 0.0
+            _tgt = (_book * float(_pct) if (_pct and _book > 0)
+                    else float(getattr(config, 'TARGET_RISK_PER_TRADE', 2500)))
+            _why = f'book={_book:,.0f}'
+            _dd, _ddm = 0.0, 1.0
+            _heat = None
+            if _pct and _book > 0:
+                try:
+                    from capital_gate import drawdown_state, get_sizing_book
+                    import portfolio_heat
+                    _dd, _ddm = drawdown_state(self.instrument)
+                    _tgt *= _ddm
+                    _tot = sum(get_sizing_book(n) for n in config.INSTRUMENTS)
+                    _heat = portfolio_heat.headroom(self.instrument, _tot)
+                    if _heat is not None and _heat < _tgt:
+                        # Never BLOCK on heat -- only size down. One lot is the
+                        # floor (applied below), so a full book cannot silence
+                        # the engine and starve the data it exists to collect.
+                        _tgt = _heat
+                    _why += f' dd={_dd*100:.1f}% x{_ddm:.2f}'
+                    if _heat is not None:
+                        _why += f' heat_room=₹{_heat:,.0f}'
+                except Exception:
+                    pass
+            signal['size_reason'] = (str(signal.get('size_reason', '')) + ' | ' + _why).strip(' |')
             _one = float(_fb_price) * self.lot_size * max(_stop_pct, 0.01)
             if _one > 0:
                 _rl = max(1, min(int(getattr(config, 'ABSOLUTE_MAX_LOTS', 50)),
-                                 int(round(_tgt / _one))))
+                                 int(_tgt // _one if _pct else round(_tgt / _one))))
                 _rl = min(_rl, self._affordable_lots(float(_fb_price), _stop_pct) or 1)
                 if _rl != lots:
                     self.logger.info(
                         f"  [SIZE] {self.instrument}: {lots} → {_rl} lot(s) "
-                        f"equal-risk (1 lot risks ₹{_one:,.0f}, target "
+                        f"risk-sized [{_why}] (1 lot risks ₹{_one:,.0f}, target "
                         f"₹{_tgt:,.0f})"
                     )
                     lots         = _rl
@@ -2818,7 +2892,7 @@ class TradingBot:
                                               get_next_expiry, get_ltp)
                     _alt_prem = get_ltp(self.fyers, build_option_symbol(
                         self.instrument, _alt_strike, signal['type'],
-                        get_next_expiry(self.instrument)))
+                        self._expiry()))
                 else:
                     _alt_prem = bs_price(signal['type'], underlying, _alt_strike,
                                          config.DAYS_TO_EXPIRY / 365, hv)
@@ -2857,6 +2931,13 @@ class TradingBot:
                 f"pre-size risk; relying on SL-M + polling stop"
             )
 
+        # Initialised before the live/paper split on purpose. The paper branch
+        # set this and the live branch did not, so building the trade record
+        # would have raised NameError on the first REAL fill -- the exact shape
+        # of the Oct 13 2026 _stop_pct bug that killed a live SENSEX entry.
+        # Both engines are off today, so it would have waited to fire until the
+        # moment real money was switched back on.
+        _px_src = None
         if self.live:
             # ── LIVE: place real order ────────────────────────────────────────
             from fyers_orders import enter_live_position
@@ -2869,6 +2950,7 @@ class TradingBot:
                 return
             entry_price   = pos_info['entry_price']
             option_symbol = pos_info['option_symbol']
+            _px_src       = 'FILL'        # real broker fill, not a quote
             sl_order_id   = pos_info.get('sl_order_id')   # None if SL-M failed
             sl_trigger    = pos_info.get('sl_trigger', 0.0)
             if sl_order_id:
@@ -2893,11 +2975,11 @@ class TradingBot:
             _bs_price_est = bs_price(signal['type'], underlying, strike, T, hv)
             entry_price   = None
             option_symbol = None
-            _px_src       = 'BS'
+            _px_src       = 'BS'          # overwritten to 'LTP' on a real quote
             try:
                 from fyers_orders import (build_option_symbol, get_next_expiry,
                                           get_ltp, resolve_quotable_option)
-                _expiry       = get_next_expiry(self.instrument)
+                _expiry       = self._expiry()
                 option_symbol = build_option_symbol(
                     self.instrument, strike, signal['type'], _expiry
                 )
@@ -3039,6 +3121,16 @@ class TradingBot:
             'lot_size'         : eff_lot_size,
             'hv_at_entry'      : hv,
             'highest_pnl_pct'  : 0.0,
+            # Trough, added Oct 15 2026. The book's single largest drain is
+            # the 25% stop (-Rs39,567 over 15 trades, mean -Rs2,638) and it
+            # was the ONE exit parameter that could not be replayed, because
+            # only the peak was ever recorded. Without the trough there is no
+            # way to know whether a trade stopped at -25% would have recovered
+            # or fallen to -60%, so the stop level cannot be tested at all.
+            # The target level WAS replayable and the replay said leave it
+            # alone (every level below 55% is worse once capped winners are
+            # counted). This closes the equivalent gap on the stop side.
+            'lowest_pnl_pct'   : 0.0,
             'target_pct'       : _dyn_tgt,       # IV-scaled target (or BASE_TARGET if IV unavailable)
             'path'             : _path,          # used by check_exits for per-path stop/target
             'otm_strikes'      : _otm,           # 0=ATM, 1/2=OTM degree (check_exits uses this)
@@ -3063,6 +3155,10 @@ class TradingBot:
             # ── Learning fields (recorded in trade_log → JSONL) ───────────
             'entry_adx'        : float(signal.get('adx', 0)),
             'lots'             : lots,
+            # Rupees lost if this position is stopped out. portfolio_heat sums this
+            # across the three bots so a new entry can see what the others hold.
+            'risk_inr'          : round(lots * self.lot_size * float(entry_price)
+                                        * float(_stop_pct), 2),
             'regime'           : getattr(getattr(self, '_daily_regime', None), 'regime', 'UNKNOWN'),
             'posture'          : getattr(getattr(self, '_daily_regime', None), 'posture', 'NORMAL'),
             # v1.6: conviction scores + sizing rationale — closes the data gap
@@ -3071,6 +3167,13 @@ class TradingBot:
             'composite_score'  : signal.get('composite_score'),
             'size_reason'      : signal.get('size_reason', ''),
             # v1.7.3: option-buyer entry-quality pack (logging only)
+            # px_src added Oct 15 2026. The trade log carried NO price-source
+            # field, so no analysis could tell a real fill from a
+            # Black-Scholes one -- and BS pricing is 41-123% wrong in this
+            # project. Resolving the rv_iv sign question meant excluding the
+            # Sep 24-28 window by RECALLING that the October symbol code was
+            # broken then, rather than reading it from the data. Never again.
+            'px_src'           : _px_src,         # 'LTP' (real) or 'BS' (modelled)
             'rv_iv'            : _rv_iv,          # realized/implied vol ratio (>1 = cheap premium)
             'rv_iv_src'        : _rv_iv_src,      # 'chain' (real ATM-IV) or 'vix' (SENSEX proxy)
             'entry_delta'      : round(_delta, 3) if _delta is not None else None,
@@ -3101,6 +3204,7 @@ class TradingBot:
         self.positions.append(position)
         self.trades_today += 1
         position['trade_no'] = self.trades_today   # stored for exit outcome lookup
+        self._publish_heat()
 
         # ── Learner: record entry prediction ─────────────────────────────────
         try:
@@ -3164,9 +3268,12 @@ class TradingBot:
                 or src not in getattr(config, 'RV_IV_GATE_SRC', ('chain',))
                 or rv < getattr(config, 'RV_IV_MAX', 0.70)):
             return False
+        _blocking = bool(getattr(config, 'RV_IV_GATE_BLOCKING', True))
         self.logger.info(
             f"  [RV-IV GATE] {self.instrument} {signal.get('type')} "
-            f"path={signal.get('path')} BLOCKED \u2014 rv_iv {rv:.3f} >= "
+            f"path={signal.get('path')} "
+            f"{'BLOCKED' if _blocking else 'SHADOW (not blocking)'} "
+            f"— rv_iv {rv:.3f} >= "
             f"{getattr(config, 'RV_IV_MAX', 0.70)} "
             f"(HV={hv*100:.2f}% IV={iv:.2f}% src={src}) \u2014 realised vol has "
             f"already caught up to implied; forward-move expectancy sits in "
@@ -3186,15 +3293,75 @@ class TradingBot:
                     rv_iv=round(rv, 3), hv=round(hv * 100, 3), iv=round(iv, 3),
                     src=src, index=signal.get('price'),
                     adx=signal.get('adx'), chase_pos=signal.get('chase_pos'),
+                    blocking=_blocking,
                 )) + '\n')
         except Exception as exc:
             self.logger.debug(f"  [RV-IV GATE] blocked-log write failed: {exc}")
+        if not _blocking:
+            # Shadowed: the trade PROCEEDS, so its own trade record is the
+            # evidence. Writing a counterfactual here as well would
+            # double-count one signal across both books.
+            return False
         counterfactual.record(self, signal.get('type'), float(signal['price']),
                               'RV_IV', f'rv_iv {rv:.3f} >= '
                               f'{getattr(config, "RV_IV_MAX", 0.70)}', hv,
                               extra=dict(rv_iv=round(rv, 3), src=src,
                                          path=signal.get('path')))
         return True
+
+    def _publish_heat(self) -> None:
+        """Tell the other two bots how much this one has at risk. Never raises."""
+        try:
+            import portfolio_heat
+            portfolio_heat.publish(self.instrument, self.positions, self.lot_size)
+        except Exception:
+            pass
+
+    def _expiry(self):
+        """The expiry this instrument should trade today, validated once.
+
+        Every expiry lookup in this class goes through here. Before Oct 15 2026
+        there were six independent call sites all calling get_next_expiry()
+        separately, which meant the premium recorder could archive one contract
+        while enter_trade priced another -- and on Oct 15 that is exactly what
+        happened, because no October NIFTY weekly after Oct 13 was listed at
+        all while the Oct 27 monthly quoted fine.
+
+        The worst of those call sites was the DTE override, which writes
+        config.DAYS_TO_EXPIRY and therefore sets T in every Black-Scholes price
+        this process computes. Pointed at an unlisted Oct 20 contract it
+        reported 5 DTE for an instrument whose real nearest tradeable expiry
+        was 12 days out: T wrong by 2.4x, on a pricing path this project has
+        already measured at 41-123% error even when T is right.
+
+        Falls back to date arithmetic whenever there is no broker session or no
+        usable spot, so backtests and unit tests are unaffected.
+        """
+        try:
+            from fyers_orders import get_quotable_expiry, get_next_expiry
+            if not getattr(self, 'fyers', None):
+                return get_next_expiry(self.instrument)
+            # Only a rough spot is needed -- it just picks the ATM strike to
+            # probe with. Last bar close first, a live index quote second.
+            spot = None
+            for src in (lambda: float(self._idx_closes.iloc[-1]),
+                        lambda: float(self.fyers.quotes(
+                            {'symbols': self.inst_cfg['index_symbol']}
+                        )['d'][0]['v']['lp'])):
+                try:
+                    v = src()
+                    if v and v > 0:
+                        spot = v
+                        break
+                except Exception:
+                    continue
+            if not spot:
+                return get_next_expiry(self.instrument)
+            return get_quotable_expiry(self.fyers, self.instrument, spot,
+                                       self.logger)
+        except Exception:
+            from fyers_orders import get_next_expiry
+            return get_next_expiry(self.instrument)
 
     def _quote_option(self, strike: int, opt_type: str, underlying: float,
                       hv: float) -> tuple:
@@ -3206,9 +3373,9 @@ class TradingBot:
         T = config.DAYS_TO_EXPIRY / 365
         px, sym, src = bs_price(opt_type, underlying, strike, T, hv), None, 'BS'
         try:
-            from fyers_orders import build_option_symbol, get_next_expiry, get_ltp
+            from fyers_orders import build_option_symbol, get_ltp
             sym = build_option_symbol(self.instrument, strike, opt_type,
-                                      get_next_expiry(self.instrument))
+                                      self._expiry())
             if self.fyers and sym:
                 ltp = get_ltp(self.fyers, sym)
                 if ltp and ltp > 0:
@@ -3267,6 +3434,16 @@ class TradingBot:
             pnl_pct = (current_opt - pos['entry_price']) / pos['entry_price']
             if pnl_pct > pos['highest_pnl_pct']:
                 pos['highest_pnl_pct'] = pnl_pct
+            if pnl_pct < pos.get('lowest_pnl_pct', 0.0):
+                pos['lowest_pnl_pct'] = pnl_pct
+
+            # Poll-level premium path, for trailing-stop research. No extra API
+            # call: current_opt was fetched above. See counterfactual.log_path.
+            counterfactual.log_path(
+                self, 'live', pos.get('option_symbol'), pos['entry_price'],
+                current_opt, pnl_pct, current_price,
+                pos['highest_pnl_pct'], pos.get('lowest_pnl_pct', 0.0),
+                tag=pos.get('path'))
 
             # ── Rolling option-price history (for rapid-spike exit) ───────────
             # Append current LTP every polling cycle; keep a fixed-length window
@@ -3462,6 +3639,7 @@ class TradingBot:
                     'exit_price'       : round(current_opt, 2),
                     'pnl_pct'          : round(pnl_pct * 100, 2),
                     'max_pnl_pct'      : round(pos.get('highest_pnl_pct', 0.0) * 100, 2),
+                    'min_pnl_pct'      : round(pos.get('lowest_pnl_pct', 0.0) * 100, 2),
                     'costs'            : round(costs, 2),
                     'pnl_net'          : round(pnl_net, 2),
                     'exit_reason'      : exit_reason,
@@ -3486,6 +3664,7 @@ class TradingBot:
                     'composite_score'  : pos.get('composite_score'),
                     'size_reason'      : pos.get('size_reason', ''),
                     # ── Option-buyer entry-quality pack (v1.7.3) ──────────
+                    'px_src'           : pos.get('px_src'),
                     'rv_iv'            : pos.get('rv_iv'),
                     'rv_iv_src'        : pos.get('rv_iv_src'),
                     'entry_delta'      : pos.get('entry_delta'),
@@ -3566,6 +3745,7 @@ class TradingBot:
 
         for idx in reversed(to_close):
             self.positions.pop(idx)
+        self._publish_heat()
 
     def _update_morning_trend(self, df: 'pd.DataFrame') -> None:
         """Track peak ADX and peak |DI+ − DI−| during the ORB window.
@@ -4493,8 +4673,9 @@ class TradingBot:
         # NIFTY monthly-Monday (~13d mid-month); BNF monthly-Wed (~14d); SENSEX weekly-Fri (~2d).
         # Each instrument runs in its own process, so mutating config here is safe.
         try:
-            from fyers_orders import get_next_expiry as _gte
-            _exp_date   = _gte(self.instrument)
+            # Validated, not assumed: this writes config.DAYS_TO_EXPIRY and
+            # therefore T for every Black-Scholes price in this process.
+            _exp_date   = self._expiry()
             _actual_dte = max((_exp_date - datetime.now(IST).date()).days, 1)
             _old_dte    = config.DAYS_TO_EXPIRY
             config.DAYS_TO_EXPIRY = _actual_dte
@@ -5107,7 +5288,7 @@ class TradingBot:
                                 if self.live and self.fyers:
                                     from fyers_orders import (build_option_symbol,
                                                               get_next_expiry, get_ltp)
-                                    _nm_expiry = get_next_expiry(self.instrument)
+                                    _nm_expiry = self._expiry()
                                     _nm_sym    = build_option_symbol(
                                         self.instrument, _nm_strike,
                                         _nm_dir, _nm_expiry)

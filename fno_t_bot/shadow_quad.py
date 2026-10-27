@@ -207,10 +207,69 @@ def evaluate(bot, df, oc, spot) -> dict | None:
         if vix_ok and abs(score) >= thr:
             direction = 'CALL' if score > 0 else 'PUT'
 
+        # ── Magnitude context, added Oct 16 2026 ───────────────────────
+        # The quad votes on DIRECTION only, and direction has no measured edge
+        # in this book. What DOES separate is whether the day can deliver a
+        # move big enough to pay for the option at all: split by trailing
+        # realised vol at entry, the share of 240min windows clearing an
+        # IV-adjusted break-even runs 23.4% in the bottom quintile against
+        # 50.0% in the top -- a +26.6 point gap that is monotone across all
+        # five and holds in both chronological halves (+26.1 / +30.4).
+        #
+        # Splitting by IV instead collapses to +12 and is non-monotone, which
+        # is the tell: IV rises only 1.34x across those quintiles while the
+        # actual excursion rises 2.3x, so implied under-responds to realised.
+        # That gap is the whole opportunity, and a fitted GARCH does NOT
+        # capture it better -- it came last in a walk-forward contest against
+        # this same plain trailing estimator (n=901).
+        #
+        # Logged, not acted on. It makes the pairing measurable: does a quad
+        # fire on a high-vol day behave differently from one on a dead day?
+        # Nothing can answer that until both fields sit on the same record.
+        _hv = _impl = _ratio = None
+        try:
+            _h = df['HV'].iloc[-1] if 'HV' in df.columns else None
+            _hv = round(float(_h), 4) if _h == _h and _h is not None else None
+        except Exception:
+            pass
+        try:
+            # UNITS, which the first version of this got wrong on Oct 20 2026.
+            # df['HV'] is annualised vol as a FRACTION (0.1982 = 19.82%) while
+            # atm_iv is annualised vol as a PERCENT (14.86 = 14.86%). The first
+            # version divided the fraction by an implied ONE-DAY percent, which
+            # compared three different units at once and came out ~6x low --
+            # 0.219 where the real ratio was 1.39. Logging-only, so no trade was
+            # affected, but it would have corrupted the direction-x-magnitude
+            # pairing this field exists to make measurable.
+            #
+            # Use the convention already in options_bot (rv_iv = hv*100/iv), so
+            # this number is directly comparable to the rv_iv on every trade
+            # record rather than being a second, subtly different quantity.
+            _iv = float((oc or {}).get('atm_iv') or 0) or None
+            if _iv:
+                _impl = round(_iv / (252 ** 0.5), 4)   # implied 1-session move %
+                if _hv:
+                    _ratio = round(_hv * 100.0 / _iv, 3)  # realised/implied
+        except Exception:
+            pass
+
         return dict(
             instrument=bot.instrument, spot=round(float(spot), 2),
             score=score, direction=direction, fired=bool(direction),
             vix=vix, vix_ok=vix_ok,
+            # date was only ever recoverable from the FILENAME, which made
+            # every evaluator reconstruct it with a regex. Put it on the row.
+            # _late('IST') not the module-level IST: this module is
+            # imported by options_bot BEFORE options_bot defines IST, so
+            # the module-level name is bound to None and a naive
+            # datetime would stamp the host's timezone, not IST.
+            date=(datetime.now(_late('IST')) if _late('IST')
+                  else datetime.now()).strftime('%Y-%m-%d'),
+            # hv_pct alongside hv so the record is self-describing: one is the
+            # raw fraction the frame carries, the other the percent everything
+            # else in this project quotes vol in.
+            hv=_hv, hv_pct=(round(_hv * 100.0, 3) if _hv else None),
+            atm_iv=_iv, impl_daily=_impl, rv_iv_fwd=_ratio,
             votes=dict(adx=a_v, pcr=p_v, maxpain=m_v, wall=w_v),
             why=dict(adx=a_d, pcr=p_d, maxpain=m_d, wall=w_d),
             raw=dict(adx=adx, di_plus=di_p, di_minus=di_m,

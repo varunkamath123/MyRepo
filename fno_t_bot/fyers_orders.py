@@ -75,11 +75,23 @@ def get_next_expiry(instrument: str) -> date:
     #
     # The monthly is always listed, so that is the correct fallback rather
     # than a weekly a further week out.
-    nearest = today
-    while nearest.weekday() != target_wday:
-        nearest += timedelta(days=1)
-    if (nearest - today).days >= min_days:
-        return nearest
+    # Walk forward to the next target weekday with enough runway. The Oct 12
+    # 2026 version of this checked ONLY the nearest target weekday and, if that
+    # was inside min_days, jumped straight to the monthly -- skipping the
+    # intervening weekly entirely. On Thu Oct 15 that made SENSEX ask for the
+    # Oct 29 monthly (14 DTE) when the Oct 22 weekly (7 DTE) was listed and
+    # quoting, so it recorded the wrong contract for three sessions: different
+    # theta, different delta, different economics. Restored to the forward walk.
+    #
+    # This function is DATE ARITHMETIC ONLY and cannot know what the exchange
+    # has actually listed -- NIFTY had no Oct 16/20/22 weekly at all while Nov 3
+    # quoted fine. Deciding what is tradeable is get_quotable_expiry()'s job;
+    # this is its candidate generator and its no-broker fallback.
+    check = today
+    for _ in range(21):
+        if check.weekday() == target_wday and (check - today).days >= min_days:
+            return check
+        check += timedelta(days=1)
 
     for month_offset in range(3):
         raw_month = today.month + month_offset
@@ -135,6 +147,169 @@ def build_option_symbol(instrument: str, strike: int,
     return f"{prefix}{exp_str}{strike}{opt_type}"
 
 
+
+
+import time as _t
+
+
+def _is_rate_limited(msg: str) -> bool:
+    """Is this broker error a rate limit, or a genuinely missing contract?
+
+    The first version tested `'limit reached' in msg`, which does NOT match
+    what Fyers actually returns:
+
+        You've reached the Standard plan limit of 5,000 requests/day
+        You've reached the Standard plan limit of 5 requests/second
+
+    That is 'reached ... limit of', not 'limit reached'. So on Oct 19 2026
+    every throttled quote fell through to the 'expiry genuinely not listed'
+    branch, and get_quotable_expiry logged 'NONE of ... quoted -- Option data
+    for this instrument will be EMPTY' about SENSEX 2026-10-22, a contract
+    verified quoting at 708.10 four days earlier -- then CACHED that wrong
+    answer for the rest of the session.
+
+    Substring-matching a vendor error string is fragile by nature, so this
+    casts a wide net and errs toward 'throttled'. Mistaking a missing contract
+    for a throttle costs one wasted re-probe; mistaking a throttle for a
+    missing contract silently empties a whole day of data.
+    """
+    m = (msg or '').lower()
+    if not m:
+        return False
+    if 'rate limit' in m or 'too many request' in m:
+        return True
+    return 'limit' in m and ('reached' in m or 'exceed' in m or 'request' in m)
+
+
+_QUOTABLE_EXPIRY_CACHE = {}
+
+
+def expiry_candidates(instrument: str, limit: int = 8) -> list:
+    """Plausible expiries in date order: each target weekday, plus the next two
+    monthlies. Superset of get_next_expiry, which returns only the first."""
+    import calendar as _cal
+    inst = config.INSTRUMENTS[instrument]
+    twd = inst['expiry_weekday']
+    min_days = config.MIN_DAYS_TO_EXPIRY
+    today = datetime.now(IST).date()
+    out = []
+    # BANKNIFTY carries monthly_expiry_only: SEBI removed weekly BANKNIFTY
+    # options in Nov 2023 and NSE kept only NIFTY as a weekly-expiry index.
+    # Leading its candidate list with weeklies made every probe for it start
+    # on contracts that cannot exist, spending quote quota to rediscover a
+    # fact already sitting in config.
+    if not inst.get('monthly_expiry_only', False):
+        d = today
+        for _ in range(60):
+            if d.weekday() == twd and (d - today).days >= min_days:
+                out.append(d)
+                if len(out) >= limit:
+                    break
+            d += timedelta(days=1)
+    for off in range(3):
+        rm = today.month + off
+        yr = today.year + (rm - 1) // 12
+        mon = ((rm - 1) % 12) + 1
+        last = date(yr, mon, _cal.monthrange(yr, mon)[1])
+        m = last - timedelta(days=(last.weekday() - twd) % 7)
+        if (m - today).days >= min_days and m not in out:
+            out.append(m)
+    return sorted(set(out))
+
+
+def get_quotable_expiry(fyers, instrument: str, underlying_price: float,
+                        logger=None):
+    """The nearest expiry the broker will actually quote.
+
+    Date arithmetic alone has been wrong twice in four days (see the module
+    docstring for this patch). This asks instead: build a candidate list, probe
+    an ATM strike on each, return the first that returns a price. Cached per
+    instrument per day, so it costs a handful of quotes once a session.
+
+    Falls back to get_next_expiry() when there is no broker session, so
+    backtests and unit tests behave exactly as before.
+    """
+    if not fyers:
+        return get_next_expiry(instrument)
+    today = datetime.now(IST).date()
+    ck = (instrument, today)
+    if ck in _QUOTABLE_EXPIRY_CACHE:
+        return _QUOTABLE_EXPIRY_CACHE[ck]
+    atm = atm_strike(instrument, underlying_price)
+    tried = []
+    throttled = False
+    # Bare fyers.quotes(), not get_ltp(): get_ltp retries the alternate
+    # Oct/Nov/Dec month-code convention, which doubles the quote count and
+    # is pointless here, because build_option_symbol already emits the
+    # right convention and the thing under test is the EXPIRY. SENSEX spent
+    # 18 quotes that way on Oct 15 2026 and hit the broker's rate limit
+    # mid-probe. Budget now: at most 4 candidates x 3 strikes, short-
+    # circuiting on the first leg that quotes, so the common case is one.
+    # 'strike_gap', the same key atm_strike() uses -- NOT 'strike_step',
+    # which does not exist in config and silently defaulted every
+    # instrument to 50. Real listed spacing is 50 for NIFTY but 100 for
+    # BANKNIFTY and SENSEX, so a 50 step probed BANKNIFTY strikes that are
+    # never listed (55750, 55850) and wasted two of its three probes.
+    step = int(config.INSTRUMENTS[instrument]['strike_gap'])
+    for e in expiry_candidates(instrument, limit=4):
+        tried.append(e)
+        lp = None
+        # Probe a NEIGHBOURHOOD, not a single strike. One strike proves
+        # nothing: on Oct 15 2026 BANKNIFTY's only listed expiry (Oct 27)
+        # quoted at 55800 for 524.50 while 55750 and 55850 both returned
+        # nothing, so a single-strike probe one step off would have declared
+        # that expiry unlisted and pushed the instrument to Nov 24. The
+        # codebase already draws this distinction in resolve_quotable_option:
+        # a dead STRIKE is a one-strike problem, a dead NEIGHBOURHOOD is a
+        # wrong expiry. Any leg quoting is sufficient proof the expiry exists.
+        for k in (0, 1, -1):
+            sym = build_option_symbol(instrument, atm + k * step, 'PUT', e)
+            try:
+                r = fyers.quotes({'symbols': sym}) or {}
+                d0 = (r.get('d') or [{}])[0]
+                lp = (d0.get('v') or {}).get('lp')
+                code = r.get('code') or d0.get('code')
+                msg = str(r.get('message') or d0.get('errmsg') or '').lower()
+                if code == 429 or _is_rate_limited(msg):
+                    throttled = True
+                    break
+                # The 5-requests/second cap is separate from the daily one, and
+                # this walks up to 12 sequential quotes with nothing between.
+                _t.sleep(0.25)
+                if lp:
+                    break
+            except Exception:
+                continue
+        if throttled:
+            break
+        if lp:
+            _QUOTABLE_EXPIRY_CACHE[ck] = e
+            if logger and len(tried) > 1:
+                logger.info(
+                    f"  [EXPIRY] {instrument}: "
+                    f"{', '.join(str(t) for t in tried[:-1])} not listed "
+                    f"\u2014 using {e} ({(e - today).days} DTE)"
+                )
+            return e
+    fb = get_next_expiry(instrument)
+    if throttled:
+        # Do NOT cache a throttled result. Nothing was learned, and caching
+        # it would pin the instrument to an unverified expiry all session.
+        if logger:
+            logger.warning(
+                f"  [EXPIRY] {instrument}: broker rate-limited mid-probe "
+                f"after {len(tried)} candidate(s) \u2014 using {fb} "
+                f"unverified; will re-probe on the next call."
+            )
+        return fb
+    if logger:
+        logger.error(
+            f"  [EXPIRY] {instrument}: NONE of "
+            f"{', '.join(str(t) for t in tried)} quoted \u2014 falling back "
+            f"to {fb}. Option data for this instrument will be EMPTY."
+        )
+    _QUOTABLE_EXPIRY_CACHE[ck] = fb
+    return fb
 
 def resolve_quotable_option(fyers, instrument: str, ideal_strike: int,
                             option_type: str, expiry, max_steps: int = 2):

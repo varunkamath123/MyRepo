@@ -43,33 +43,139 @@ def get_combined_live_capital() -> float:
         return float(config.SENSEX_LIVE_START_CAPITAL)
 
 
+_PNL_CACHE = {}
+
+
+def _closed_pnls(instrument: str, since: str | None = None) -> list:
+    """Closed-trade net P&L for one instrument, oldest first.
+
+    Reads the per-session trade logs the bot already writes, so the book
+    survives restarts and is shared by the three bot processes with no new state
+    to corrupt. BS-priced fills are excluded: they are modelled, not observed,
+    and compounding on fiction would size real money off a guess.
+
+    Cached for a minute -- it runs once per entry, not per tick.
+    """
+    import glob, json, os, re, time
+    ld = getattr(config, 'LOG_DIRECTORY', 'logs')
+    key = (instrument, since, ld)
+    hit = _PNL_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < 60:
+        return hit[1]
+    out = []
+    try:
+        files = []
+        for f in glob.glob(os.path.join(ld, f'*_{instrument}_trades_*.jsonl')):
+            m = re.search(r'_trades_(\d{4}-\d{2}-\d{2})', os.path.basename(f))
+            if m and not (since and m.group(1) < since):
+                files.append((m.group(1), f))
+        for _day, f in sorted(files):
+            with open(f, encoding='utf-8', errors='ignore') as fh:
+                for ln in fh:
+                    try:
+                        d = json.loads(ln)
+                    except Exception:
+                        continue
+                    if d.get('pnl_net') is None or d.get('px_src') == 'BS':
+                        continue
+                    out.append(float(d['pnl_net']))
+    except Exception:
+        out = []
+    _PNL_CACHE[key] = (time.time(), out)
+    return out
+
+
+def realised_pnl(instrument: str, since: str | None = None) -> float:
+    """Sum of closed-trade net P&L for one instrument since a date."""
+    return float(sum(_closed_pnls(instrument, since)))
+
+
+def drawdown_state(instrument: str) -> tuple:
+    """(drawdown fraction, risk multiplier) for one instrument's book.
+
+    Drawdown is measured against the book's own running high-water mark, built
+    from the same closed-trade stream the compounding book uses, starting from
+    the configured capital:
+        dd = (peak_equity - equity) / peak_equity
+
+    The multiplier de-levers linearly as drawdown deepens:
+        mult = clamp(1 - dd / DD_THROTTLE_FULL, DD_THROTTLE_MIN_MULT, 1)
+    so with the defaults (full 25%, floor 0.25) a book 12.5% off its peak risks
+    half the usual fraction, and one 25%+ off risks a quarter.
+
+    This sits ON TOP of compounding, which already shrinks size as equity falls.
+    Together they de-lever roughly quadratically in a drawdown. That is the
+    intent: the cost of a drawdown is that recovery needs more than the loss, so
+    risk should come down faster than equity does.
+    """
+    try:
+        if not getattr(config, 'DD_THROTTLE_ENABLED', False):
+            return 0.0, 1.0
+        base = None
+        per = (config.INSTRUMENT_STRATEGY.get(instrument, {}) or {}).get('capital')
+        if per:
+            base = float(per)
+        if not base:
+            return 0.0, 1.0
+        eq = peak = base
+        for p in _closed_pnls(instrument, getattr(config, 'COMPOUND_FROM_DATE', None)):
+            eq += p
+            peak = max(peak, eq)
+        dd = max((peak - eq) / peak, 0.0) if peak > 0 else 0.0
+        full = max(float(getattr(config, 'DD_THROTTLE_FULL', 0.25)), 1e-9)
+        lo = float(getattr(config, 'DD_THROTTLE_MIN_MULT', 0.25))
+        return dd, min(1.0, max(lo, 1.0 - dd / full))
+    except Exception:
+        return 0.0, 1.0
+
+
+
 def get_sizing_book(instrument: str | None = None) -> float:
-    """Capital available for SIZING a position, from configuration.
+    """Equity used to SIZE a position: starting capital plus realised P&L.
 
     Separate from get_combined_live_capital() on purpose. That function returns
     SENSEX_LIVE_START_CAPITAL plus cumulative NIFTY/BANKNIFTY P&L -- a July 2026
     constant eroded by paper losses -- and resolve_live_mode() depends on it to
-    decide live-vs-paper. Pointing the sizing path at configured capital while
-    leaving the gate alone keeps a capital change from silently flipping an
-    instrument into live mode.
+    decide live-vs-paper. Sizing off its own book keeps a capital change from
+    silently flipping an instrument into live mode.
 
-    The defect this fixes, found Oct 13 2026: TOTAL_CAPITAL was raised to
-    Rs300,000 and sizing never saw it. get_risk_params was reading Rs37,230 and
-    issuing a Rs3,723 risk cap, so the account balance had no effect on
-    position size whatsoever.
+    History of this function:
+      Oct 13 2026  TOTAL_CAPITAL was raised to Rs300,000 and sizing never saw it:
+                   it read Rs37,230 and issued a Rs3,723 risk cap.
+      Oct 21 2026  configured capital was read, but LOT_SIZING_MODE was 'fixed',
+                   so the bot traded 1 lot at every account size from Rs1L to
+                   Rs30L. Account size had no effect on anything.
+      Oct 21 2026  this version: starting capital COMPOUNDS with realised P&L, so
+                   the book grows after wins and shrinks after losses.
+
+    With COMPOUND_ENABLED the book is
+        start + realised P&L since COMPOUND_FROM_DATE,
+    floored at COMPOUND_FLOOR_PCT x start so a bad run cannot size the book to
+    zero. The floor is a safety net for the arithmetic, NOT a stop: below it the
+    book simply stops shrinking.
     """
     try:
+        base = None
         if instrument:
             per = (config.INSTRUMENT_STRATEGY.get(instrument, {}) or {}).get('capital')
             if per:
-                return float(per)
-        tot = getattr(config, 'TOTAL_CAPITAL', None)
-        if tot:
-            n = max(1, len([i for i in getattr(config, 'INSTRUMENTS', {})]))
-            return float(tot) / n
+                base = float(per)
+        if base is None:
+            tot = getattr(config, 'TOTAL_CAPITAL', None)
+            if tot:
+                n = max(1, len([i for i in getattr(config, 'INSTRUMENTS', {})]))
+                base = float(tot) / n
+        if base is not None:
+            if instrument and getattr(config, 'COMPOUND_ENABLED', False):
+                pnl = realised_pnl(instrument,
+                                   getattr(config, 'COMPOUND_FROM_DATE', None))
+                floor = base * float(getattr(config, 'COMPOUND_FLOOR_PCT', 0.25))
+                return max(base + pnl, floor)
+            return base
     except Exception:
         pass
     return float(getattr(config, 'SENSEX_LIVE_START_CAPITAL', 50_000))
+
 
 
 def get_risk_params(logger: logging.Logger | None = None,

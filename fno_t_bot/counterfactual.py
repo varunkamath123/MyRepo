@@ -136,7 +136,8 @@ def record(bot, direction: str, index_px: float, gate: str, reason: str,
             instrument=bot.instrument, date=day, gate=gate, reason=reason,
             type=direction, strike=strike, symbol=sym, px_src=src,
             entry_time=now, entry_price=float(px), entry_index=float(index_px),
-            lot_size=bot.lot_size, peak_pct=0.0, extra=(extra or {}),
+            lot_size=bot.lot_size, peak_pct=0.0, trough_pct=0.0,
+            extra=(extra or {}),
         ))
         bot.logger.info(
             f"  [COUNTERFACTUAL] {bot.instrument} {direction} blocked by {gate} "
@@ -192,6 +193,38 @@ def _exit_reason(pos, pnl_pct: float, minutes: float, force: bool) -> str | None
     return None
 
 
+def log_path(bot, kind: str, symbol, entry_price, cur, pnl_pct,
+             index_px, peak_pct=None, trough_pct=None, tag=None) -> None:
+    """Append one poll of a position's premium path. Never raises.
+
+    Added Oct 21 2026 so a trailing-stop replay is possible at all. The
+    5-minute premium archive cannot show what a 20-second trail saw: the
+    NIFTY trade's +14.49% peak is invisible in it. Costs no API requests --
+    the caller has already fetched `cur`.
+
+    kind is "live" (an open position) or "phantom" (counterfactual).
+    """
+    try:
+        if not getattr(config, 'POSITION_PATH_LOG_ENABLED', True):
+            return
+        now = datetime.now(_late('IST'))
+        p = os.path.join(_log_dir(),
+                         f'position_path_{bot.instrument}_{now.strftime("%Y-%m-%d")}.jsonl')
+        os.makedirs(_log_dir(), exist_ok=True)
+        with open(p, 'a', encoding='utf-8') as fh:
+            fh.write(json.dumps(dict(
+                ts=now.isoformat(timespec='seconds'), kind=kind,
+                instrument=bot.instrument, symbol=symbol, tag=tag,
+                entry=round(float(entry_price), 2), px=round(float(cur), 2),
+                pnl_pct=round(float(pnl_pct) * 100, 3),
+                peak_pct=(None if peak_pct is None else round(float(peak_pct) * 100, 3)),
+                trough_pct=(None if trough_pct is None else round(float(trough_pct) * 100, 3)),
+                index=round(float(index_px), 2),
+            )) + '\n')
+    except Exception:
+        pass
+
+
 def mark(bot, index_px: float, hv: float, force_close: bool = False) -> None:
     """Mark open phantoms against real premiums and close them on the live rules."""
     try:
@@ -218,7 +251,20 @@ def mark(bot, index_px: float, hv: float, force_close: bool = False) -> None:
                         0.01) / 365
                 cur = bs_price(pos['type'], index_px, pos['strike'], T, hv)
             pnl_pct = (cur - pos['entry_price']) / pos['entry_price']
-            pos['peak_pct'] = max(pos['peak_pct'], pnl_pct)
+            pos['peak_pct']   = max(pos['peak_pct'], pnl_pct)
+            # Trough as well as peak. Added Oct 15 2026: the 25% stop is the
+            # single largest drain in the real book (-Rs39,567 over 15 trades)
+            # and it cannot be replayed without knowing how far a position
+            # actually went against us -- a trade stopped at -25% might have
+            # recovered or might have gone to -60%, and only the trough tells
+            # them apart. min_pnl_pct was added to the LIVE position path the
+            # same day, but both engines run with PATH_*_LIVE=False, so no
+            # position is ever opened and that field would have collected
+            # nothing. This is the path that is actually running.
+            pos['trough_pct'] = min(pos['trough_pct'], pnl_pct)
+            log_path(bot, 'phantom', pos.get('symbol'), pos['entry_price'], cur,
+                     pnl_pct, index_px, pos['peak_pct'], pos['trough_pct'],
+                     tag=(pos.get('extra') or {}).get('gate') or pos.get('gate'))
             minutes = (now - pos['entry_time']).total_seconds() / 60.0
             why = _exit_reason(pos, pnl_pct, minutes, force_close)
             if not why:
@@ -237,6 +283,7 @@ def mark(bot, index_px: float, hv: float, force_close: bool = False) -> None:
                 exit_index=round(index_px, 2),
                 pnl_pct=round(pnl_pct * 100, 2),
                 peak_pct=round(pos['peak_pct'] * 100, 2),
+                min_pnl_pct=round(pos['trough_pct'] * 100, 2),
                 costs=round(costs, 2), pnl_net=round(pnl_net, 2),
                 exit_reason=why, px_src=pos['px_src'], **pos.get('extra', {}),
             ))
