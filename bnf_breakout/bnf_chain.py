@@ -136,6 +136,7 @@ class ChainRecorder:
         if not rows:
             return None
         px = float(chain.get('spot') or spot or 0.0)
+        expiry_day = _is_expiry_day(chain.get('expiry'), now)
         gap = int(self.c.STRIKE_GAP)
         atm = int(round(px / gap) * gap) if px > 0 else None
         keep = int(self.c.CHAIN_STRIKES_EACH_SIDE) * gap
@@ -150,7 +151,7 @@ class ChainRecorder:
             strikes[str(k)] = [int(r.get('call_oi') or 0), _f(r.get('call_iv')),
                                int(r.get('put_oi') or 0), _f(r.get('put_iv'))]
         return dict(ts=now.isoformat(timespec='seconds'), slot=slot, spot=px or None,
-                    expiry=str(chain.get('expiry')), expiries=[str(x) for x in (chain.get('all_expiries') or [])[:3]],
+                    expiry=str(chain.get('expiry')), expiry_day=expiry_day, expiries=[str(x) for x in (chain.get('all_expiries') or [])[:3]],
                     pcr=_f(chain.get('pcr')), max_pain=_f(chain.get('max_pain')),
                     atm_iv=_f(chain.get('atm_iv')), iv_skew=_f(chain.get('iv_skew')),
                     total_call_oi=chain.get('total_call_oi'), total_put_oi=chain.get('total_put_oi'),
@@ -185,6 +186,18 @@ class ChainRecorder:
 
     def status(self) -> dict:
         return dict(ok=self.ok, fail=self.fail, last_ok=self.last_ok_ts, last_error=self.last_error or None)
+
+
+def _is_expiry_day(expiry, now: datetime) -> bool:
+    """True when the chain's expiry is today: the series is expiring and is NOT the one the bot
+    trades (it rolls to the next monthly that day). Accepts NSE's '27-Oct-2026' and ISO dates."""
+    s = str(expiry or '')
+    for fmt in ('%d-%b-%Y', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(s[:11] if fmt == '%d-%b-%Y' else s[:10], fmt).date() == now.date()
+        except ValueError:
+            continue
+    return False
 
 
 def _f(x):

@@ -1301,6 +1301,29 @@ ok('validate() rejects a gate that checks nothing',
    any('gates nothing' in x for x in validate_with(OI_USE_PCR=False, OI_USE_WALLS=False)))
 ok("validate() rejects an unknown OI_ON_MISSING", any('OI_ON_MISSING' in x for x in validate_with(OI_ON_MISSING='maybe')))
 
+# expiry day: the nearest chain is the expiring series, not the one the bot trades
+eq("an NSE-format expiry equal to today flags the record", CH._is_expiry_day('22-Oct-2026', at('10:00')), True)
+eq("...ISO format too", CH._is_expiry_day('2026-10-22', at('10:00')), True)
+eq("...a different day does not", CH._is_expiry_day('27-Oct-2026', at('10:00')), False)
+eq("...garbage or None does not raise", (CH._is_expiry_day(None, at('10:00')), CH._is_expiry_day('??', at('10:00'))), (False, False))
+recE, dE = mk_rec(lambda: dict(fake_chain(), expiry='22-Oct-2026'))
+recE.trigger(at('09:20'), 55800.0)
+recE.wait()
+eq('the recorder marks a snapshot taken on the expiry day', chain_lines(dE)[0]['expiry_day'], True)
+recN, dN = mk_rec(lambda: fake_chain())
+recN.trigger(at('09:20'), 55800.0)
+recN.wait()
+eq('...and not on other days', chain_lines(dN)[0]['expiry_day'], False)
+fE = S.oi_features(dict(mk_snap(pcr=0.5), expiry_day=True), 55000.0, PRIOR, cfgO)
+eq('oi_features carries the flag', fE['expiry_day'], True)
+dx = ev(dict(oi_feat(pcr_z=-3.4, dn=0.14), expiry_day=True), cfg_=mk_cfg(OI_GATE_ENABLED=True, COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL')))
+eq('on an expiry day the gate is skipped: it passes whatever PCR/walls say', (dx.enter, dx.oi_would_block), (True, False))
+ok('...and says why', 'expiry day' in dx.gates['oi'][1], dx.gates['oi'])
+dx2 = ev(dict(oi_feat(pcr_z=-1.0), expiry_day=True), cfg_=mk_cfg(OI_GATE_ENABLED=True, OI_SKIP_ON_EXPIRY_DAY=False,
+         COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL')))
+eq('with the skip switched off the gate judges the expiring chain as before', (dx2.enter, dx2.blocked_by()), (False, ['oi']))
+eq('the shipped config skips the gate on expiry days', _bc2.OI_SKIP_ON_EXPIRY_DAY, True)
+
 # chain recorder: latest snapshot, age, restart
 rec, d_ = mk_rec(lambda: fake_chain())
 eq('before any fetch there is no snapshot', rec.snapshot(at('09:20')), None)

@@ -117,3 +117,12 @@ low -> high) and DIRECTION not at all (a big-volume bar's direction continues -2
 This is a config change, so the n = 30 clock restarts (1 trade existed). The live strategy is now:
 coil + key level + hot regime, OI gate in shadow.
 
+## Note 2026-10-28: OI gate skips on the nearest series' expiry day (logging/shadow only, no trade effect)
+
+Oct 27 was the monthly expiry. NSE's feed (jugaad/nse_oi) returns only the NEAREST expiry's rows, so on
+expiry day the chain is the series that is expiring, while the bot trades the next monthly. That chain's
+PCR and IV collapse through the day (PCR 0.80 -> 0.60, ATM IV 20.7 -> 5.3), which produced a PCR z of -3.4
+and a 'wall' that were artefacts. `OI_SKIP_ON_EXPIRY_DAY=True`: the gate passes and says why. The gate is
+in shadow, so no trade is affected; the shadow verdict for the Oct 27 13:45 trade (`oi_would_block=true`)
+is an artefact and must be excluded when the shadow record is scored.
+

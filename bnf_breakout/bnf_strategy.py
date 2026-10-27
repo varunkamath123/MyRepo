@@ -150,6 +150,7 @@ def oi_features(snap, spot: float, pcr_prior: list, cfg=cfg_default):
         return None
     pcr = snap.get('pcr')
     out = dict(pcr=pcr, age_min=snap.get('age_min'), pcr_z=None, n_prior=len(pcr_prior),
+               expiry_day=bool(snap.get('expiry_day')),
                wall_up_strike=None, wall_up_pct=None, wall_dn_strike=None, wall_dn_pct=None)
     if pcr is not None and len(pcr_prior) >= cfg.OI_PCR_MIN_HISTORY:
         a = np.asarray(pcr_prior, float)
@@ -179,6 +180,8 @@ def _oi_gate(oi, direction: int, cfg) -> tuple:
     miss_ok = (cfg.OI_ON_MISSING == 'pass')
     if oi is None:
         return miss_ok, 'no chain data'
+    if oi.get('expiry_day') and cfg.OI_SKIP_ON_EXPIRY_DAY:
+        return True, 'expiry day: chain is the expiring series, not the one traded - skipped'
     parts, ok = [], True
     if cfg.OI_USE_PCR:
         z = oi.get('pcr_z')

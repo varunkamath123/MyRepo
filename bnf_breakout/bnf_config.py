@@ -137,6 +137,11 @@ OI_PCR_Z_MIN = 0.0                # direction-signed PCR z must be >= this (CALL
 OI_WALL_CLEAR_PCT = 0.5           # the biggest wall toward the trade must be farther than this (% of spot)
 OI_WALL_LOOKAHEAD_PCT = 1.5       # walls are searched within this distance of spot
 OI_MAX_SNAPSHOT_AGE_MIN = 20      # a chain snapshot older than this is treated as missing
+OI_SKIP_ON_EXPIRY_DAY = True      # On the nearest series' expiry day the chain NSE gives us (nse_oi/jugaad returns only the
+                                  # NEAREST expiry's rows) is the series that is expiring, not the one the bot trades
+                                  # (the next monthly). Its PCR and OI collapse over the day (Oct 27: PCR 0.80 -> 0.60,
+                                  # ATM IV 20.7 -> 5.3) and are not comparable with the history, so the gate is skipped
+                                  # (passes, and says so) rather than judging on a different instrument.
 OI_ON_MISSING = 'block'           # 'block' | 'pass'. Block, so the test only counts trades where
                                   # the condition could actually be evaluated, and it is VISIBLE
                                   # in the decision log. 'pass' would silently trade unfiltered.
