@@ -108,3 +108,12 @@ Consequence: the live trades are the ungated strategy again, so trades from this
 n = 30 as the base strategy. At the verdict, split the trades by `thesis.oi_would_block` and compare
 their P&L; only then decide whether the gate should block.
 
+## Amendment 2026-10-27: volume gate OFF (owner's call)
+
+`VOLUME_MODE = 'off'`. Evidence (`research/volume_study.py`; replay on the 322 sessions that have volume):
+gate on n=200, -0.089%/trade; gate off n=268, -0.086%; random entry -0.080%. The mean does not move; trades
+rise 34%. Volume forecasts the next hour's RANGE weakly (rank rho ~0.17, both halves positive, but 0.34% -> 0.39%
+low -> high) and DIRECTION not at all (a big-volume bar's direction continues -2.4 bps, 46% hit).
+This is a config change, so the n = 30 clock restarts (1 trade existed). The live strategy is now:
+coil + key level + hot regime, OI gate in shadow.
+

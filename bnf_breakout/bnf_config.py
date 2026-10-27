@@ -84,7 +84,11 @@ COIL_RATIO_MAX = 0.812            # range6 / (ATR14 * sqrt(6)) must be <= this.
                                   # ORIGIN: bottom third of the pooled ratio over
                                   # 420 sessions, from breakout_study.py. Re-derive
                                   # with bnf_replay.py --calibrate if history grows.
-VOLUME_MODE = 'participate'       # 'participate' | 'dryup' | 'off'
+VOLUME_MODE = 'off'               # 'participate' | 'dryup' | 'off'. OFF since 2026-10-27 (was 'participate').
+                                  # research/volume_study.py + replay: gate on -0.089% (n=200) vs off -0.086% (n=268)
+                                  # vs random -0.080%: no change in the mean, 25% fewer trades. Volume forecasts
+                                  # RANGE weakly (rho ~0.17) and direction not at all. Switch back to 'participate'
+                                  # with the replay as evidence only.
 VOL_REL_MIN = 1.0                 # mean volume of last 3 bars vs the median at the
                                   # same time of day over the previous 20 sessions
 VOL_REL_MAX_DRYUP = 0.8

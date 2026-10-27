@@ -207,7 +207,7 @@ def entry_day(hot=True):
     return dict(pdh=56000.0, pdl=54000.0, hot=hot, vbase=np.full(75, 1.0e7))
 
 
-cfg0 = mk_cfg(COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL'))
+cfg0 = mk_cfg(COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL'), VOLUME_MODE='participate')   # the volume tests need the gate ON; shipped config has it off
 bars = coil_bars()
 st0 = dict(trades_today=0, open_positions=0, last_loss_bar=None)
 d = S.evaluate_entry(bars, 29, entry_day(), st0, cfg0)
@@ -1293,6 +1293,7 @@ eq('SHADOW still refuses when ANOTHER gate fails', ev(oi_feat(), cfg_=cfgS, day_
 # config shipped
 import bnf_config as _bc2       # noqa: E402
 eq('the shipped config evaluates the OI gate', _bc2.OI_GATE_ENABLED, True)
+eq('the shipped config has the volume gate OFF since 2026-10-27', _bc2.VOLUME_MODE, 'off')
 eq('...in SHADOW mode (logs the verdict, does not block) since 2026-10-24', _bc2.OI_GATE_BLOCKS, False)
 eq('...blocking when data is missing', _bc2.OI_ON_MISSING, 'block')
 eq('...using both conditions', (_bc2.OI_USE_PCR, _bc2.OI_USE_WALLS), (True, True))

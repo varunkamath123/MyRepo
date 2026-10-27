@@ -10,7 +10,7 @@ This is a testbed built to produce a clean forward verdict, not a claim of edge.
 ## The idea being tested
 
 > Price coils against a key level (previous-day high/low, opening range, day
-> high/low) on above-normal volume, in a volatile regime. Anticipate the break, in
+> high/low) in a volatile regime (the volume condition was dropped on 2026-10-27). Anticipate the break, in
 > the direction of the level, **before** it happens. Leave if the premium falls 25%,
 > if price closes back through the coil (thesis broken), or if the break fails to
 > carry within 6 bars (thesis stale).
