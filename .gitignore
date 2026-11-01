@@ -30,3 +30,4 @@ early_session_results.json
 gap_stats_raw.csv
 backtest_trades*.csv
 blocked_shadow_state.json
+regime_watch_data/
