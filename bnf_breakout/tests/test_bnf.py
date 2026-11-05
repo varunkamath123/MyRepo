@@ -1611,6 +1611,171 @@ ok('the heartbeat reports both recorders', stat.get('chain') is not None and sta
 eq("the shipped OI source is the broker's chain", bnf_config.OI_SOURCE, 'fyers')
 ok("validate() rejects an unknown OI_SOURCE", any('OI_SOURCE' in x for x in validate_with(OI_SOURCE='bloomberg')))
 
+
+# --- 8w. the stale-shadow arm: follow a trade the stale rule closed ---
+print('\n--- stale shadow ---')
+import bnf_shadow as SH             # noqa: E402
+
+
+def shadow_recs(rig_, day=DAY):
+    pth = os.path.join(rig_.dir, 'logs', f'bnf_shadow_{day}.jsonl')
+    return [json.loads(x) for x in open(pth)] if os.path.exists(pth) else []
+
+
+def stale_rig(tape=None, **kw):
+    """Enter at 10:35, stale exit at 11:05 (held 6 bars with no follow-through)."""
+    r_ = Rig(tape if tape is not None else flat_tape(55800), MAX_TRADES_PER_DAY=1, **kw)
+    r_.go('10:35')
+    r_.go('11:00', 5)
+    r_.go('11:05', 5)
+    return r_
+
+
+rs = stale_rig()
+ok('a stale exit is recorded as the real trade', rs.trades() and rs.trades()[0]['kind'] == 'thesis_stale')
+real_net = rs.trades()[0]['pnl_net']
+ok('...and opens exactly one shadow', rs.r.shadow is not None and len(rs.r.shadow.open) == 1)
+ok('...with its own state file, not the real one',
+   os.path.exists(os.path.join(rs.dir, 'shadow_state.json')) and 'shadow' not in json.load(open(os.path.join(rs.dir, 'state.json'))))
+eq('no shadow record yet while it is still open', shadow_recs(rs), [])
+eq('the real position is gone: the shadow is virtual', rs.r.state['position'], None)
+sleep_on = rs.go('11:06')
+ok('while a shadow is open the loop wakes within SHADOW_POLL_SECONDS', sleep_on <= rs.c.SHADOW_POLL_SECONDS, sleep_on)
+stat = json.load(open(os.path.join(rs.dir, 'status.json')))
+ok('...and the heartbeat reports it', stat.get('shadow', {}).get('open') == 1, stat.get('shadow'))
+
+# (A) kept to the end of the day
+rs.ff.premium['*'] = dict(lp=520.0, bid=519.0, ask=521.0)
+rs.go('13:00', 10)
+eq('still open at 13:00 (nothing in the other rules fires on a flat tape)', len(rs.r.shadow.open), 1)
+rs.go('15:00', 10)
+sr = shadow_recs(rs)
+eq('at 15:00 the shadow is force-closed and recorded', (len(sr), sr and sr[0]['kind'], sr and sr[0]['shadow']['kind']),
+   (1, 'stale_shadow', 'force_close'))
+approx('...priced at the BID like a real exit', sr[0]['shadow']['exit_premium'], 519.0)
+approx('...P&L is (exit - entry) x quantity - costs',
+       sr[0]['shadow']['pnl_net'], (519.0 - sr[0]['entry_premium']) * 30 - S.round_trip_cost(sr[0]['entry_premium'], 519.0, 1, rs.c), 0.01)
+approx('...the delta against the real trade is shadow minus real', sr[0]['delta_vs_real'], sr[0]['shadow']['pnl_net'] - real_net, 0.01)
+eq('...the real side of the record is the stale-closed trade', (sr[0]['real']['pnl_net'], sr[0]['entry_time']),
+   (real_net, rs.trades()[0]['entry_time']))
+eq('...no real trade opened while it ran', (sr[0]['real_trades_during_shadow'], sr[0]['real_pnl_during_shadow']), (0, 0.0))
+eq('...and nothing is left open', rs.r.shadow.open, [])
+eq('THE REAL TRADE LOG IS UNTOUCHED: still exactly the one stale trade', [t['kind'] for t in rs.trades()], ['thesis_stale'])
+
+# (B) thesis broken after the stale exit
+tb = flat_tape(55800)
+tb['C'][24:] = 55300.0
+tb['H'][24:] = 55310.0
+tb['L'][24:] = 55290.0
+rb = stale_rig(tb)
+if rb.r.state['position'] is None and rb.trades()[0]['opt'] == 'PE':
+    tb['C'][24:] = 56300.0
+    tb['H'][24:] = 56310.0
+    tb['L'][24:] = 56290.0
+    rb.tape = tb
+rb.ff.premium['*'] = dict(lp=350.0, bid=349.0, ask=351.0)
+rb.go('11:20', 5)
+sb = shadow_recs(rb)
+eq('a close beyond the invalidation ends the shadow as thesis_broken', sb and sb[0]['shadow']['kind'], 'thesis_broken')
+ok('...and that is a loss, shown against the real stale exit', sb and sb[0]['shadow']['pnl_net'] < sb[0]['real']['pnl_net'])
+
+# (C) hard stop on the premium
+rc = stale_rig()
+rc.ff.premium['*'] = dict(lp=300.0, bid=299.0, ask=301.0)
+rc.go('11:07', 30)
+sc = shadow_recs(rc)
+eq('a 25% premium drawdown ends the shadow at the hard stop', sc and sc[0]['shadow']['kind'], 'stop')
+
+# (D) the trail, after a favourable move
+tt = flat_tape(55800)
+up = 55800 * 1.007
+tt['C'][22:31] = up
+tt['H'][22:31] = up + 3
+tt['L'][22:31] = up - 3
+tt['O'][22:31] = up
+tt['C'][31:] = 55800.0
+tt['H'][31:] = 55803.0
+tt['L'][31:] = 55797.0
+tt['O'][31:] = 55800.0
+rt = stale_rig(tt)
+if rt.trades()[0]['opt'] == 'PE':                    # make the move favour the position
+    dn = 55800 * 0.993
+    tt['C'][22:31] = dn
+    tt['H'][22:31] = dn + 3
+    tt['L'][22:31] = dn - 3
+    tt['O'][22:31] = dn
+    rt.tape = tt
+rt.ff.premium['*'] = dict(lp=470.0, bid=469.0, ask=471.0)
+rt.go('11:55', 10)
+rt.go('12:00', 10)
+st_ = shadow_recs(rt)
+eq('after a favourable move that fades, the shadow exits on the trail', st_ and st_[0]['shadow']['kind'], 'trail')
+ok('...earning more than the stale exit it is compared with', st_ and st_[0]['delta_vs_real'] > 0, st_ and st_[0]['delta_vs_real'])
+
+# (E) a restart does not lose it
+rr = stale_rig()
+rr.build()                                           # a new Runner on the same state directory
+ok('a shadow survives a restart', len(rr.r.shadow.open) == 1)
+rr.ff.premium['*'] = dict(lp=450.0, bid=449.0, ask=451.0)
+rr.go('15:00', 10)
+eq('...and still completes after it', [x['shadow']['kind'] for x in shadow_recs(rr)], ['force_close'])
+
+# (F) a shadow left over from another day is abandoned, never priced
+ra = stale_rig()
+ra.r.shadow.step(at('10:00', day='2026-10-23'))
+sa = shadow_recs(ra)
+eq('a shadow carried across a day boundary is recorded as abandoned', (len(sa), sa and sa[0]['kind']), (1, 'stale_shadow_abandoned'))
+eq('...and removed', ra.r.shadow.open, [])
+
+# (G) it can never hurt the real trade
+rg = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1)
+rg.r.shadow.step = lambda now: (_ for _ in ()).throw(RuntimeError('boom'))
+rg.go('10:35')
+ok('an exception inside the shadow does not stop a real entry', rg.r.state['position'] is not None)
+rg2 = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1)
+rg2.r.shadow.open_from = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom'))
+rg2.go('10:35')
+rg2.go('11:00', 5)
+rg2.go('11:05', 5)
+eq('...nor does a failure to open one: the stale exit is still recorded', [t['kind'] for t in rg2.trades()], ['thesis_stale'])
+
+# (H) its calls are non-essential: with the budget spent it is refused, the real exit is not
+rh = stale_rig()
+rh.budget.calls = rh.c.MAX_API_CALLS_PER_DAY
+q_before = len(rh.ff.q_calls)
+rh.go('11:30', 10)
+eq('with the budget spent the shadow makes no quote request', len(rh.ff.q_calls), q_before)
+eq('...and stays open rather than failing', len(rh.r.shadow.open), 1)
+
+# (I) the overlap accounting
+ro = stale_rig()
+rec_path = os.path.join(ro.dir, 'logs', f'bnf_trades_{DAY}.jsonl')
+with open(rec_path, 'a') as fh:
+    fh.write(json.dumps(dict(entry_time=at('12:00').isoformat(timespec='seconds'), pnl_net=700.0)) + '\n')
+    fh.write(json.dumps(dict(entry_time=at('14:00').isoformat(timespec='seconds'), pnl_net=-50.0)) + '\n')
+n_, pnl_ = ro.r.shadow._overlap(rs.trades()[0]['exit_time'], at('13:00').isoformat(timespec='seconds'))
+eq('only real trades that opened while the shadow ran count', (n_, pnl_), (1, 700.0))
+
+# (J) switched off, nothing changes
+rn = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1, SHADOW_STALE_ENABLED=False)
+rn.go('10:35')
+rn.go('11:00', 5)
+rn.go('11:05', 5)
+eq('with the switch off there is no shadow object', rn.r.shadow, None)
+eq('...and no shadow files', [f for f in os.listdir(rn.dir) if 'shadow' in f], [])
+sleep_off = rn.go('11:06')
+ok('...and the loop sleeps as before', sleep_off > rn.c.SHADOW_POLL_SECONDS, sleep_off)
+rs_ = stale_rig()
+rs_.ff.premium['*'] = dict(lp=520.0, bid=519.0, ask=521.0)
+rs_.go('15:00', 10)
+rn.ff.premium['*'] = dict(lp=520.0, bid=519.0, ask=521.0)
+rn.go('15:00', 10)
+key = lambda r_: [(t['kind'], t['entry_premium'], t['exit_premium'], t['pnl_net']) for t in r_.trades()]
+eq('THE REAL TRADES ARE IDENTICAL with the shadow on or off', key(rs_), key(rn))
+eq('the shipped config enables it', bnf_config.SHADOW_STALE_ENABLED, True)
+ok('validate() rejects a shadow that would out-poll the real position',
+   any('SHADOW_POLL_SECONDS' in x for x in validate_with(SHADOW_POLL_SECONDS=5)))
+
 # --- 8n. preflight ---
 rig = Rig(flat_tape(55800))
 names = {n: okk for n, okk, _ in rig.r.preflight()}

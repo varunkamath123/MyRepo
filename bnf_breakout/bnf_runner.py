@@ -39,6 +39,7 @@ import bnf_broker
 import bnf_chain
 import bnf_config as cfg
 import bnf_data
+import bnf_shadow
 import bnf_strategy as S
 
 IST = bnf_data.IST
@@ -70,7 +71,7 @@ def _atomic_write(path: str, obj) -> None:
 class Runner:
     def __init__(self, broker, c=cfg, clock=None, sleep=time.sleep, history=None,
                  state_dir=None, log_dir=None, logger=None, is_holiday=None,
-                 reload_client=None, chain=None, pcr_hist=None, chain_log=None):
+                 reload_client=None, chain=None, pcr_hist=None, chain_log=None, shadow=None):
         self.b, self.c, self.sleep = broker, c, sleep
         self.clock = clock or (lambda: datetime.now(IST))
         self.state_dir = state_dir or c.STATE_DIR
@@ -84,6 +85,11 @@ class Runner:
         self.chain_log = chain_log                   # a second recorder that only LOGS (NSE: has IV), or None
         self.pcr_hist = pcr_hist                     # PcrHistory or None
         self._last_spot = None
+        # shadow arm: follows trades the stale rule closes. Optional and isolated: see bnf_shadow.py
+        self.shadow = shadow if shadow is not None else (
+            bnf_shadow.StaleShadow(broker, c, self.state_dir, self.log_dir, append=self._append,
+                                   day_fn=lambda: self.day, logger=self.log)
+            if getattr(c, 'SHADOW_STALE_ENABLED', False) and broker is not None else None)
         self.ctx = None
         self.day = None
         self.state = None
@@ -268,7 +274,10 @@ class Runner:
         """
         now = self.clock()
         try:
-            return self._step(now)
+            secs = self._step(now)
+            if self.shadow is not None and self.shadow.active():
+                secs = min(secs, float(self.c.SHADOW_POLL_SECONDS))      # wake in time to poll the shadow
+            return secs
         finally:
             self._status(now, self._last_note)
 
@@ -299,6 +308,12 @@ class Runner:
                 self.chain.trigger(now, self._last_spot)     # the Fyers chain: needs the client built just above
             except Exception:
                 pass
+
+        if self.shadow is not None:
+            try:
+                self.shadow.step(now)             # never allowed to affect the real position
+            except Exception as e:
+                self.log.warning(f'[SHADOW] step failed: {e}')
 
         pos = self.state.get('position')
         if pos:
@@ -509,6 +524,11 @@ class Runner:
         self.state['position'] = None
         self.mark = None
         self._save()
+        if dec['kind'] == 'thesis_stale' and self.shadow is not None:
+            try:
+                self.shadow.open_from(pos, now, rec, self.state['last_bar_idx'])
+            except Exception as e:
+                self.log.warning(f'[SHADOW] could not open a shadow: {e}')
         self.log.info(f"[EXIT] {dec['kind']}: {dec['reason']} | {pos['symbol']} {fill:.2f} "
                       f"({rec['pnl_pct']:+.1f}%)  net Rs{net:+,.0f}")
         self._last_note = f"exited: {dec['kind']}"
@@ -527,6 +547,7 @@ class Runner:
                 api_calls=getattr(bb, 'calls', None), api_budget=self.c.MAX_API_CALLS_PER_DAY,
                 chain=(self.chain.status() if self.chain is not None else None),
                 chain_log=(self.chain_log.status() if self.chain_log is not None else None),
+                shadow=(self.shadow.status() if self.shadow is not None else None),
                 api_by_label=getattr(bb, 'by_label', None)))
         except Exception:
             pass

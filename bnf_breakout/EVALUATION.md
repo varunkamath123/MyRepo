@@ -136,3 +136,23 @@ history, starting empty: the PCR condition shows 'warming up' (passes) until 10 
 immediately. The gate is still in shadow, so no trade is affected. Shadow verdicts logged before 2026-10-29
 used the NSE nearest-series chain; do not pool them with later ones without noting the source.
 
+## Note 2026-11-05: stale-rule shadow arm (owner's request) - no effect on the live trades
+
+`bnf_shadow.py`, `SHADOW_STALE_ENABLED=True`. Every trade the STALE rule closes is also followed as if it
+had stayed open, managed by every other rule (premium stop/target, thesis-broken, ATR trail, 15:00
+force close). It places nothing, never touches the real position or trade log (a test asserts the real
+trades are identical with it on or off), and uses non-essential API calls only.
+
+Why: Nov 5 the stale rule closed two CALLs for +1,252 and +9 on a day the index rose 1.2%; the model puts the
+first at about +12,400 had it run. Earlier it saved Oct 29 (about -1,600 avoided) and Nov 3 (about -2,400).
+One day settles nothing; the forward record can.
+
+HOW TO READ IT. `bnf_shadow_<date>.jsonl`: per stale-closed trade, `real` (the stale result) beside `shadow`
+(what the other rules did), `delta_vs_real`, and - because only one position is held at a time - the real
+trades that opened while the shadow ran (`real_trades_during_shadow`, `real_pnl_during_shadow`) and
+`delta_vs_real_incl_overlap = shadow - (stale trade + those later trades)`. Judge the rule on the INCLUDING-
+overlap column. Pre-registered: review at 20 stale-closed trades; the stale rule is judged worth keeping only
+if the sum of `delta_vs_real_incl_overlap` is <= 0 with a bootstrap CI that does not lie wholly above 0 and
+both chronological halves agree; if it lies wholly above 0 in both halves, the rule is costing money and
+the removal proposal goes to the owner (a rule change restarts the n = 30 count).
+
