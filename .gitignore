@@ -31,3 +31,6 @@ gap_stats_raw.csv
 backtest_trades*.csv
 blocked_shadow_state.json
 regime_watch_data/
+stock_state.json
+stock_trades.jsonl
+stock_signals.jsonl

@@ -1,0 +1,252 @@
+[
+ {
+  "symbol": "ADANIENT",
+  "key": "NSE_EQ|INE423A01024",
+  "lot": 309
+ },
+ {
+  "symbol": "ADANIPORTS",
+  "key": "NSE_EQ|INE742F01042",
+  "lot": 475
+ },
+ {
+  "symbol": "APOLLOHOSP",
+  "key": "NSE_EQ|INE437A01024",
+  "lot": 125
+ },
+ {
+  "symbol": "ASIANPAINT",
+  "key": "NSE_EQ|INE021A01026",
+  "lot": 250
+ },
+ {
+  "symbol": "AXISBANK",
+  "key": "NSE_EQ|INE238A01034",
+  "lot": 625
+ },
+ {
+  "symbol": "BSE",
+  "key": "NSE_EQ|INE118H01025",
+  "lot": 200
+ },
+ {
+  "symbol": "BAJAJ-AUTO",
+  "key": "NSE_EQ|INE917I01010",
+  "lot": 75
+ },
+ {
+  "symbol": "BAJFINANCE",
+  "key": "NSE_EQ|INE296A01032",
+  "lot": 750
+ },
+ {
+  "symbol": "BAJAJFINSV",
+  "key": "NSE_EQ|INE918I01026",
+  "lot": 300
+ },
+ {
+  "symbol": "BEL",
+  "key": "NSE_EQ|INE263A01024",
+  "lot": 1425
+ },
+ {
+  "symbol": "BHARTIARTL",
+  "key": "NSE_EQ|INE397D01024",
+  "lot": 475
+ },
+ {
+  "symbol": "CIPLA",
+  "key": "NSE_EQ|INE059A01026",
+  "lot": 425
+ },
+ {
+  "symbol": "COALINDIA",
+  "key": "NSE_EQ|INE522F01014",
+  "lot": 1350
+ },
+ {
+  "symbol": "DRREDDY",
+  "key": "NSE_EQ|INE089A01031",
+  "lot": 625
+ },
+ {
+  "symbol": "EICHERMOT",
+  "key": "NSE_EQ|INE066A01021",
+  "lot": 100
+ },
+ {
+  "symbol": "ETERNAL",
+  "key": "NSE_EQ|INE758T01015",
+  "lot": 2425
+ },
+ {
+  "symbol": "GRASIM",
+  "key": "NSE_EQ|INE047A01021",
+  "lot": 250
+ },
+ {
+  "symbol": "HCLTECH",
+  "key": "NSE_EQ|INE860A01027",
+  "lot": 400
+ },
+ {
+  "symbol": "HDFCBANK",
+  "key": "NSE_EQ|INE040A01034",
+  "lot": 650
+ },
+ {
+  "symbol": "HDFCLIFE",
+  "key": "NSE_EQ|INE795G01014",
+  "lot": 1100
+ },
+ {
+  "symbol": "HINDALCO",
+  "key": "NSE_EQ|INE038A01020",
+  "lot": 700
+ },
+ {
+  "symbol": "HINDUNILVR",
+  "key": "NSE_EQ|INE030A01027",
+  "lot": 300
+ },
+ {
+  "symbol": "ICICIBANK",
+  "key": "NSE_EQ|INE090A01021",
+  "lot": 700
+ },
+ {
+  "symbol": "ITC",
+  "key": "NSE_EQ|INE154A01025",
+  "lot": 1725
+ },
+ {
+  "symbol": "INFY",
+  "key": "NSE_EQ|INE009A01021",
+  "lot": 400
+ },
+ {
+  "symbol": "INDIGO",
+  "key": "NSE_EQ|INE646L01027",
+  "lot": 150
+ },
+ {
+  "symbol": "JSWSTEEL",
+  "key": "NSE_EQ|INE019A01038",
+  "lot": 675
+ },
+ {
+  "symbol": "JIOFIN",
+  "key": "NSE_EQ|INE758E01017",
+  "lot": 2350
+ },
+ {
+  "symbol": "KOTAKBANK",
+  "key": "NSE_EQ|INE237A01036",
+  "lot": 2000
+ },
+ {
+  "symbol": "LT",
+  "key": "NSE_EQ|INE018A01030",
+  "lot": 175
+ },
+ {
+  "symbol": "M&M",
+  "key": "NSE_EQ|INE101A01026",
+  "lot": 200
+ },
+ {
+  "symbol": "MARUTI",
+  "key": "NSE_EQ|INE585B01010",
+  "lot": 50
+ },
+ {
+  "symbol": "MAXHEALTH",
+  "key": "NSE_EQ|INE027H01010",
+  "lot": 525
+ },
+ {
+  "symbol": "NTPC",
+  "key": "NSE_EQ|INE733E01010",
+  "lot": 1500
+ },
+ {
+  "symbol": "NESTLEIND",
+  "key": "NSE_EQ|INE239A01024",
+  "lot": 500
+ },
+ {
+  "symbol": "ONGC",
+  "key": "NSE_EQ|INE213A01029",
+  "lot": 2250
+ },
+ {
+  "symbol": "POWERGRID",
+  "key": "NSE_EQ|INE752E01010",
+  "lot": 1900
+ },
+ {
+  "symbol": "RELIANCE",
+  "key": "NSE_EQ|INE002A01018",
+  "lot": 500
+ },
+ {
+  "symbol": "SBILIFE",
+  "key": "NSE_EQ|INE123W01016",
+  "lot": 375
+ },
+ {
+  "symbol": "SHRIRAMFIN",
+  "key": "NSE_EQ|INE721A01047",
+  "lot": 825
+ },
+ {
+  "symbol": "SBIN",
+  "key": "NSE_EQ|INE062A01020",
+  "lot": 750
+ },
+ {
+  "symbol": "SUNPHARMA",
+  "key": "NSE_EQ|INE044A01036",
+  "lot": 350
+ },
+ {
+  "symbol": "TCS",
+  "key": "NSE_EQ|INE467B01029",
+  "lot": 225
+ },
+ {
+  "symbol": "TATACONSUM",
+  "key": "NSE_EQ|INE192A01025",
+  "lot": 550
+ },
+ {
+  "symbol": "TMPV",
+  "key": "NSE_EQ|INE155A01022",
+  "lot": 1600
+ },
+ {
+  "symbol": "TATASTEEL",
+  "key": "NSE_EQ|INE081A01020",
+  "lot": 2750
+ },
+ {
+  "symbol": "TECHM",
+  "key": "NSE_EQ|INE669C01036",
+  "lot": 600
+ },
+ {
+  "symbol": "TITAN",
+  "key": "NSE_EQ|INE280A01028",
+  "lot": 175
+ },
+ {
+  "symbol": "TRENT",
+  "key": "NSE_EQ|INE849A01020",
+  "lot": 225
+ },
+ {
+  "symbol": "ULTRACEMCO",
+  "key": "NSE_EQ|INE481G01011",
+  "lot": 50
+ }
+]
