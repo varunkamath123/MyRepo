@@ -101,6 +101,13 @@ INSTRUMENT_PARAMS = {
         "kronos_rev_conf_min": 0.45,
         "supertrend_period":   10,
         "supertrend_multiplier": 4.0,   # wider than NIFTY: reduces ST_FLIP whipsaw, PF 0.41->1.00
+        # Nov 9 2026 BANKNIFTY-only config: the ADX / SuperTrend-alignment ENTRY gates are off and
+        # CONFIDENCE_DECAY is profit-gated again. Other instruments default to gates on, decay "immediate".
+        # Replay (2.9y, net Rs500/trade): +118k / +219k (Upstox / yfinance input) vs -92k / -23k before.
+        "entry_gate_adx":      False,
+        "entry_gate_st":       False,
+        "decay_mode":          "profit_only",
+        "same_day_reentry":    False,   # the replay never re-enters on the day of an exit (live run enforces it)
     },
     "SENSEX": {
         "stop_loss_pct":       0.025,   # conservative until we have backtest
@@ -303,6 +310,9 @@ def backtest_instrument(
     kronos_rev_conf_min = p["kronos_rev_conf_min"]
     st_period           = p["supertrend_period"]
     st_multiplier       = p["supertrend_multiplier"]
+    gate_adx            = p.get("entry_gate_adx", True)
+    gate_st             = p.get("entry_gate_st", True)
+    decay_profit_only   = p.get("decay_mode", "immediate") == "profit_only"
 
     trades: list[Trade] = []
 
@@ -382,8 +392,9 @@ def backtest_instrument(
                         _last_signal_bar = -999
                         continue
 
-                if EXIT_ON_CONFIDENCE_DECAY and not (_cached_dir == pos.direction and
-                                                     _cached_conf >= kronos_conf_min):
+                if (EXIT_ON_CONFIDENCE_DECAY and not (_cached_dir == pos.direction and
+                                                      _cached_conf >= kronos_conf_min)
+                        and not (decay_profit_only and pnl_pct < 0)):
                     _close(pos, i + 1, nxt_date, price, "CONFIDENCE_DECAY", trades)
                     pos = None; hwm = trail_stop = 0.0; trail_active = False
                     _last_signal_bar = -999
@@ -404,7 +415,7 @@ def backtest_instrument(
         # ── Entry (signal on today's close, enter at next open) ──────────────
         try:
             adx = compute_adx(ctx)
-            if adx < MIN_ADX:
+            if gate_adx and adx < MIN_ADX:
                 continue
 
             direction, confidence, source = _cached_dir, _cached_conf, _cached_src
@@ -412,9 +423,9 @@ def backtest_instrument(
                 continue
 
             st = supertrend(ctx, period=st_period, multiplier=st_multiplier)
-            if direction == "LONG"  and st != "BULL":
+            if gate_st and direction == "LONG"  and st != "BULL":
                 continue
-            if direction == "SHORT" and st != "BEAR":
+            if gate_st and direction == "SHORT" and st != "BEAR":
                 continue
 
             pos = Trade(
