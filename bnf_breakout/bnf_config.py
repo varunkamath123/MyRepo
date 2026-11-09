@@ -139,6 +139,9 @@ OI_WALL_LOOKAHEAD_PCT = 1.5       # walls are searched within this distance of s
 OI_MAX_SNAPSHOT_AGE_MIN = 20      # a chain snapshot older than this is treated as missing
 SHADOW_STALE_ENABLED = True        # follow every trade the STALE rule closes as if it had stayed open (no orders,
                                   # never touches the real position); the record is bnf_shadow_<date>.jsonl
+SHADOW_PROFIT_WAIT_ENABLED = True # a second shadow arm that follows EVERY entry: the stale / thesis-broken / trail rules
+                                  # do not close it until it has been net profitable (replay: research/profit_wait_study.py)
+PROFIT_WAIT_MIN_NET_RS = 0.0      # 'profitable' = net P&L after round-trip costs above this, at a premium poll
 SHADOW_POLL_SECONDS = 60          # premium poll for a shadow (the real position polls every 20 s)
 OI_SOURCE = 'fyers'              # 'fyers' | 'nse'. Where the GATE reads its chain from. 'fyers' = the broker's option
                                   # chain for the series the bot actually TRADES (the next monthly on the nearest

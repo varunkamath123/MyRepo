@@ -406,6 +406,40 @@ def on_bar_exit(pos: dict, bars: dict, i: int, cfg=cfg_default, replay: bool = F
     return None
 
 
+def on_bar_exit_profit_wait(pos: dict, bars: dict, i: int, cfg=cfg_default, replay: bool = False,
+                            profitable_now: bool = False):
+    """PROFIT-WAIT variant of on_bar_exit: do not let the discretionary exits (stale, thesis-broken,
+    trail) close a position while it has not yet been profitable; once it has been profitable
+    (sticky: pos['pw_on']), apply exactly the existing rules.
+
+    Always in force, profitable or not: the force close at FORCE_CLOSE, and (replay only) the hard
+    stop / target; live, the premium poll covers the stop and the target for every position.
+
+    `profitable_now` is supplied by the caller because 'profitable' is measured differently live
+    (premium net of costs) and in a replay (index close beyond the cost, in the trade's favour).
+    Used by the profit-wait SHADOW only; the real position uses on_bar_exit.
+    """
+    if profitable_now:
+        pos['pw_on'] = True
+    if pos.get('pw_on'):
+        return on_bar_exit(pos, bars, i, cfg, replay)
+    H, L, C, T = bars['H'], bars['L'], bars['C'], bars['T']
+    e, d = pos['entry_px'], pos['dir']
+    h, l, c = float(H[i]), float(L[i]), float(C[i])
+    if replay:
+        fav_i = (h - e) / e * 100 if d > 0 else (e - l) / e * 100
+        adv_i = (e - l) / e * 100 if d > 0 else (h - e) / e * 100
+        if adv_i >= stop_index_pct(cfg):
+            return dict(kind='stop', reason='hard stop (replay)', exit_pct=-stop_index_pct(cfg))
+        if fav_i >= target_index_pct(cfg):
+            return dict(kind='target', reason='target (replay)', exit_pct=target_index_pct(cfg))
+    update_excursions(pos, h, l)
+    if bar_close_time(T[i], cfg) >= cfg.FORCE_CLOSE:
+        return dict(kind='force_close', reason=f'end of day {cfg.FORCE_CLOSE}',
+                    exit_pct=(c - e) / e * 100 * d)
+    return None
+
+
 # ── sizing & costs ──────────────────────────────────────────────────────────
 def book_state(pnls: list, cfg=cfg_default) -> dict:
     """Book, running peak, drawdown and the risk multiplier, from the closed-trade

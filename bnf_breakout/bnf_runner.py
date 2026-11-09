@@ -71,7 +71,7 @@ def _atomic_write(path: str, obj) -> None:
 class Runner:
     def __init__(self, broker, c=cfg, clock=None, sleep=time.sleep, history=None,
                  state_dir=None, log_dir=None, logger=None, is_holiday=None,
-                 reload_client=None, chain=None, pcr_hist=None, chain_log=None, shadow=None):
+                 reload_client=None, chain=None, pcr_hist=None, chain_log=None, shadow=None, shadow_pw=None):
         self.b, self.c, self.sleep = broker, c, sleep
         self.clock = clock or (lambda: datetime.now(IST))
         self.state_dir = state_dir or c.STATE_DIR
@@ -90,6 +90,10 @@ class Runner:
             bnf_shadow.StaleShadow(broker, c, self.state_dir, self.log_dir, append=self._append,
                                    day_fn=lambda: self.day, logger=self.log)
             if getattr(c, 'SHADOW_STALE_ENABLED', False) and broker is not None else None)
+        self.shadow_pw = shadow_pw if shadow_pw is not None else (
+            bnf_shadow.ProfitWaitShadow(broker, c, self.state_dir, self.log_dir, append=self._append,
+                                        day_fn=lambda: self.day, logger=self.log)
+            if getattr(c, 'SHADOW_PROFIT_WAIT_ENABLED', False) and broker is not None else None)
         self.ctx = None
         self.day = None
         self.state = None
@@ -275,8 +279,8 @@ class Runner:
         now = self.clock()
         try:
             secs = self._step(now)
-            if self.shadow is not None and self.shadow.active():
-                secs = min(secs, float(self.c.SHADOW_POLL_SECONDS))      # wake in time to poll the shadow
+            if any(a is not None and a.active() for a in (self.shadow, self.shadow_pw)):
+                secs = min(secs, float(self.c.SHADOW_POLL_SECONDS))      # wake in time to poll a shadow
             return secs
         finally:
             self._status(now, self._last_note)
@@ -309,16 +313,17 @@ class Runner:
             except Exception:
                 pass
 
-        if self.shadow is not None:
-            try:
-                self.shadow.step(now)             # never allowed to affect the real position
-            except Exception as e:
-                self.log.warning(f'[SHADOW] step failed: {e}')
-
         pos = self.state.get('position')
-        if pos:
-            return self._manage(now, pos)
-        return self._scan(now)
+        secs = self._manage(now, pos) if pos else self._scan(now)
+        # The shadow arms run AFTER the real position has been handled, so a real exit is on record
+        # before a shadow that closes in the same step is compared with it. Never allowed to affect it.
+        for arm in (self.shadow, self.shadow_pw):
+            if arm is not None:
+                try:
+                    arm.step(now)
+                except Exception as e:
+                    self.log.warning(f'[SHADOW] step failed: {e}')
+        return secs
 
     def _ensure_client(self, now: datetime, day: str) -> bool:
         """A client built at start-up holds the token of the day the service started.
@@ -435,6 +440,11 @@ class Runner:
         self.state['position'] = pos
         self.state['trades_today'] += 1
         self._save()
+        if self.shadow_pw is not None:
+            try:
+                self.shadow_pw.open_from_entry(pos, now, self.state['last_bar_idx'])
+            except Exception as e:
+                self.log.warning(f'[SHADOW] could not open a profit-wait shadow: {e}')
         self.log.info(f"[ENTRY] {pos['opt']} {res['symbol']} {sz['lots']} lot(s) @ {fill:.2f} "
                       f"(ltp {q['ltp']}, ask {q.get('ask')}) | {sz['why']}")
         self._last_note = f"entered {pos['symbol']} x{sz['lots']}"
@@ -548,6 +558,7 @@ class Runner:
                 chain=(self.chain.status() if self.chain is not None else None),
                 chain_log=(self.chain_log.status() if self.chain_log is not None else None),
                 shadow=(self.shadow.status() if self.shadow is not None else None),
+                shadow_pw=(self.shadow_pw.status() if self.shadow_pw is not None else None),
                 api_by_label=getattr(bb, 'by_label', None)))
         except Exception:
             pass
