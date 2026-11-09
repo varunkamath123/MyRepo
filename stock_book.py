@@ -18,6 +18,16 @@ Why this rule, and why it is a paper experiment
   as an entry filter on ~2,400 breakout days and did NOT separate better trades from worse ones,
   so it is only logged here (kronos_dir / kronos_conf on each ENTRY), never gating.
 
+Market beta and regime (research/stk_beta_regime.py, added after "long-only is just a bull-market bet")
+  Hedged against NIFTY over each holding period the long edge is about half the raw number (+0.58% vs
+  +1.07% per trade, t=1.7) and it vanishes with NIFTY below its 200-day average (+0.09% raw, -0.64% hedged,
+  n=147, vs +1.41% / +1.01% above it, n=422). So the capital book only opens positions while NIFTY is above
+  its 200-day average (REGIME_FILTER; it is a post-hoc filter from one look, so it is one constant to revert).
+  The signal book stays unfiltered so the regime split keeps accumulating forward. Every ENTRY/EXIT carries
+  the NIFTY level and the beta-hedged return. The mirror trade does not rescue the short side: breakdown
+  shorts lose in every year and every regime, even hedged (-1.31% raw, -0.58% hedged, 389 trades), so shorts
+  run only as a SHORT SHADOW ledger (mirrored rules, no capital, no Kronos) to collect forward evidence.
+
 Rules (research/stk_triggers.py, stk_expectancy.py; same definitions)
   Entry : price > highest high of the prior 20 completed sessions AND today's volume >= 1.5x the
           prior-20-session average. Today's volume is partial at 15:25, so it is scaled by
@@ -25,13 +35,16 @@ Rules (research/stk_triggers.py, stk_expectancy.py; same definitions)
   ATR   : Wilder ATR14 including today's true range (day high/low from the quote), measured at entry.
   Exit  : STOP_LOSS price <= entry - 2 x ATR14 (ATR at entry) | CHANNEL_EXIT price < lowest low of
           the prior 10 completed sessions | TIME_EXIT after 30 sessions. Checked in that order.
+  Short shadow: the mirror (price below the prior-20-session low on 1.5x volume; stop +2 ATR; exit above
+          the prior-10-session high; 30 sessions).
   No re-entry in a stock on the day it exits. No entry when the quote is stale (holiday).
 
-Two ledgers from one engine
-  signal book  : every signal, one lot each, uncapped. Roughly 40 signals a quarter, which is what
-                 the statistics need. Reported as Rs per lot.
-  capital book : the subset that fit while fewer than MAX_SLOTS (3) capital-book positions were open
-                 (strongest volume first). That is what Rs3.5L of margin could actually carry.
+Three ledgers from one engine
+  signal book  : every long signal, one lot each, uncapped, any regime. Roughly 45 signals a quarter, which
+                 is what the statistics need. Reported as Rs per lot.
+  capital book : the subset that fit while fewer than MAX_SLOTS (3) capital-book positions were open AND
+                 NIFTY was above its 200-day average (strongest volume first). What Rs3.5L could carry.
+  short shadow : the mirrored short signals, uncapped, no capital.
 
 Usage
   python stock_book.py                    daily run (cron, 15:25 IST)
@@ -71,6 +84,7 @@ UNIVERSE_FILE = HERE / "stock_universe.json"
 STATE_FILE    = HERE / "stock_state.json"
 TRADES_LOG    = HERE / "stock_trades.jsonl"
 SIGNALS_LOG   = HERE / "stock_signals.jsonl"
+BOOKS         = ("signal", "capital", "short_shadow")
 
 CHANNEL_IN, CHANNEL_OUT = 20, 10      # Donchian entry / exit windows (completed sessions)
 VOL_AVG, VOL_MULT       = 20, 1.5     # volume expansion vs prior-20-session average
@@ -79,6 +93,8 @@ MAX_HOLD                = 30          # sessions
 COST_PCT                = 0.0010      # round trip, deducted at exit
 MAX_SLOTS               = 3           # capital-book concurrency (Rs3.5L of margin)
 LIVE_VOLUME_ADJ         = 1.03        # 15:25 volume is ~97% of the day: approximation
+REGIME_FILTER           = True        # capital slots only while NIFTY > its 200-day average
+HEDGE_COST_PCT          = 0.0003      # NIFTY-futures hedge round trip, for the hedged-return column
 CONTEXT_BARS            = 150
 _BASE                   = "https://api.upstox.com/v2"
 
@@ -94,18 +110,24 @@ class StockPos:
     volx: float = 0.0
     kronos_dir: Optional[str] = None
     kronos_conf: Optional[float] = None
+    side: int = 1                      # +1 long, -1 short shadow
+    nifty_entry: Optional[float] = None
+    regime_above200: Optional[bool] = None
 
 
 def _empty_stats() -> dict:
-    return {"n": 0, "wins": 0, "pnl_inr": 0.0, "cost_inr": 0.0, "sum_ret_pct": 0.0}
+    return {"n": 0, "wins": 0, "pnl_inr": 0.0, "cost_inr": 0.0, "sum_ret_pct": 0.0, "sum_hedged_pct": 0.0}
 
 
 def _load_state() -> dict:
     st = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     st.setdefault("positions", {})
+    st.setdefault("shorts", {})
     st.setdefault("stats", {})
-    for k in ("signal", "capital"):
+    for k in BOOKS:
         st["stats"].setdefault(k, _empty_stats())
+        for f, v in _empty_stats().items():
+            st["stats"][k].setdefault(f, v)
     return st
 
 
@@ -131,15 +153,17 @@ def _atr(d: pd.DataFrame) -> float:
 
 
 def evaluate_entry(df: pd.DataFrame, px: float, vol_today: float, vol_adj: float = LIVE_VOLUME_ADJ,
-                   day_high: Optional[float] = None, day_low: Optional[float] = None) -> dict:
+                   day_high: Optional[float] = None, day_low: Optional[float] = None, side: int = 1) -> dict:
     """df = complete daily bars through the last closed session (columns datetime/open/high/low/close/volume).
     day_high / day_low (today's range so far) put today's true range into the ATR, as the research did."""
     d = df.tail(CONTEXT_BARS)
     hi_in = float(d["high"].tail(CHANNEL_IN).max())
+    lo_in = float(d["low"].tail(CHANNEL_IN).min())
     avg_vol = float(d["volume"].tail(VOL_AVG).mean())
     volx_raw = (vol_today / avg_vol) if avg_vol > 0 else 0.0
     volx = volx_raw * vol_adj
-    sig = bool(px > hi_in and volx >= VOL_MULT and len(d) >= CHANNEL_IN)
+    broke = (px > hi_in) if side == 1 else (px < lo_in)
+    sig = bool(broke and volx >= VOL_MULT and len(d) >= CHANNEL_IN)
     atr = None
     if sig:
         if day_high is not None and day_low is not None:
@@ -148,14 +172,16 @@ def evaluate_entry(df: pd.DataFrame, px: float, vol_today: float, vol_adj: float
             atr = _atr(pd.concat([d, today_bar], ignore_index=True))
         else:
             atr = _atr(d)
-    return {"signal": sig, "hi_in": hi_in, "volx": volx, "volx_raw": volx_raw, "atr": atr}
+    return {"signal": sig, "hi_in": hi_in, "lo_in": lo_in, "volx": volx, "volx_raw": volx_raw, "atr": atr}
 
 
 def check_exit(pos: StockPos, df: pd.DataFrame, px: float) -> Optional[str]:
     d = df.tail(CONTEXT_BARS)
-    if px - pos.entry_price <= -STOP_ATR * pos.atr:
+    if pos.side * (px - pos.entry_price) <= -STOP_ATR * pos.atr:
         return "STOP_LOSS"
-    if px < float(d["low"].tail(CHANNEL_OUT).min()):
+    if pos.side == 1 and px < float(d["low"].tail(CHANNEL_OUT).min()):
+        return "CHANNEL_EXIT"
+    if pos.side == -1 and px > float(d["high"].tail(CHANNEL_OUT).max()):
         return "CHANNEL_EXIT"
     held = int((df["datetime"].dt.normalize() > pd.Timestamp(pos.entry_date)).sum()) + 1   # sessions incl. today
     if held >= MAX_HOLD:
@@ -164,81 +190,107 @@ def check_exit(pos: StockPos, df: pd.DataFrame, px: float) -> Optional[str]:
 
 
 def run_day(st: dict, universe: list[dict], data: dict, today: str, vol_adj: float = LIVE_VOLUME_ADJ,
-            kronos_fn=None, write_logs: bool = True) -> list[dict]:
-    """One daily run on already-fetched data: data[symbol] = {"df", "px", "vol"}. Mutates `st`; returns the events."""
+            kronos_fn=None, write_logs: bool = True, regime: Optional[dict] = None) -> list[dict]:
+    """One daily run on already-fetched data: data[symbol] = {"df", "px", "vol", "high", "low"}.
+    regime = {"nifty": level, "sma200": avg, "above200": bool} or None (unknown: capital slots not filtered).
+    Mutates `st`; returns the events."""
     events: list[dict] = []
-    exited: set[str] = set()
     lots = {u["symbol"]: u["lot"] for u in universe}
+    nifty_now = regime["nifty"] if regime else None
+    above200 = regime["above200"] if regime else None
+    sides = ((1, st["positions"], "long"), (-1, st["shorts"], "short_shadow"))
 
-    # PASS 1: exits
-    for sym in list(st["positions"].keys()):
-        d = data.get(sym)
-        if d is None:
-            continue
-        pos = StockPos(**st["positions"][sym])
-        if pos.entry_date == today:
-            continue
-        reason = check_exit(pos, d["df"], d["px"])
-        if not reason:
-            continue
-        gross = (d["px"] - pos.entry_price) * pos.lot
-        cost = COST_PCT * pos.entry_price * pos.lot
-        net = gross - cost
-        ret_pct = ((d["px"] - pos.entry_price) / pos.entry_price - COST_PCT) * 100
-        for book in ("signal",) + (("capital",) if pos.slot else ()):
-            s = st["stats"][book]
-            s["n"] += 1; s["wins"] += 1 if net > 0 else 0
-            s["pnl_inr"] += net; s["cost_inr"] += cost; s["sum_ret_pct"] += ret_pct
-        rec = {"event": "EXIT", "symbol": sym, "direction": "LONG", "entry_date": pos.entry_date, "entry_price": pos.entry_price,
-               "exit_date": today, "exit_price": d["px"], "exit_reason": reason, "lot": pos.lot, "slot": pos.slot,
-               "pnl_gross_inr": gross, "cost_inr": cost, "pnl_inr": net, "ret_pct": ret_pct,
-               "volx": pos.volx, "kronos_dir": pos.kronos_dir, "kronos_conf": pos.kronos_conf}
-        events.append(rec)
-        if write_logs:
-            _append(TRADES_LOG, rec)
-        log.info("[%s] EXIT %s @ %.2f  %s  net INR %+.0f (%+.2f%%)  slot=%s  [held from %s]",
-                 sym, "LONG", d["px"], reason, net, ret_pct, pos.slot, pos.entry_date)
-        del st["positions"][sym]
-        exited.add(sym)
+    # PASS 1: exits (long book and short shadow)
+    exited = {1: set(), -1: set()}
+    for side, book, bname in sides:
+        for sym in list(book.keys()):
+            d = data.get(sym)
+            if d is None:
+                continue
+            pos = StockPos(**book[sym])
+            if pos.entry_date == today:
+                continue
+            reason = check_exit(pos, d["df"], d["px"])
+            if not reason:
+                continue
+            gross = side * (d["px"] - pos.entry_price) * pos.lot
+            cost = COST_PCT * pos.entry_price * pos.lot
+            net = gross - cost
+            ret_pct = (side * (d["px"] - pos.entry_price) / pos.entry_price - COST_PCT) * 100
+            nret = ((nifty_now / pos.nifty_entry - 1) * 100) if (nifty_now and pos.nifty_entry) else None
+            hedged = (ret_pct - side * nret - HEDGE_COST_PCT * 100) if nret is not None else None
+            for bk in (("signal",) + (("capital",) if pos.slot else ())) if side == 1 else ("short_shadow",):
+                s_ = st["stats"][bk]
+                s_["n"] += 1; s_["wins"] += 1 if net > 0 else 0
+                s_["pnl_inr"] += net; s_["cost_inr"] += cost; s_["sum_ret_pct"] += ret_pct
+                s_["sum_hedged_pct"] += hedged if hedged is not None else 0.0
+            rec = {"event": "EXIT", "book": bname, "symbol": sym, "direction": "LONG" if side == 1 else "SHORT",
+                   "entry_date": pos.entry_date, "entry_price": pos.entry_price, "exit_date": today, "exit_price": d["px"],
+                   "exit_reason": reason, "lot": pos.lot, "slot": pos.slot, "pnl_gross_inr": gross, "cost_inr": cost,
+                   "pnl_inr": net, "ret_pct": ret_pct, "nifty_entry": pos.nifty_entry, "nifty_exit": nifty_now,
+                   "nifty_ret_pct": nret, "hedged_ret_pct": hedged, "regime_above200": pos.regime_above200,
+                   "volx": pos.volx, "kronos_dir": pos.kronos_dir, "kronos_conf": pos.kronos_conf}
+            events.append(rec)
+            if write_logs:
+                _append(TRADES_LOG, rec)
+            log.info("[%s] %sEXIT %s @ %.2f  %s  net INR %+.0f (%+.2f%%, hedged %s)  slot=%s  [held from %s]",
+                     sym, "SHADOW " if side == -1 else "", rec["direction"], d["px"], reason, net, ret_pct,
+                     f"{hedged:+.2f}%" if hedged is not None else "n/a", pos.slot, pos.entry_date)
+            del book[sym]
+            exited[side].add(sym)
 
     # PASS 2: entries
-    cands = []
+    cands = {1: [], -1: []}
     for u in universe:
         sym = u["symbol"]
         d = data.get(sym)
-        if d is None or sym in st["positions"] or sym in exited:
+        if d is None:
             continue
-        ev = evaluate_entry(d["df"], d["px"], d["vol"], vol_adj, d.get("high"), d.get("low"))
-        if write_logs:
-            _append(SIGNALS_LOG, {"date": today, "symbol": sym, "price": d["px"], "hi20": ev["hi_in"],
-                                  "volx": round(ev["volx"], 3), "volx_raw": round(ev["volx_raw"], 3), "signal": ev["signal"]})
-        if ev["signal"]:
-            cands.append((ev["volx"], sym, ev))
-    cands.sort(reverse=True)                                   # strongest volume first for the capital slots
+        evs = {}
+        for side, book, bname in sides:
+            if sym in book or sym in exited[side]:
+                continue
+            ev = evaluate_entry(d["df"], d["px"], d["vol"], vol_adj, d.get("high"), d.get("low"), side=side)
+            evs[side] = ev
+            if ev["signal"]:
+                cands[side].append((ev["volx"], sym, ev))
+        if write_logs and evs:
+            e1 = evs.get(1) or evs.get(-1)
+            _append(SIGNALS_LOG, {"date": today, "symbol": sym, "price": d["px"], "hi20": e1["hi_in"], "lo20": e1["lo_in"],
+                                  "volx": round(e1["volx"], 3), "volx_raw": round(e1["volx_raw"], 3),
+                                  "long_signal": bool(evs.get(1) and evs[1]["signal"]), "short_signal": bool(evs.get(-1) and evs[-1]["signal"])})
     open_slots = sum(1 for p in st["positions"].values() if p["slot"])
-    for volx, sym, ev in cands:
-        d = data[sym]
-        slot = open_slots < MAX_SLOTS
-        open_slots += 1 if slot else 0
-        kd = kc = None
-        if kronos_fn is not None:
-            try:
-                kd, kc = kronos_fn(d["df"])
-            except Exception as e:
-                log.warning("[%s] Kronos read failed (logging only): %s", sym, e)
-        pos = StockPos(symbol=sym, entry_date=today, entry_price=d["px"], atr=ev["atr"], lot=lots[sym], slot=slot,
-                       volx=round(volx, 3), kronos_dir=kd, kronos_conf=(round(kc, 3) if kc is not None else None))
-        st["positions"][sym] = asdict(pos)
-        rec = {"event": "ENTRY", "symbol": sym, "direction": "LONG", "entry_date": today, "entry_price": d["px"],
-               "atr": ev["atr"], "stop": d["px"] - STOP_ATR * ev["atr"], "lot": pos.lot, "slot": slot,
-               "volx": pos.volx, "volx_raw": round(ev["volx_raw"], 3), "hi20": ev["hi_in"],
-               "kronos_dir": kd, "kronos_conf": pos.kronos_conf,
-               "kronos_agrees": (kd == "LONG") if kd is not None else None}
-        events.append(rec)
-        if write_logs:
-            _append(TRADES_LOG, rec)
-        log.info("[%s] ENTRY LONG @ %.2f  hi20=%.2f volx=%.2f  stop=%.2f  lot=%d  slot=%s  kronos=%s/%s",
-                 sym, d["px"], ev["hi_in"], volx, rec["stop"], pos.lot, slot, kd, pos.kronos_conf)
+    regime_ok = not (REGIME_FILTER and above200 is False)
+    for side, book, bname in sides:
+        for volx, sym, ev in sorted(cands[side], reverse=True):            # strongest volume first
+            d = data[sym]
+            slot = False
+            if side == 1:
+                slot = regime_ok and open_slots < MAX_SLOTS
+                open_slots += 1 if slot else 0
+            kd = kc = None
+            if side == 1 and kronos_fn is not None:
+                try:
+                    kd, kc = kronos_fn(d["df"])
+                except Exception as e:
+                    log.warning("[%s] Kronos read failed (logging only): %s", sym, e)
+            pos = StockPos(symbol=sym, entry_date=today, entry_price=d["px"], atr=ev["atr"], lot=lots[sym], slot=slot,
+                           volx=round(volx, 3), kronos_dir=kd, kronos_conf=(round(kc, 3) if kc is not None else None),
+                           side=side, nifty_entry=nifty_now, regime_above200=above200)
+            book[sym] = asdict(pos)
+            rec = {"event": "ENTRY", "book": bname, "symbol": sym, "direction": "LONG" if side == 1 else "SHORT",
+                   "entry_date": today, "entry_price": d["px"], "atr": ev["atr"], "stop": d["px"] - side * STOP_ATR * ev["atr"],
+                   "lot": pos.lot, "slot": slot, "volx": pos.volx, "volx_raw": round(ev["volx_raw"], 3),
+                   "hi20": ev["hi_in"], "lo20": ev["lo_in"], "nifty": nifty_now, "regime_above200": above200,
+                   "capital_blocked_by_regime": (side == 1 and not regime_ok),
+                   "kronos_dir": kd, "kronos_conf": pos.kronos_conf,
+                   "kronos_agrees": (kd == "LONG") if kd is not None else None}
+            events.append(rec)
+            if write_logs:
+                _append(TRADES_LOG, rec)
+            log.info("[%s] %sENTRY %s @ %.2f  volx=%.2f  stop=%.2f  lot=%d  slot=%s%s  kronos=%s/%s",
+                     sym, "SHADOW " if side == -1 else "", rec["direction"], d["px"], volx, rec["stop"], pos.lot, slot,
+                     " (regime below 200-DMA: signal book only)" if rec["capital_blocked_by_regime"] else "", kd, pos.kronos_conf)
     return events
 
 
@@ -279,6 +331,20 @@ def load_quotes(keys: list[str]) -> dict:
             out[v["instrument_token"]] = {"px": float(v["last_price"]), "vol": float(v.get("volume") or 0.0), "fresh_date": ts,
                                           "high": oh.get("high"), "low": oh.get("low")}
     return out
+
+
+def load_regime() -> Optional[dict]:
+    """NIFTY live level vs its 200-session average (complete sessions through yesterday)."""
+    try:
+        from brokers.upstox_data import load_daily_ohlcv, get_ltp
+        d = load_daily_ohlcv("NIFTY", bars=215)
+        d = d[d["datetime"].dt.dayofweek < 5]
+        sma = float(d["close"].tail(200).mean())
+        px = float(get_ltp("NIFTY"))
+        return {"nifty": px, "sma200": sma, "above200": px > sma, "bars": int(min(len(d), 200))}
+    except Exception as e:
+        log.error("regime fetch failed (%s) -- capital slots will not be regime-filtered this run", e)
+        return None
 
 
 def _kronos_read(df: pd.DataFrame):
@@ -331,33 +397,44 @@ def cmd_daily_run(dry: bool, use_kronos: bool):
         log.info("%d of %d quotes are not from today -- market closed / holiday; nothing to do", len(stale), len(universe))
         return
     log.info("data ok for %d stocks; stale %s; failed %s", len(data), stale, failed)
+    regime = load_regime()
+    if regime:
+        log.info("regime: NIFTY %.1f vs 200-DMA %.1f -> %s", regime["nifty"], regime["sma200"],
+                 "ABOVE (capital slots open)" if regime["above200"] else "BELOW (capital slots closed; signal book only)")
     work = json.loads(json.dumps(st)) if dry else st
-    events = run_day(work, universe, data, today, kronos_fn=(_kronos_read if use_kronos and not dry else None), write_logs=not dry)
+    events = run_day(work, universe, data, today, kronos_fn=(_kronos_read if use_kronos and not dry else None),
+                     write_logs=not dry, regime=regime)
     if dry:
         print(f"\nDRY RUN {today}: {len(events)} events (nothing written)")
         for e in events:
-            print("  ", {k: e[k] for k in e if k in ("event", "symbol", "entry_price", "exit_price", "exit_reason", "volx", "slot", "pnl_inr", "stop")})
+            print("  ", {k: e[k] for k in e if k in ("event", "book", "symbol", "entry_price", "exit_price", "exit_reason", "volx", "slot", "pnl_inr", "stop")})
         return
     _save_state(st)
     print_status(st)
 
 
 def print_status(st: dict):
-    sep = "=" * 66
-    print(f"\n{sep}\n  STOCK BOOK (NIFTY 50, long-only breakout + volume)  |  paper, 1 lot each\n{sep}")
-    for name, key in (("SIGNAL BOOK  (every signal, uncapped)", "signal"), (f"CAPITAL BOOK (max {MAX_SLOTS} open)", "capital")):
+    sep = "=" * 70
+    print(f"{chr(10)}{sep}{chr(10)}  STOCK BOOK (NIFTY 50, breakout + volume)  |  paper, 1 lot each{chr(10)}{sep}")
+    for name, key in (("SIGNAL BOOK  long, uncapped, any regime", "signal"),
+                      (f"CAPITAL BOOK long, max {MAX_SLOTS} open, NIFTY > 200-DMA", "capital"),
+                      ("SHORT SHADOW mirrored shorts, no capital", "short_shadow")):
         s = st["stats"][key]
         if s["n"]:
             print(f"  {name}: {s['n']} closed, win {s['wins']/s['n']*100:.0f}%, net INR {s['pnl_inr']:+,.0f} "
-                  f"(avg {s['pnl_inr']/s['n']:+,.0f}/trade, {s['sum_ret_pct']/s['n']:+.2f}%/trade), costs INR {s['cost_inr']:,.0f}")
+                  f"(avg {s['pnl_inr']/s['n']:+,.0f}/trade); {s['sum_ret_pct']/s['n']:+.2f}%/trade, "
+                  f"beta-hedged {s['sum_hedged_pct']/s['n']:+.2f}%/trade")
         else:
             print(f"  {name}: no closed trades yet")
-    if st["positions"]:
-        print("  OPEN:")
-        for sym, p in sorted(st["positions"].items()):
-            print(f"    {sym:<12} entry {p['entry_date']} @ {p['entry_price']:.2f}  stop {p['entry_price'] - STOP_ATR * p['atr']:.2f}  "
-                  f"lot {p['lot']}  {'CAPITAL' if p['slot'] else 'signal-only'}  volx {p['volx']:.2f}  kronos {p['kronos_dir']}/{p['kronos_conf']}")
-    else:
+    for title, book in (("OPEN (long)", st["positions"]), ("OPEN (short shadow)", st["shorts"])):
+        if book:
+            print(f"  {title}:")
+            for sym, p in sorted(book.items()):
+                sd = p.get("side", 1)
+                print(f"    {sym:<12} entry {p['entry_date']} @ {p['entry_price']:.2f}  stop {p['entry_price'] - sd * STOP_ATR * p['atr']:.2f}  "
+                      f"lot {p['lot']}  {'CAPITAL' if p['slot'] else 'signal-only'}  volx {p['volx']:.2f}  "
+                      f"NIFTY>200DMA {p.get('regime_above200')}  kronos {p['kronos_dir']}/{p['kronos_conf']}")
+    if not st["positions"] and not st["shorts"]:
         print("  No open positions.")
     print(sep)
 
