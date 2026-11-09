@@ -137,6 +137,12 @@ OI_PCR_Z_MIN = 0.0                # direction-signed PCR z must be >= this (CALL
 OI_WALL_CLEAR_PCT = 0.5           # the biggest wall toward the trade must be farther than this (% of spot)
 OI_WALL_LOOKAHEAD_PCT = 1.5       # walls are searched within this distance of spot
 OI_MAX_SNAPSHOT_AGE_MIN = 20      # a chain snapshot older than this is treated as missing
+SHADOW_STALE_ENABLED = True        # follow every trade the STALE rule closes as if it had stayed open (no orders,
+                                  # never touches the real position); the record is bnf_shadow_<date>.jsonl
+SHADOW_PROFIT_WAIT_ENABLED = True # a second shadow arm that follows EVERY entry: the stale / thesis-broken / trail rules
+                                  # do not close it until it has been net profitable (replay: research/profit_wait_study.py)
+PROFIT_WAIT_MIN_NET_RS = 0.0      # 'profitable' = net P&L after round-trip costs above this, at a premium poll
+SHADOW_POLL_SECONDS = 60          # premium poll for a shadow (the real position polls every 20 s)
 OI_SOURCE = 'fyers'              # 'fyers' | 'nse'. Where the GATE reads its chain from. 'fyers' = the broker's option
                                   # chain for the series the bot actually TRADES (the next monthly on the nearest
                                   # series' expiry day), ~77 calls/day. 'nse' = NSE's public page, which only ever
@@ -246,6 +252,8 @@ def validate() -> list:
         p.append('ENTRY_START must precede ENTRY_END')
     if ENTRY_END >= FORCE_CLOSE:
         p.append('ENTRY_END must precede FORCE_CLOSE')
+    if SHADOW_POLL_SECONDS < 20:
+        p.append('SHADOW_POLL_SECONDS under 20 would out-poll the real position')
     if OI_SOURCE not in ('fyers', 'nse'):
         p.append("OI_SOURCE must be 'fyers' or 'nse'")
     if DIRECTION not in ('toward', 'away'):

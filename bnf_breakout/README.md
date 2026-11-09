@@ -25,6 +25,7 @@ This is a testbed built to produce a clean forward verdict, not a claim of edge.
 | `bnf_broker.py` | Fyers adapter with a persisted API budget. Read-only. | the API behaviour changes |
 | `bnf_runner.py` | the live paper loop, state, logs, heartbeat | operations change |
 | `bnf_replay.py` | replays `bnf_strategy` over history vs a random baseline | you want to try a config |
+| `bnf_shadow.py` | two virtual shadow arms: one follows every trade the stale rule closes as if it had stayed open; the other follows every entry and waits for a profit before applying the soft exit rules. Results are recorded beside the real trade. No orders, no effect on the real position. | you want to review the stale rule or the exits |
 | `bnf_chain.py` | records the option chain in a background thread and supplies the latest snapshot to the OI/PCR entry gate. | you want more fields recorded |
 | `tests/test_bnf.py` | 282 assertions, incl. a simulated trading day | always, before deploying |
 | `research/` | the pre-registered studies behind `LEARNINGS.md` | — |

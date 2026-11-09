@@ -136,3 +136,44 @@ history, starting empty: the PCR condition shows 'warming up' (passes) until 10 
 immediately. The gate is still in shadow, so no trade is affected. Shadow verdicts logged before 2026-10-29
 used the NSE nearest-series chain; do not pool them with later ones without noting the source.
 
+## Note 2026-11-05: stale-rule shadow arm (owner's request) - no effect on the live trades
+
+`bnf_shadow.py`, `SHADOW_STALE_ENABLED=True`. Every trade the STALE rule closes is also followed as if it
+had stayed open, managed by every other rule (premium stop/target, thesis-broken, ATR trail, 15:00
+force close). It places nothing, never touches the real position or trade log (a test asserts the real
+trades are identical with it on or off), and uses non-essential API calls only.
+
+Why: Nov 5 the stale rule closed two CALLs for +1,252 and +9 on a day the index rose 1.2%; the model puts the
+first at about +12,400 had it run. Earlier it saved Oct 29 (about -1,600 avoided) and Nov 3 (about -2,400).
+One day settles nothing; the forward record can.
+
+HOW TO READ IT. `bnf_shadow_<date>.jsonl`: per stale-closed trade, `real` (the stale result) beside `shadow`
+(what the other rules did), `delta_vs_real`, and - because only one position is held at a time - the real
+trades that opened while the shadow ran (`real_trades_during_shadow`, `real_pnl_during_shadow`) and
+`delta_vs_real_incl_overlap = shadow - (stale trade + those later trades)`. Judge the rule on the INCLUDING-
+overlap column. Pre-registered: review at 20 stale-closed trades; the stale rule is judged worth keeping only
+if the sum of `delta_vs_real_incl_overlap` is <= 0 with a bootstrap CI that does not lie wholly above 0 and
+both chronological halves agree; if it lies wholly above 0 in both halves, the rule is costing money and
+the removal proposal goes to the owner (a rule change restarts the n = 30 count).
+
+## Note 2026-11-09: profit-wait shadow arm (owner's idea) - no effect on the live trades
+
+`ProfitWaitShadow`, `SHADOW_PROFIT_WAIT_ENABLED=True`. It follows EVERY real entry from the moment it opens. While the
+position has not been net profitable (after round-trip costs, judged at a premium poll) the stale, thesis-broken
+and trail rules do not close it; once it has been, the existing rules apply exactly as normal. Always on: the 25%
+premium hard stop, the target, and the 15:00 force close. Virtual: no orders, real trades untouched (a test asserts
+the real trades are identical with every shadow arm on or off).
+
+Replay evidence (`research/profit_wait_study.py`, 430 sessions, realistic 30%/1% leverage, 'profitable' = a bar
+closes beyond the 0.08% cost): as built -0.073%/trade; profit-wait -0.047%/trade (CI [-0.084,-0.011]), win rate
+30% -> 58%, but average loss -0.18% -> -0.30% (payoff ratio 1.00 -> 0.46) and worst trade -0.74% -> -0.91%.
+Paired session-level gain +0.0237% (CI [+0.0048,+0.0438]), positive in both halves. It turns small losers into small
+winners; it does NOT raise the size of the winners, and expectancy stays negative. A replay cannot see premium
+paths, so this is a reason to run the shadow, not to adopt the rule.
+
+HOW TO READ IT. `bnf_shadow_<date>.jsonl`, records with `arm: profit_wait`: per real trade, `real` beside `shadow`,
+`delta_vs_real`, and the real trades that opened while the shadow ran (`delta_vs_real_incl_overlap`).
+Pre-registered: review at 20 profit-wait shadows. Adopt (a rule change; restarts the n=30 count) only if the sum of
+`delta_vs_real_incl_overlap` is > 0 with a bootstrap CI lower bound > 0 AND both halves are positive AND the single
+worst shadow loss is tolerable at the live lot size. Otherwise keep the exits as built.
+
