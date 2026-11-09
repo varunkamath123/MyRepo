@@ -71,12 +71,21 @@ def main(logs, since):
                 r = json.loads(ln)
             except Exception:
                 continue
-            if r.get('kind') == 'stale_shadow':
+            if r.get('kind') in ('stale_shadow', 'profit_wait_shadow') and r.get('delta_vs_real_incl_overlap') is not None:
                 sh.append(r)
-    if sh:
-        d = np.array([r['delta_vs_real_incl_overlap'] for r in sh], float)
-        print(f'\n  STALE SHADOW: {len(sh)} stale-closed trades; sum of (shadow - real incl. overlap) = Rs{d.sum():+,.0f}; '
-              f'shadow better in {int((d > 0).sum())} of {len(d)}')
+    for arm, label in (('stale_off', 'STALE SHADOW (stale rule off)'),
+                       ('profit_wait', 'PROFIT-WAIT SHADOW (soft exits wait for a profit)')):
+        rs = [r for r in sh if r.get('arm') == arm]
+        if not rs:
+            continue
+        d = np.array([r['delta_vs_real_incl_overlap'] for r in rs], float)
+        bsd = [rng.choice(d, len(d)).sum() for _ in range(3000)]
+        hh = len(d) // 2
+        print(f'\n  {label}: {len(rs)} trades; sum of (shadow - real incl. overlap) = Rs{d.sum():+,.0f} '
+              f'(bootstrap 95% [{np.percentile(bsd, 2.5):+,.0f}, {np.percentile(bsd, 97.5):+,.0f}]); '
+              f'shadow better in {int((d > 0).sum())} of {len(d)}; '
+              f'worst single shadow Rs{min(r["shadow"]["pnl_net"] for r in rs):+,.0f}; '
+              f'halves Rs{d[:hh].sum():+,.0f} / Rs{d[hh:].sum():+,.0f}')
 
 
 if __name__ == '__main__':
