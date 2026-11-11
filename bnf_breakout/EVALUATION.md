@@ -177,3 +177,29 @@ Pre-registered: review at 20 profit-wait shadows. Adopt (a rule change; restarts
 `delta_vs_real_incl_overlap` is > 0 with a bootstrap CI lower bound > 0 AND both halves are positive AND the single
 worst shadow loss is tolerable at the live lot size. Otherwise keep the exits as built.
 
+## Note 2026-11-11: early-entry shadow arm (owner's request) - no effect on the live trades
+
+`EarlyEntryShadow`, `SHADOW_EARLY_ENTRY_ENABLED=True`, `COIL_GATE_ENABLED` (live stays True). A virtual copy of the
+strategy with ONE change: the coil gate is off, so it can enter from the first allowed bar (09:55; the live strategy
+cannot before ~10:30 because the coil needs 15 bars) and does not need price to compress. Everything else is the live
+strategy's: window, regime and level gates, 'toward' direction, exits, one position at a time, 2 trades a day, 30-min
+cooldown after a loss; 1 lot at the ask, exit at the bid. OI gate not applied. It enters whether or not a real
+position is open and records whether one was. No orders; real trades untouched (a test asserts they are identical
+with every shadow arm on or off).
+
+Why: Nov 11 the real entry came at 11:15 (+Rs1,304) while a CALL at ~10:20 would have made about +Rs6,800 by the same
+exits. `research/earlier_entry_review.py` checked all 16 live trades with the same model: earlier same-side entries
+existed for every trade; for the 10 profitable trades the earliest candidate beat the real trade in 2 of 10 (mean real
+Rs+2,047 vs earliest Rs+1,045); for the 6 losers in 3 of 6 (mean real Rs-1,236 vs earliest Rs+277). Across 269 earlier
+candidates: mean Rs+752, win rate 41%; same side as the real trade Rs+1,425, opposite side Rs-732. The live window was a
++7.5% trend, so this is not evidence; the 422-session replay of the idea (open-break entries) averaged -0.059% a trade vs
+-0.101% for random.
+
+HOW TO READ IT. `bnf_shadow_<date>.jsonl`, records `early_entry_shadow` (and `_abandoned`). Tags: `coil_value` (None = the coil
+could not yet be computed), `coil_would_pass`, `real_position_open_at_entry`. `research/payoff_review.py` reports the arm's
+expectancy, the three coil groups, and the per-session difference (early minus real). Pre-registered: review after 20
+sessions. Consider dropping the coil gate (a rule change; restarts the n=30 count) only if the per-session difference
+(early minus real) has a bootstrap CI lower bound > 0 AND both halves are positive AND the arm's own expectancy per trade
+is not wholly below zero. The 'before the coil can be computed' and 'gate would have refused' groups are the ones
+that decide it: they are the trades the live strategy does not take.
+

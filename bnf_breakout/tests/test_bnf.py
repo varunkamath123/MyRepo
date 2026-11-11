@@ -1758,7 +1758,8 @@ n_, pnl_ = ro.r.shadow._overlap(rs.trades()[0]['exit_time'], at('13:00').isoform
 eq('only real trades that opened while the shadow ran count', (n_, pnl_), (1, 700.0))
 
 # (J) switched off, nothing changes
-rn = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1, SHADOW_STALE_ENABLED=False, SHADOW_PROFIT_WAIT_ENABLED=False)
+rn = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1, SHADOW_STALE_ENABLED=False, SHADOW_PROFIT_WAIT_ENABLED=False,
+         SHADOW_EARLY_ENTRY_ENABLED=False)
 rn.go('10:35')
 rn.go('11:00', 5)
 rn.go('11:05', 5)
@@ -1903,7 +1904,8 @@ rp.build()
 ok('a profit-wait shadow survives a restart', len(rp.r.shadow_pw.open) == 1)
 
 # switched off, and the real trades never change
-roff = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1, SHADOW_STALE_ENABLED=False, SHADOW_PROFIT_WAIT_ENABLED=False)
+roff = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1, SHADOW_STALE_ENABLED=False, SHADOW_PROFIT_WAIT_ENABLED=False,
+           SHADOW_EARLY_ENTRY_ENABLED=False)
 ron = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1)
 for r_ in (roff, ron):
     r_.go('10:35')
@@ -1927,6 +1929,113 @@ ry.go('10:35')
 ry.go('11:00', 5)
 ry.go('11:05', 5)
 eq('...nor does a failure in its step: the real stale exit is still recorded', [t['kind'] for t in ry.trades()], ['thesis_stale'])
+
+
+# --- 8y. the early-entry arm: the strategy with the coil gate off, tracked forward ---
+print('\n--- early-entry shadow ---')
+
+
+def early_recs(rig_, day=DAY):
+    return shadow_recs(rig_, day=day, arm='early_entry')
+
+
+# the switch in the strategy itself
+cfgNoCoil = mk_cfg(COIL_GATE_ENABLED=False, LEVELS=('PDH', 'PDL'))
+bars_n = coil_bars()
+dn_ = S.evaluate_entry(bars_n, 8, entry_day(), st0, cfgNoCoil)
+ok('with the coil gate off an entry is possible before 15 bars of history exist', dn_.enter is True, dn_.gates)
+ok('...and the coil is still reported, marked as not gated', dn_.gates['coil'][0] is True and 'not gated' in dn_.gates['coil'][1], dn_.gates['coil'])
+dg_ = S.evaluate_entry(bars_n, 8, entry_day(), st0, mk_cfg(LEVELS=('PDH', 'PDL')))
+eq('...whereas with it on (the live setting) the same bar is refused by the coil alone', dg_.blocked_by(), ['coil'])
+eq('the live config keeps the coil gate ON', bnf_config.COIL_GATE_ENABLED, True)
+eq('...and the early arm is enabled by default', bnf_config.SHADOW_EARLY_ENTRY_ENABLED, True)
+
+# a real run: the live strategy cannot enter at 09:55 (no coil history); the arm can
+re_ = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=2)
+re_.go('09:55')
+eq('the REAL strategy does not enter at 09:55 (coil n/a)', re_.r.state['position'], None)
+ok('...but the early-entry arm does', re_.r.shadow_early is not None and len(re_.r.shadow_early.st['open']) == 1)
+pe = re_.r.shadow_early.st['open'][0]
+eq('...a CALL on the same level rule as the real strategy', (pe['opt'], pe['lots']), ('CE', 1))
+approx('...at the ASK', pe['entry_premium'], 400.5)
+eq('...recording that the coil was not computable and the gate would not have passed',
+   (pe['coil_value'], pe['coil_would_pass'], pe['real_position_open']), (None, False, False))
+ok('...with its own state file', os.path.exists(os.path.join(re_.dir, 'shadow_early_state.json')))
+eq('it counts as a trade for the day', re_.r.shadow_early.st['trades_today'], 1)
+ok('the heartbeat reports it', json.load(open(os.path.join(re_.dir, 'status.json'))).get('shadow_early', {}).get('open') == 1)
+sl = re_.go('09:57')
+ok('...and the loop wakes in time to poll it', sl <= re_.c.SHADOW_POLL_SECONDS, sl)
+
+# it exits by the live rules: stale after 6 bars with no follow-through
+re_.go('10:25', 5)
+re_.go('10:30', 5)
+er = early_recs(re_)
+eq('a flat tape ends it on the stale rule, like a real trade', er and er[0]['shadow']['kind'], 'thesis_stale')
+ok('...recorded as an early-entry record with its entry details',
+   er and er[0]['kind'] == 'early_entry_shadow' and er[0]['coil_value'] is None and er[0]['level'] is not None)
+approx('...P&L is (exit - entry) x quantity - costs', er[0]['shadow']['pnl_net'],
+       (er[0]['shadow']['exit_premium'] - 400.5) * 30 - S.round_trip_cost(400.5, er[0]['shadow']['exit_premium'], 1, re_.c), 0.01)
+eq('the first shadow was a loss (spread + costs on a flat tape), so the 30-minute cooldown applies',
+   re_.r.shadow_early.st['last_loss_bar'] is not None, True)
+
+# capacity: two trades a day, one at a time
+rc_ = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1)
+rc_.go('09:55')
+ok('one open early position', len(rc_.r.shadow_early.st['open']) == 1)
+rc_.go('10:00', 5)
+eq('...and never a second while it is open', len(rc_.r.shadow_early.st['open']), 1)
+
+# premium hard stop
+rh_ = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1)
+rh_.go('09:55')
+rh_.ff.premium['*'] = dict(lp=300.0, bid=299.0, ask=301.0)
+rh_.go('09:58', 10)
+eq('a 25% premium drawdown closes the early position at the hard stop', early_recs(rh_) and early_recs(rh_)[0]['shadow']['kind'], 'stop')
+
+# force close
+rf_ = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1, THESIS_CONFIRM_BARS=999)
+rf_.go('09:55')
+rf_.ff.premium['*'] = dict(lp=420.0, bid=419.0, ask=421.0)
+rf_.go('15:00', 10)
+eq('an open early position is closed at 15:00', early_recs(rf_) and early_recs(rf_)[0]['shadow']['kind'], 'force_close')
+
+# restart and day boundary
+rr_ = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1)
+rr_.go('09:55')
+rr_.build()
+ok('an open early position survives a restart', len(rr_.r.shadow_early.st['open']) == 1)
+rr_.r.shadow_early.step(at('10:00', day='2026-10-23'))
+ab = [r for r in shadow_recs(rr_, arm='early_entry') if r['kind'].endswith('_abandoned')]
+eq('one left over from another day is recorded as abandoned, never priced', len(ab), 1)
+eq('...and the new day starts clean', (rr_.r.shadow_early.st['trades_today'], rr_.r.shadow_early.st['open']), (0, []))
+
+# safety: budget, failures, a catch-up after a pause, the switch, and the real trades
+rb_ = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1)
+rb_.budget.calls = rb_.c.MAX_API_CALLS_PER_DAY
+q0 = len(rb_.ff.q_calls)
+rb_.go('09:55')
+eq('with the API budget spent the arm makes no request and does not enter', (len(rb_.ff.q_calls), rb_.r.shadow_early.st['open']), (q0, []))
+rl_ = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1)
+rl_.go('09:40')
+rl_.go('09:57', 30)                                     # the service woke 150 s after the 09:55 bar closed
+eq('a bar noticed more than 2 minutes late is not entered on (the price has moved on)', rl_.r.shadow_early.st['open'], [])
+rx_ = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1)
+rx_.r.shadow_early.step = lambda now: (_ for _ in ()).throw(RuntimeError('boom'))
+rx_.go('10:35')
+ok('a failure inside the early arm does not stop a real entry', rx_.r.state['position'] is not None)
+ro_ = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1, SHADOW_EARLY_ENTRY_ENABLED=False)
+ro_.go('09:55')
+eq('with the switch off there is no arm and no file', (ro_.r.shadow_early, [f for f in os.listdir(ro_.dir) if 'early' in f]), (None, []))
+rA = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1)
+rB = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1, SHADOW_EARLY_ENTRY_ENABLED=False, SHADOW_STALE_ENABLED=False,
+         SHADOW_PROFIT_WAIT_ENABLED=False)
+for r_ in (rA, rB):
+    r_.go('09:55')
+    r_.go('10:35')
+    r_.ff.premium['*'] = dict(lp=520.0, bid=519.0, ask=521.0)
+    r_.go('10:40', 5)
+    r_.go('15:00', 10)
+eq('THE REAL TRADES ARE IDENTICAL with all three shadow arms on or off', key(rA), key(rB))
 
 # --- 8n. preflight ---
 rig = Rig(flat_tape(55800))

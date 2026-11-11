@@ -79,6 +79,8 @@ COOLDOWN_BARS_AFTER_LOSS = 6      # no re-entry for 30 min after a loss.
 LEVELS = ('PDH', 'PDL', 'ORH', 'ORL', 'DAYH', 'DAYL')
 LEVEL_PROX_PCT = 0.15             # close within 0.15% of the level.
                                   # ORIGIN: pre-registered in breakout_study.py
+COIL_GATE_ENABLED = True          # False = the coil is computed and REPORTED but does not gate an entry. The live
+                                  # strategy keeps it True; the early-entry shadow arm and research scripts turn it off.
 COIL_BARS = 6                     # 30 minutes
 COIL_RATIO_MAX = 0.812            # range6 / (ATR14 * sqrt(6)) must be <= this.
                                   # ORIGIN: bottom third of the pooled ratio over
@@ -142,6 +144,7 @@ SHADOW_STALE_ENABLED = True        # follow every trade the STALE rule closes as
 SHADOW_PROFIT_WAIT_ENABLED = True # a second shadow arm that follows EVERY entry: the stale / thesis-broken / trail rules
                                   # do not close it until it has been net profitable (replay: research/profit_wait_study.py)
 PROFIT_WAIT_MIN_NET_RS = 0.0      # 'profitable' = net P&L after round-trip costs above this, at a premium poll
+SHADOW_EARLY_ENTRY_ENABLED = True # a virtual copy of the strategy with the coil gate off (enters from 09:55, no compression needed)
 SHADOW_POLL_SECONDS = 60          # premium poll for a shadow (the real position polls every 20 s)
 OI_SOURCE = 'fyers'              # 'fyers' | 'nse'. Where the GATE reads its chain from. 'fyers' = the broker's option
                                   # chain for the series the bot actually TRADES (the next monthly on the nearest

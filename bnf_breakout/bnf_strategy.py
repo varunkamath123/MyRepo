@@ -270,8 +270,12 @@ def evaluate_entry(bars: dict, i: int, day: dict, state: dict, cfg=cfg_default) 
     direction = toward if cfg.DIRECTION == 'toward' else -toward
 
     cr = compression_ratio(H, L, i, cfg.COIL_BARS)
-    g['coil'] = (cr is not None and cr <= cfg.COIL_RATIO_MAX,
-                 'n/a' if cr is None else f'{cr:.3f}<={cfg.COIL_RATIO_MAX}')
+    if getattr(cfg, 'COIL_GATE_ENABLED', True):
+        g['coil'] = (cr is not None and cr <= cfg.COIL_RATIO_MAX,
+                     'n/a' if cr is None else f'{cr:.3f}<={cfg.COIL_RATIO_MAX}')
+    else:
+        # not gated: the number is still reported so a later review can see what the gate would have said
+        g['coil'] = (True, 'not gated (n/a)' if cr is None else f'not gated ({cr:.3f}; limit {cfg.COIL_RATIO_MAX})')
 
     if cfg.VOLUME_MODE == 'off':
         g['volume'] = (True, 'off')
