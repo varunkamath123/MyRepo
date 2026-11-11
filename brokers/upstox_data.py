@@ -126,6 +126,21 @@ def load_daily_ohlcv(instrument: str, bars: int = 200) -> pd.DataFrame:
     return df
 
 
+def get_ltp_dated(instrument: str) -> tuple[float, "datetime.date"]:
+    """(last price, IST date of the last trade). The date is how a run tells a live market from a holiday."""
+    key = INDEX_KEYS[instrument]
+    url = f"{_BASE}/market-quote/quotes?instrument_key={quote(key, safe='')}"
+    resp = requests.get(url, headers=_headers(), timeout=10)
+    if resp.status_code != 200:
+        raise RuntimeError(f"[UPSTOX] quotes error for {instrument}: {resp.text}")
+    data = resp.json()
+    if data.get("status") != "success":
+        raise RuntimeError(f"[UPSTOX] quotes failed for {instrument}: {data}")
+    q = list(data["data"].values())[0]
+    traded = datetime.fromtimestamp(int(q["last_trade_time"]) / 1000, IST).date()
+    return float(q["last_price"]), traded
+
+
 def get_ltp(instrument: str) -> float:
     """Return latest traded price of the index (used as futures proxy in paper mode)."""
     key = INDEX_KEYS[instrument]

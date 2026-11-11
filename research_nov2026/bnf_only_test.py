@@ -36,6 +36,7 @@ class FakeDate(_dt.date):
 pt.date = FakeDate
 real_df = pd.read_csv("/opt/kronos_bot/research/sweepU_BANKNIFTY_df.csv", parse_dates=["datetime"]).tail(150).reset_index(drop=True)
 SCEN = {"price": 0.0, "sig": ("NEUTRAL", 0.0, "kronos", 0.0, 0.0), "adx": 30.0, "st": "BEAR"}
+_real_get_entry_price = pt.get_entry_price
 pt.get_context     = lambda inst, bars=150: real_df
 pt.get_entry_price = lambda inst, ctx: (SCEN["price"], "stub")
 pt.get_signal      = lambda df, force_fallback=False: SCEN["sig"]
@@ -215,6 +216,36 @@ dec = [t for t in tr_new if t.exit_reason == "CONFIDENCE_DECAY"]
 check("under profit_only no CONFIDENCE_DECAY exit is red", all(t.pnl_inr >= 0 for t in dec), f"({len(dec)} decay exits)")
 dec_old = [t for t in tr_old if t.exit_reason == "CONFIDENCE_DECAY"]
 check("old config does fire decay at a loss (switch is live)", any(t.pnl_inr < 0 for t in dec_old), f"({sum(t.pnl_inr < 0 for t in dec_old)} red of {len(dec_old)})")
+
+print("T12: holiday guard -- a quote that did not trade today stops the run (Nov 10 2026 ran on stale data)")
+from datetime import datetime as _dtm, timezone as _tz, timedelta as _td
+today_ist = _dtm.now(_tz(_td(hours=5, minutes=30))).date()
+pt._UPSTOX_OK = True
+pt._upstox_ltp_dated = lambda inst: (59000.0, today_ist - _td(days=1))
+try:
+    _real_get_entry_price("BANKNIFTY", real_df); raised = False
+except pt.MarketClosed:
+    raised = True
+check("stale quote -> MarketClosed (no silent fallback to the last close)", raised)
+pt._upstox_ltp_dated = lambda inst: (59000.0, today_ist)
+check("quote traded today -> live price", _real_get_entry_price("BANKNIFTY", real_df) == (59000.0, "upstox_ltp"))
+pt._upstox_ltp_dated = lambda inst: (_ for _ in ()).throw(RuntimeError("api down"))
+check("API failure still falls back to the last close (unchanged behaviour)", _real_get_entry_price("BANKNIFTY", real_df)[1] == "last_close")
+reset(True)
+pt.get_entry_price = _real_get_entry_price
+pt._upstox_ltp_dated = lambda inst: (55300.0, today_ist - _td(days=1))
+SCEN.update(sig=NEUTRAL)
+with contextlib.redirect_stdout(io.StringIO()):
+    pt.cmd_daily_run(["BANKNIFTY"])
+st_ = pt._load_state()
+check("holiday run: open position untouched (no exit, no streak bump), nothing logged, no daily read",
+      "BANKNIFTY" in st_.positions and st_.positions["BANKNIFTY"].unsupported_streak == 0 and st_.realised_pnl == 0
+      and lines(pt.DAILY_READS_LOG) == [] and lines(pt.TRADES_LOG) == [])
+reset(False)
+SCEN.update(sig=SHORT50, adx=30.0, st="BEAR")
+with contextlib.redirect_stdout(io.StringIO()):
+    pt.cmd_daily_run(["BANKNIFTY"])
+check("holiday run with a qualifying read opens NO position", pt._load_state().positions == {})
 
 print()
 print("ALL PASSED" if all(results) else f"FAILURES: {results.count(False)} of {len(results)}")

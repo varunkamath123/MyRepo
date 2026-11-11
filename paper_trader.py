@@ -129,7 +129,7 @@ import logging
 import os
 import sys
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -147,7 +147,8 @@ from config import INSTRUMENTS
 
 # Live Upstox data (complete daily bars + LTP). Falls back to yfinance if unavailable.
 try:
-    from brokers.upstox_data import load_daily_ohlcv as _upstox_daily, get_ltp as _upstox_ltp
+    from brokers.upstox_data import (load_daily_ohlcv as _upstox_daily, get_ltp as _upstox_ltp,
+                                     get_ltp_dated as _upstox_ltp_dated)
     _UPSTOX_OK = True
 except Exception:
     _UPSTOX_OK = False
@@ -406,17 +407,29 @@ def get_context(instrument: str, bars: int = 150) -> pd.DataFrame:
     return df
 
 
+class MarketClosed(RuntimeError):
+    """The live quote is not from today (NSE holiday): there is nothing to trade or exit on."""
+
+
 def get_entry_price(instrument: str, context: pd.DataFrame) -> tuple[float, str]:
     """
     Return (price, source) for the same-day entry/exit fill.
     Prefers live Upstox LTP (~today's close during market hours);
     falls back to the last complete daily close.
+    Raises MarketClosed when the quote's last trade is not from today (IST): on the Nov 10 2026
+    holiday the cron run read a stale price as 'live', and a qualifying read would have opened
+    a paper position at it.
     """
     if _UPSTOX_OK:
         try:
-            return float(_upstox_ltp(instrument)), "upstox_ltp"
+            px, traded = _upstox_ltp_dated(instrument)
         except Exception as e:
             log.warning("[%s] LTP fetch failed (%s) — using last daily close", instrument, e)
+        else:
+            today_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+            if traded != today_ist:
+                raise MarketClosed(f"quote last traded {traded}, not {today_ist} -- market closed (holiday)")
+            return float(px), "upstox_ltp"
     return float(context["close"].iloc[-1]), "last_close"
 
 
@@ -715,6 +728,8 @@ def cmd_daily_run(instruments: list[str]):
             px[inst]  = price
             log.info("[%s] context=%d bars  last_close=%.1f  live=%.1f (%s)",
                      inst, len(df), float(df["close"].iloc[-1]), price, src)
+        except MarketClosed as e:
+            log.info("[%s] %s -- no run today", inst, e)
         except Exception as e:
             log.error("[%s] Data fetch failed: %s — skipping", inst, e)
 
