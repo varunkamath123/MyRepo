@@ -4,12 +4,17 @@
   python build_dataset.py --only NIFTY
 
 What is checked / flagged (columns in the output):
-  session_type  normal (starts 09:15, 36-38 bars) | short | special_hours (e.g. Diwali Muhurat) | weekend_special
+  post_close    bars stamped after 15:25 (frozen prints published after the close, seen in Apr-May 2025); never usable
+  frozen_close  since 2026-08-03 cash-market trading is continuous only until 15:15; 15:15 -> ~15:28 is a call-auction window with no volume and
+                no price movement, then one auction print (= the official close).  The index is frozen over that window, so the 15:15 bar is flat
+                and the 15:25 bar holds the auction jump.  Both bars are flagged and not usable; FUTURES keep trading through the window and are
+                the source of truth for anything near the close.
+  session_type  normal (starts 09:15, 36-38 regular bars) | short | special_hours (e.g. Diwali Muhurat) | weekend_special
   bad_ohlc      high < max(open, close, low), low > min(...), a price <= 0 or NaN
   flat          high == low (a bar with no price movement: a stale feed shows up as flat bars at fixed times)
   gap_before    the previous 10-minute slot of the session is missing
   outlier       |return| > 8 robust sd of that time slot
-  usable        normal session and not bad_ohlc   (flat / outlier bars stay usable, but see ret_clean_bp)
+  usable        normal session, not bad_ohlc, not post_close, not frozen_close   (outlier bars stay usable, see ret_clean_bp)
   ret_bp        within-session close-to-close return in basis points (NaN on a session's first bar or after a gap)
   ret_clean_bp  ret_bp with NaN wherever the bar or the previous bar is flat / bad / follows a gap (so a stale bar cannot fake a pattern)
 The result is cross-checked against Upstox's own daily candles (open, high, low, close per session)."""
@@ -42,8 +47,10 @@ def clean(raw: pd.DataFrame, daily: pd.DataFrame | None = None) -> tuple[pd.Data
     d = d.drop_duplicates("ts", keep="last").sort_values("ts").reset_index(drop=True)
     d["session"] = d["ts"].dt.normalize()
     d["slot"] = ((d["ts"].dt.hour * 60 + d["ts"].dt.minute) - OPEN_MIN) // 10
+    fm = d.groupby("session")["ts"].transform("min")
+    d["post_close"] = (d["slot"] > 37) & ((fm.dt.hour * 60 + fm.dt.minute) == OPEN_MIN)      # only in sessions that open at 09:15 (not Muhurat evenings)
 
-    s = d.groupby("session").agg(n=("ts", "size"), first=("ts", "min"))
+    s = d[~d["post_close"]].groupby("session").agg(n=("ts", "size"), first=("ts", "min"))
     s["first_min"] = s["first"].dt.hour * 60 + s["first"].dt.minute
     s["dow"] = s["first"].dt.dayofweek
     s["session_type"] = np.select([s["dow"] >= 5, s["first_min"] != OPEN_MIN, (s["n"] >= 36) & (s["n"] <= 38)],
@@ -60,16 +67,22 @@ def clean(raw: pd.DataFrame, daily: pd.DataFrame | None = None) -> tuple[pd.Data
     prev_flat = d.groupby("session")["flat"].shift(1).fillna(False).astype(bool)
     prev_bad = d.groupby("session")["bad_ohlc"].shift(1).fillna(False).astype(bool)
     d["ret_clean_bp"] = d["ret_bp"].where(~(d["flat"] | prev_flat | d["bad_ohlc"] | prev_bad | d["gap_before"]))
-    d["usable"] = (d["session_type"] == "normal") & ~d["bad_ohlc"]
+    frozen_sessions = d.loc[(d["slot"] == 36) & d["flat"] & ~d["post_close"], "session"]
+    d["frozen_close"] = d["session"].isin(frozen_sessions) & d["slot"].isin([36, 37])
+    d["ret_clean_bp"] = d["ret_clean_bp"].where(~d["frozen_close"])
+    d["usable"] = (d["session_type"] == "normal") & ~d["bad_ohlc"] & ~d["post_close"] & ~d["frozen_close"]
 
     rep["bars"] = int(len(d)); rep["sessions"] = int(d["session"].nunique())
     rep["first"] = str(d["ts"].iloc[0]); rep["last"] = str(d["ts"].iloc[-1])
     rep["session_types"] = {k: int(v) for k, v in s["session_type"].value_counts().items()}
     rep["short_sessions"] = [str(x.date()) + f" ({int(s.loc[x, 'n'])} bars)" for x in s.index[s["session_type"] == "short"]][:12]
     rep["special_sessions"] = [str(x.date()) + f" ({s.loc[x, 'session_type']}, {int(s.loc[x, 'n'])} bars)" for x in s.index[s["session_type"].isin(["special_hours", "weekend_special"])]][:12]
+    rep["post_close_bars"] = int(d["post_close"].sum())
+    rep["frozen_close_sessions"] = int(frozen_sessions.nunique())
+    rep["frozen_close_first_session"] = str(frozen_sessions.min().date()) if len(frozen_sessions) else None
     rep["bad_ohlc_bars"] = int(d["bad_ohlc"].sum()); rep["gap_bars"] = int(d["gap_before"].sum()); rep["outlier_bars"] = int(d["outlier"].sum())
     rep["zero_volume_share"] = float((d["v"] == 0).mean())
-    normal = d[d["session_type"] == "normal"]
+    normal = d[(d["session_type"] == "normal") & ~d["post_close"]]
     fr = normal.groupby("slot")["flat"].mean()
     rep["flat_bar_rate_overall"] = float(normal["flat"].mean())
     rep["flat_bar_slots"] = {f"{(OPEN_MIN + int(k) * 10) // 60:02d}:{(OPEN_MIN + int(k) * 10) % 60:02d}": round(float(v), 3) for k, v in fr[fr > 0.05].items()}
@@ -84,7 +97,7 @@ def clean(raw: pd.DataFrame, daily: pd.DataFrame | None = None) -> tuple[pd.Data
                         "worst": [f"{x.date()} {e:.2f}%" for x, e in err.sort_values(ascending=False).head(3).items()]}
         rep["daily_crosscheck"] = out
         rep["sessions_without_daily_bar"] = int(len(set(agg.index) - set(dd["session"])))
-    cols = ["ts", "session", "slot", "o", "h", "l", "c", "v", "session_type", "bad_ohlc", "flat", "gap_before", "outlier", "usable", "ret_bp", "ret_clean_bp"]
+    cols = ["ts", "session", "slot", "o", "h", "l", "c", "v", "session_type", "bad_ohlc", "flat", "gap_before", "outlier", "post_close", "frozen_close", "usable", "ret_bp", "ret_clean_bp"]
     return d[cols], rep
 
 

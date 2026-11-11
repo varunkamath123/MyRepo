@@ -83,8 +83,18 @@ check("bad OHLC flagged", int(d["bad_ohlc"].sum()) == 1 and bool(d[(d.session ==
 fl = d[(d.session == "2026-11-06") & (d.slot == 36)].iloc[0]
 nx = d[(d.session == "2026-11-06") & (d.slot == 37)].iloc[0]
 check("flat bar flagged; its return and the next bar's return are not 'clean'", fl["flat"] and np.isnan(fl["ret_clean_bp"]) and np.isnan(nx["ret_clean_bp"]) and not np.isnan(nx["ret_bp"]))
-check("usable = normal sessions without bad OHLC", int(d["usable"].sum()) == int(((d.session_type == "normal") & ~d.bad_ohlc).sum()) and not d[d.session_type == "short"]["usable"].any())
+check("usable = normal session, valid OHLC, not post-close, not in the frozen close window", int(d["usable"].sum()) == int(((d.session_type == "normal") & ~d.bad_ohlc & ~d.post_close & ~d.frozen_close).sum()) and not d[d.session_type == "short"]["usable"].any())
 check("first bar of a session has no return", d[d.slot == 0]["ret_bp"].isna().all() or d[(d.slot == 0) & (d.session_type == "normal")]["ret_bp"].isna().all())
+s7 = session("2026-11-09", n=40, seed=7)                                                          # 38 regular bars + two post-close prints
+s7.loc[36, ["o", "h", "l", "c"]] = s7.loc[35, "c"]                                                # frozen 15:15 bar ...
+s7.loc[37, "c"] = s7.loc[35, "c"] + 0.8; s7.loc[37, "h"] = s7.loc[37, "c"]                        # ... then the 15:25 bar carries the auction jump
+s7.loc[38:39, ["o", "h", "l", "c"]] = s7.loc[37, "c"]                                             # post-close prints
+d7, rep7 = B.clean(s7)
+check("post-close bars flagged, session still normal", int(d7["post_close"].sum()) == 2 and (d7["session_type"] == "normal").all() and not d7[d7.post_close]["usable"].any())
+check("frozen close window: slots 36-37 flagged, not usable, no clean return", d7[d7.slot.isin([36, 37])]["frozen_close"].all() and not d7[d7.slot.isin([36, 37])]["usable"].any()
+      and d7[d7.slot.isin([36, 37])]["ret_clean_bp"].isna().all(), f"({rep7['frozen_close_sessions']} session, first {rep7['frozen_close_first_session']})")
+check("bars before the window stay usable", d7[d7.slot <= 35]["usable"].all())
+check("an ordinary session has no frozen window", int(d[d.session == "2026-11-02"]["frozen_close"].sum()) == 0)
 dly = pd.DataFrame({"ts": [pd.Timestamp("2026-11-02"), pd.Timestamp("2026-11-03")], "o": [frames[0].o.iloc[0], frames[1].o.iloc[0] * 1.01],
                     "h": [frames[0].h.max(), frames[1].h.max()], "l": [frames[0].l.min(), frames[1].l.min()], "c": [frames[0].c.iloc[-1], frames[1].c.iloc[-1]]})
 _, rep2 = B.clean(raw, dly)
