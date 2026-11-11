@@ -27,3 +27,19 @@ Predictive power of the pre-registered signals (S1 net breakout breadth, S2 tren
   predictive (IC +0.2) but mostly proxy the volatility level.
 - Verdict: breadth / leader z-scores built from constituent PRICES add nothing to the index's own price. The index volume is zero in
   the spot feed, constituent VOLUME is the one input the index does not already contain: the next hypothesis (not yet run).
+
+## Study 2: constituent VOLUME breadth -> index direction (idx_build_long.py, idx_study2.py, idx_study2b.py; 14 years, 2012-2026)
+Pre-registered: signals A (volume-confirmed breakout breadth), B (heavyweight volume breakout), C (net up-volume thrust), Zv = mean of their z-scores;
+primary test = Zv vs the forward 5-day return; pass needs all of: IC interval above 0, positive in both halves, placebo p < 0.05, rule expectancy > 0
+and PF > 1.2 in both halves.
+
+Primary result: **no statistical edge established** on either index.
+- NIFTY: IC -0.009 [-0.08, +0.06] (p=0.31); both-sides rule +0.40%/trade overall but H1 +0.78% / H2 +0.05%.
+- BANKNIFTY: IC +0.053 [-0.01, +0.12] (placebo p=0.036); H1 +0.112 / H2 -0.001; rule H1 +1.18% / H2 -0.02%.
+- The volume-based signals are no better than the price-only breadth baselines. Whatever there was lived mostly in 2014-2020 and faded.
+
+Exploratory follow-up (study 2b, post hoc, 12 variants looked at): vs randomly timed trades with identical exits (500 circular-shift placebos), the
+long-only tail rule (Zv >= +1.5) shows timing alpha of +0.46% (NIFTY, p=0.028) and +0.68% (BANKNIFTY, p=0.010) per trade overall, same sign in both
+halves (H2 alpha +0.29% / +0.36%) but not significant in H2 alone (p=0.20 / 0.17, ~35 trades). The short side's alpha is gone in H2.
+Treat as a hypothesis for a forward shadow test, not an edge: ~6-8 trades a year per index, NIFTY and BANKNIFTY are not independent confirmations,
+and 12 looks put the Bonferroni bar at p < 0.004.
