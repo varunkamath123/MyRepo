@@ -192,7 +192,7 @@ exits. `research/earlier_entry_review.py` checked all 16 live trades with the sa
 existed for every trade; for the 10 profitable trades the earliest candidate beat the real trade in 2 of 10 (mean real
 Rs+2,047 vs earliest Rs+1,045); for the 6 losers in 3 of 6 (mean real Rs-1,236 vs earliest Rs+277). Across 269 earlier
 candidates: mean Rs+752, win rate 41%; same side as the real trade Rs+1,425, opposite side Rs-732. The live window was a
-+7.5% trend, so this is not evidence; the 2023-26 replay of the idea (open-break entries) averaged -0.059% a trade vs
++7.5% trend, so this is not evidence; the 422-session replay of the idea (open-break entries) averaged -0.059% a trade vs
 -0.101% for random.
 
 HOW TO READ IT. `bnf_shadow_<date>.jsonl`, records `early_entry_shadow` (and `_abandoned`). Tags: `coil_value` (None = the coil
