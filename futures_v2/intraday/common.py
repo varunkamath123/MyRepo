@@ -181,5 +181,5 @@ def merge_write(path: Path, df: pd.DataFrame) -> int:
 
 def load_clean(underlying: str, usable_only: bool = True) -> pd.DataFrame:
     """The validated 10-minute index bars written by build_dataset.py (ts index; ret_bp = within-session close-to-close return)."""
-    d = pd.read_csv(DATA / "clean" / f"index_10m_{underlying}.csv.gz", parse_dates=["ts"])
+    d = pd.read_csv(DATA / "clean" / f"index_10m_{underlying}.csv.gz", parse_dates=["ts", "session"])
     return d[d["usable"]].reset_index(drop=True) if usable_only else d
