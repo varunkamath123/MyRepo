@@ -15,6 +15,7 @@ What is checked / flagged (columns in the output):
   gap_before    the previous 10-minute slot of the session is missing
   outlier       |return| > 8 robust sd of that time slot
   usable        normal session, not bad_ohlc, not post_close, not frozen_close   (outlier bars stay usable, see ret_clean_bp)
+  gap_bp        on a session's first bar only: open vs the previous normal session's close, in basis points (the overnight move)
   ret_bp        within-session close-to-close return in basis points (NaN on a session's first bar or after a gap)
   ret_clean_bp  ret_bp with NaN wherever the bar or the previous bar is flat / bad / follows a gap (so a stale bar cannot fake a pattern)
 The result is cross-checked against Upstox's own daily candles (open, high, low, close per session)."""
@@ -57,6 +58,9 @@ def clean(raw: pd.DataFrame, daily: pd.DataFrame | None = None) -> tuple[pd.Data
                                   ["weekend_special", "special_hours", "normal"], default="short")
     d = d.merge(s[["session_type"]], left_on="session", right_index=True)
 
+    last_close = d[~d["post_close"]].groupby("session")["c"].last()                      # official close = last regular bar (auction print when frozen)
+    prev_close = last_close[s.index[s["session_type"] == "normal"]].shift(1)              # previous NORMAL session's close
+    d["gap_bp"] = np.where((d["slot"] == 0) & (d["session_type"] == "normal"), (d["o"] / d["session"].map(prev_close) - 1) * 1e4, np.nan)
     d["bad_ohlc"] = ~((d.h >= d[["o", "c", "l"]].max(axis=1)) & (d.l <= d[["o", "c", "h"]].min(axis=1)) & (d[["o", "h", "l", "c"]] > 0).all(axis=1))
     d["flat"] = (d.h == d.l)
     d["gap_before"] = (d.groupby("session")["slot"].diff() > 1)
@@ -97,7 +101,7 @@ def clean(raw: pd.DataFrame, daily: pd.DataFrame | None = None) -> tuple[pd.Data
                         "worst": [f"{x.date()} {e:.2f}%" for x, e in err.sort_values(ascending=False).head(3).items()]}
         rep["daily_crosscheck"] = out
         rep["sessions_without_daily_bar"] = int(len(set(agg.index) - set(dd["session"])))
-    cols = ["ts", "session", "slot", "o", "h", "l", "c", "v", "session_type", "bad_ohlc", "flat", "gap_before", "outlier", "post_close", "frozen_close", "usable", "ret_bp", "ret_clean_bp"]
+    cols = ["ts", "session", "slot", "o", "h", "l", "c", "v", "session_type", "bad_ohlc", "flat", "gap_before", "outlier", "post_close", "frozen_close", "usable", "gap_bp", "ret_bp", "ret_clean_bp"]
     return d[cols], rep
 
 

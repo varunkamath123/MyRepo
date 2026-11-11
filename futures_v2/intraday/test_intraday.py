@@ -84,6 +84,10 @@ fl = d[(d.session == "2026-11-06") & (d.slot == 36)].iloc[0]
 nx = d[(d.session == "2026-11-06") & (d.slot == 37)].iloc[0]
 check("flat bar flagged; its return and the next bar's return are not 'clean'", fl["flat"] and np.isnan(fl["ret_clean_bp"]) and np.isnan(nx["ret_clean_bp"]) and not np.isnan(nx["ret_bp"]))
 check("usable = normal session, valid OHLC, not post-close, not in the frozen close window", int(d["usable"].sum()) == int(((d.session_type == "normal") & ~d.bad_ohlc & ~d.post_close & ~d.frozen_close).sum()) and not d[d.session_type == "short"]["usable"].any())
+g = d[(d.slot == 0) & (d.session_type == "normal")].set_index("session")["gap_bp"]
+exp_gap = (frames[1].o.iloc[0] / frames[0].c.iloc[-1] - 1) * 1e4
+check("overnight gap = first open vs previous normal session's last close; none for the first session", np.isnan(g.loc["2026-11-02"]) and abs(g.loc["2026-11-03"] - exp_gap) < 1e-6, f"({g.loc['2026-11-03']:+.1f} bp)")
+check("gap_bp only on session-opening bars", d[d.slot > 0]["gap_bp"].isna().all())
 check("first bar of a session has no return", d[d.slot == 0]["ret_bp"].isna().all() or d[(d.slot == 0) & (d.session_type == "normal")]["ret_bp"].isna().all())
 s7 = session("2026-11-09", n=40, seed=7)                                                          # 38 regular bars + two post-close prints
 s7.loc[36, ["o", "h", "l", "c"]] = s7.loc[35, "c"]                                                # frozen 15:15 bar ...
