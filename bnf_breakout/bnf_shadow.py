@@ -2,6 +2,8 @@
 """Shadow arms: forward, virtual "what if" versions of the exit rules, recorded beside the real trade.
 
 ARMS
+  EarlyEntryShadow  (a different kind of arm: it enters on its own) the strategy WITHOUT the coil gate, tracked
+                    forward. Question: would entering earlier / without waiting for compression have done better?
   StaleShadow       follows every trade the STALE rule closes, as if it had stayed open (all the OTHER
                     rules still apply). Question: is the stale rule saving money or costing it?
   ProfitWaitShadow  follows EVERY entry from the moment it opens. While the position has not yet been
@@ -328,3 +330,236 @@ def _jsonable(o):
     except Exception:
         pass
     return str(o)
+
+
+class EarlyEntryShadow:
+    """FORWARD TEST of "enter without waiting for the coil".
+
+    A virtual copy of the strategy with ONE difference: the coil gate (COIL_GATE_ENABLED) is switched off, so
+    it can enter from the first allowed bar (09:55) instead of ~10:30 and does not need price to compress. Every
+    other gate (window, regime, level), the direction rule, the exits (stale, thesis-broken, trail, stop, target,
+    15:00), the one-position-at-a-time rule, the two-trades-a-day cap and the 30-minute cooldown after a loss are the
+    live strategy's. One lot, entered at the ask, exited at the bid, same costs.
+
+    Independent of the real position: it enters whether or not a real position is open, and records whether one was.
+    Review by comparing its per-session total with the real strategy's over the same sessions
+    (research/payoff_review.py). The OI gate is not applied.
+
+    Same safety rules as the other arms: it places no order; its requests are non-essential (refused first past the
+    API budget); the runner wraps every call; own state file. It fetches bars only when it has a position or may
+    enter, and prices options with its own quote (never Broker.resolve_option, whose probes are essential).
+    """
+    ARM = 'early_entry'
+    KIND = 'early_entry_shadow'
+    STATE = 'shadow_early_state.json'
+
+    def __init__(self, broker, c=cfg, state_dir: str | None = None, log_dir: str | None = None, append=None,
+                 day_fn=None, ctx_fn=None, real_fn=None, logger=None):
+        self.b, self.c, self.log = broker, c, logger
+        self.state_dir = state_dir or c.STATE_DIR
+        self.log_dir = log_dir or os.path.join(self.state_dir, 'logs')
+        self._append = append
+        self._day = day_fn or (lambda: datetime.now(bnf_data.IST).strftime('%Y-%m-%d'))
+        self._ctx = ctx_fn or (lambda: None)
+        self._real_open = real_fn or (lambda: False)
+        ns = types.SimpleNamespace(**{k: getattr(c, k) for k in dir(c) if k.isupper()})
+        ns.COIL_GATE_ENABLED = False
+        ns.OI_GATE_ENABLED = False
+        self.cfg_early = ns
+        self.st = dict(day=None, last_idx=-1, trades_today=0, last_loss_bar=None, open=[])
+        self.calls = 0
+        self.closed_today = 0
+        self._warned = 0.0
+        self._load()
+
+    # -- persistence ---------------------------------------------------------
+    @property
+    def _path(self):
+        return os.path.join(self.state_dir, self.STATE)
+
+    def _load(self):
+        try:
+            with open(self._path, encoding='utf-8') as fh:
+                self.st = json.load(fh)
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            os.makedirs(self.state_dir, exist_ok=True)
+            tmp = self._path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(self.st, fh, default=_jsonable)
+            os.replace(tmp, self._path)
+        except Exception as e:
+            self._say('warning', f'[SHADOW:{self.ARM}] could not save state: {e}')
+
+    def _say(self, level, msg):
+        if self.log:
+            getattr(self.log, level)(msg)
+
+    def active(self) -> bool:
+        return bool(self.st.get('open'))
+
+    def status(self) -> dict:
+        return dict(open=len(self.st.get('open', [])), trades_today=self.st.get('trades_today', 0),
+                    closed_today=self.closed_today, calls=self.calls)
+
+    # -- one pass --------------------------------------------------------------
+    def step(self, now: datetime):
+        today = now.strftime('%Y-%m-%d')
+        if self.st.get('day') != today:
+            for p in list(self.st.get('open', [])):
+                self._abandon(p)
+            self.st = dict(day=today, last_idx=-1, trades_today=0, last_loss_bar=None, open=[])
+            self.closed_today = 0
+            self._save()
+        try:
+            self._poll(now)
+            self._bars(now)
+        except Exception as e:
+            import time as _t
+            if _t.time() - self._warned > 600:
+                self._warned = _t.time()
+                self._say('warning', f'[SHADOW:{self.ARM}] {e}')
+
+    def _poll(self, now: datetime):
+        hhmm = now.strftime('%H:%M')
+        for p in list(self.st['open']):
+            if hhmm >= self.c.FORCE_CLOSE:
+                self._close(now, p, dict(kind='force_close', reason=f'end of day {self.c.FORCE_CLOSE}'))
+                continue
+            epoch = now.timestamp()
+            if epoch - p['last_poll'] < self.c.SHADOW_POLL_SECONDS:
+                continue
+            p['last_poll'] = epoch
+            self.calls += 1
+            q, _ = self.b.quote(p['symbol'], essential=False)
+            if q is None:
+                continue
+            mark = q['bid'] if q.get('bid') else q['ltp'] * (1 - self.c.SLIPPAGE_PCT)
+            pct = (mark - p['entry_premium']) / p['entry_premium']
+            p['last_mark'] = mark
+            p['polls'] += 1
+            p['prem_best'] = max(p['prem_best'], pct)
+            p['prem_worst'] = min(p['prem_worst'], pct)
+            dec = S.check_premium(p['pos'], pct, self.c)
+            if dec:
+                self._close(now, p, dec, q)
+        self._save()
+
+    def _bars(self, now: datetime):
+        secs = (now.hour * 3600 + now.minute * 60 + now.second) - (9 * 3600 + 15 * 60) - 2
+        closed_idx = secs // (self.c.BAR_MINUTES * 60) - 1
+        if closed_idx <= self.st['last_idx']:
+            return
+        hhmm = now.strftime('%H:%M')
+        in_window = self.c.ENTRY_START <= hhmm <= S._hhmm_add(self.c.ENTRY_END, self.c.BAR_MINUTES)
+        can_enter = (not self.st['open'] and in_window and self.st['trades_today'] < self.c.MAX_TRADES_PER_DAY)
+        if not (self.st['open'] or can_enter):
+            self.st['last_idx'] = closed_idx
+            self._save()
+            return
+        self.calls += 1
+        bars, _ = self.b.get_bars(self._day(), now, essential=False)
+        if bars is None or not bnf_data.bars_are_contiguous(bars['T'], self.c.BAR_MINUTES):
+            return
+        last = len(bars['T']) - 1
+        for idx in range(self.st['last_idx'] + 1, last + 1):
+            view = {k: v[:idx + 1] for k, v in bars.items()}
+            if self.st['open']:
+                for p in list(self.st['open']):
+                    dec = S.on_bar_exit(p['pos'], view, idx, self.c, replay=False)
+                    if dec:
+                        self._close(now, p, dec, idx=idx)
+            elif idx == last and secs - (idx + 1) * self.c.BAR_MINUTES * 60 <= 120:
+                self._maybe_enter(now, view, idx)
+            self.st['last_idx'] = idx
+        self._save()
+
+    # -- entering ----------------------------------------------------------------
+    def _maybe_enter(self, now: datetime, view: dict, idx: int):
+        ctx = self._ctx()
+        if not ctx or ctx.get('stale') or self.st['trades_today'] >= self.c.MAX_TRADES_PER_DAY:
+            return
+        d = S.evaluate_entry(view, idx, ctx, dict(trades_today=self.st['trades_today'], open_positions=0,
+                                                  last_loss_bar=self.st['last_loss_bar']), self.cfg_early)
+        if not d.enter:
+            return
+        import bnf_broker
+        spot = float(view['C'][idx])
+        today = now.date()
+        e = getattr(self.b, '_expiry', None)
+        exp = e[1] if e and e[0] == today else (bnf_broker.expiry_candidates(today, self.c) or [None])[0]
+        if exp is None:
+            return
+        strike = bnf_broker.atm_strike(spot, self.c)
+        sym = bnf_broker.option_symbol(strike, d.direction, exp, self.c)
+        self.calls += 1
+        q, st = self.b.quote(sym, essential=False)
+        if q is None:
+            return
+        fill = q['ask'] if q.get('ask') else q['ltp'] * (1 + self.c.SLIPPAGE_PCT)
+        pos = S.new_position(d, fill, 1)
+        cr = S.compression_ratio(view['H'], view['L'], idx, self.c.COIL_BARS)
+        p = dict(symbol=sym, opt='CE' if d.direction > 0 else 'PE', strike=strike, expiry=str(exp), lots=1,
+                 entry_time=now.isoformat(timespec='seconds'), entry_bar=idx, entry_premium=fill, pos=pos,
+                 gates={k: [bool(ok), det] for k, (ok, det) in d.gates.items()},
+                 coil_value=None if cr is None else round(cr, 3),
+                 coil_would_pass=bool(cr is not None and cr <= self.c.COIL_RATIO_MAX),
+                 real_position_open=bool(self._real_open()), last_poll=0.0, last_mark=None, polls=0,
+                 prem_best=0.0, prem_worst=0.0)
+        self.st['trades_today'] += 1
+        self.st['open'].append(p)
+        self._save()
+        self._say('info', f"[SHADOW:{self.ARM}] ENTER {p['opt']} {sym} @ {fill:.2f} (coil "
+                          f"{'n/a' if cr is None else format(cr, '.3f')}, coil gate would have passed: {p['coil_would_pass']})")
+
+    # -- closing -------------------------------------------------------------------
+    def _close(self, now: datetime, p: dict, dec: dict, q=None, idx=None):
+        late = now.strftime('%H:%M') >= '15:25'
+        priced = q is not None
+        if q is None:
+            self.calls += 1
+            q, _ = self.b.quote(p['symbol'], essential=False)
+            priced = q is not None
+        if priced:
+            fill = q['bid'] if q.get('bid') else q['ltp'] * (1 - self.c.SLIPPAGE_PCT)
+        elif p.get('last_mark') and late:
+            fill = p['last_mark']
+        else:
+            return
+        qty = p['lots'] * self.c.LOT_SIZE
+        gross = (fill - p['entry_premium']) * qty
+        cost = S.round_trip_cost(p['entry_premium'], fill, p['lots'], self.c)
+        net = gross - cost
+        held = (now - datetime.fromisoformat(p['entry_time'])).total_seconds() / 60
+        th = p['pos']['thesis']
+        rec = dict(kind=self.KIND, arm=self.ARM, symbol=p['symbol'], opt=p['opt'], strike=p['strike'], lots=p['lots'],
+                   entry_time=p['entry_time'], entry_premium=round(p['entry_premium'], 2), entry_bar=p['entry_bar'],
+                   level=th.get('level'), level_value=th.get('level_value'), coil_value=p['coil_value'],
+                   coil_would_pass=p['coil_would_pass'], real_position_open_at_entry=p['real_position_open'],
+                   shadow=dict(exit_time=now.isoformat(timespec='seconds'), kind=dec['kind'], reason=dec['reason'],
+                               exit_priced=priced, exit_premium=round(fill, 2),
+                               pnl_pct=round((fill / p['entry_premium'] - 1) * 100, 2),
+                               max_pnl_pct=round(p['prem_best'] * 100, 2), min_pnl_pct=round(p['prem_worst'] * 100, 2),
+                               held_min=round(held, 1), gross=round(gross, 2), costs=round(cost, 2),
+                               pnl_net=round(net, 2)))
+        if self._append:
+            self._append(f'bnf_shadow_{self._day()}.jsonl', rec)
+        self.st['open'].remove(p)
+        self.closed_today += 1
+        if net < 0:
+            self.st['last_loss_bar'] = idx if idx is not None else self.st['last_idx']
+        self._save()
+        self._say('info', f"[SHADOW:{self.ARM}] {p['symbol']} {dec['kind']} at {fill:.2f} (Rs{net:+,.0f})")
+
+    def _abandon(self, p: dict):
+        if self._append:
+            self._append(f'bnf_shadow_{p["entry_time"][:10]}.jsonl', dict(
+                kind=self.KIND + '_abandoned', arm=self.ARM, symbol=p['symbol'], entry_time=p['entry_time'],
+                note='carried across a day boundary; not priced'))
+        try:
+            self.st['open'].remove(p)
+        except ValueError:
+            pass

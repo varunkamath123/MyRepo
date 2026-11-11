@@ -71,7 +71,7 @@ def _atomic_write(path: str, obj) -> None:
 class Runner:
     def __init__(self, broker, c=cfg, clock=None, sleep=time.sleep, history=None,
                  state_dir=None, log_dir=None, logger=None, is_holiday=None,
-                 reload_client=None, chain=None, pcr_hist=None, chain_log=None, shadow=None, shadow_pw=None):
+                 reload_client=None, chain=None, pcr_hist=None, chain_log=None, shadow=None, shadow_pw=None, shadow_early=None):
         self.b, self.c, self.sleep = broker, c, sleep
         self.clock = clock or (lambda: datetime.now(IST))
         self.state_dir = state_dir or c.STATE_DIR
@@ -94,6 +94,12 @@ class Runner:
             bnf_shadow.ProfitWaitShadow(broker, c, self.state_dir, self.log_dir, append=self._append,
                                         day_fn=lambda: self.day, logger=self.log)
             if getattr(c, 'SHADOW_PROFIT_WAIT_ENABLED', False) and broker is not None else None)
+        self.shadow_early = shadow_early if shadow_early is not None else (
+            bnf_shadow.EarlyEntryShadow(broker, c, self.state_dir, self.log_dir, append=self._append,
+                                        day_fn=lambda: self.day, ctx_fn=lambda: self.ctx,
+                                        real_fn=lambda: bool(self.state and self.state.get('position')),
+                                        logger=self.log)
+            if getattr(c, 'SHADOW_EARLY_ENTRY_ENABLED', False) and broker is not None else None)
         self.ctx = None
         self.day = None
         self.state = None
@@ -279,7 +285,7 @@ class Runner:
         now = self.clock()
         try:
             secs = self._step(now)
-            if any(a is not None and a.active() for a in (self.shadow, self.shadow_pw)):
+            if any(a is not None and a.active() for a in (self.shadow, self.shadow_pw, self.shadow_early)):
                 secs = min(secs, float(self.c.SHADOW_POLL_SECONDS))      # wake in time to poll a shadow
             return secs
         finally:
@@ -317,7 +323,7 @@ class Runner:
         secs = self._manage(now, pos) if pos else self._scan(now)
         # The shadow arms run AFTER the real position has been handled, so a real exit is on record
         # before a shadow that closes in the same step is compared with it. Never allowed to affect it.
-        for arm in (self.shadow, self.shadow_pw):
+        for arm in (self.shadow, self.shadow_pw, self.shadow_early):
             if arm is not None:
                 try:
                     arm.step(now)
@@ -559,6 +565,7 @@ class Runner:
                 chain_log=(self.chain_log.status() if self.chain_log is not None else None),
                 shadow=(self.shadow.status() if self.shadow is not None else None),
                 shadow_pw=(self.shadow_pw.status() if self.shadow_pw is not None else None),
+                shadow_early=(self.shadow_early.status() if self.shadow_early is not None else None),
                 api_by_label=getattr(bb, 'by_label', None)))
         except Exception:
             pass

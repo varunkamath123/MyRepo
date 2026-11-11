@@ -87,6 +87,47 @@ def main(logs, since):
               f'worst single shadow Rs{min(r["shadow"]["pnl_net"] for r in rs):+,.0f}; '
               f'halves Rs{d[:hh].sum():+,.0f} / Rs{d[hh:].sum():+,.0f}')
 
+    # the early-entry arm: a separate strategy variant (no coil gate), judged against the real strategy per session
+    ee = []
+    for f in sorted(glob.glob(os.path.join(logs, 'bnf_shadow_2*.jsonl'))):
+        for ln in open(f, encoding='utf-8', errors='ignore'):
+            try:
+                r = json.loads(ln)
+            except Exception:
+                continue
+            if r.get('kind') == 'early_entry_shadow':
+                ee.append(r)
+    if ee:
+        e = np.array([r['shadow']['pnl_net'] for r in ee], float)
+        eb = [rng.choice(e, len(e)).mean() for _ in range(3000)]
+        print(f'\n  EARLY-ENTRY SHADOW (strategy without the coil gate): {len(e)} trades, net Rs{e.sum():+,.0f}, '
+              f'win rate {np.mean(e > 0) * 100:.0f}%, expectancy Rs{e.mean():+,.0f} per trade '
+              f'(bootstrap 95% [{np.percentile(eb, 2.5):+,.0f}, {np.percentile(eb, 97.5):+,.0f}])')
+        for lab, sel in (('before the coil can be computed (< ~10:30)', [r for r in ee if r.get('coil_value') is None]),
+                         ('coil computable, gate would have PASSED (the live strategy would also have entered)',
+                          [r for r in ee if r.get('coil_value') is not None and r.get('coil_would_pass')]),
+                         ('coil computable, gate would have REFUSED (trending / not compressed)',
+                          [r for r in ee if r.get('coil_value') is not None and not r.get('coil_would_pass')])):
+            if sel:
+                v = np.array([r['shadow']['pnl_net'] for r in sel], float)
+                print(f'      {lab}: n={len(v)} net Rs{v.sum():+,.0f} mean Rs{v.mean():+,.0f} win {np.mean(v > 0) * 100:.0f}%')
+        days = sorted({r['entry_time'][:10] for r in ee})
+        d0 = days[0]
+        real_by = {}
+        for t in T:
+            real_by[t['entry_time'][:10]] = real_by.get(t['entry_time'][:10], 0.0) + t['pnl_net']
+        early_by = {}
+        for r in ee:
+            early_by[r['entry_time'][:10]] = early_by.get(r['entry_time'][:10], 0.0) + r['shadow']['pnl_net']
+        sessions = sorted(set(early_by) | {d for d in real_by if d >= d0})
+        diff = np.array([early_by.get(d, 0.0) - real_by.get(d, 0.0) for d in sessions], float)
+        if len(diff) >= 3:
+            bsd = [rng.choice(diff, len(diff)).mean() for _ in range(3000)]
+            hh = len(diff) // 2
+            print(f'      per-session, early minus real over {len(diff)} sessions: mean Rs{diff.mean():+,.0f} '
+                  f'(bootstrap 95% [{np.percentile(bsd, 2.5):+,.0f}, {np.percentile(bsd, 97.5):+,.0f}]); '
+                  f'halves Rs{diff[:hh].mean():+,.0f} / Rs{diff[hh:].mean():+,.0f}')
+
 
 if __name__ == '__main__':
     a = [v for v in sys.argv[1:] if not v.startswith('--')]
