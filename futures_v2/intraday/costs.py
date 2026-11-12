@@ -4,8 +4,8 @@
   python costs.py --slip 0.5      override per-side slippage in index points (replace with the spread measured by depth_recorder.py)
 
 Statutory rates and the broker's brokerage are DEFAULTS to verify against a recent contract note; they sit in one dataclass so a change is
-one line.  Slippage is the least known input: a market order pays about half the quoted spread per side plus any impact; the depth recorder
-measures the spread, after which the default below should be replaced.
+one line.  Slippage is the least known input: a market order pays about half the quoted spread per side plus any impact. The first full day of depth
+recordings gave a median spread of 4.5 points (NIFTY future) and 15.0 points (BANKNIFTY future), about 2.3x and 2.5x the placeholders first used.
 
 Break-even logic.  A signal s with unit variance and correlation IC with the forward return r (sd sigma_h over the holding period) earns
 E[sign(s) * r] = IC * sigma_h * m  when trading every signal (m = E|s| = 0.798 for a Gaussian s), or IC * sigma_h * m_k when trading only
@@ -30,7 +30,9 @@ class CostModel:
     sebi_pct: float = 0.0001                # % of turnover each side (Rs10 per crore)
     stamp_buy_pct: float = 0.002            # % of buy turnover
     gst_pct: float = 18.0                   # on brokerage + exchange + SEBI fees
-    slip_pts: dict = field(default_factory=lambda: {"NIFTY": 1.0, "BANKNIFTY": 3.0})   # per side, index points (conservative placeholder)
+    # per side, index points: HALF the median top-of-book spread of the near-month future measured by depth_recorder.py on Nov 12 2026
+    # (NIFTY 4.5 pts, BANKNIFTY 15.0 pts; one session, 1,495 snapshots). A market order pays about half the spread per side. Re-measure as days accumulate.
+    slip_pts: dict = field(default_factory=lambda: {"NIFTY": 2.25, "BANKNIFTY": 7.5})
 
 
 def round_trip(m: CostModel, underlying: str, price: float, lot: int, lots: int = 1, slip_pts: float | None = None) -> dict:
