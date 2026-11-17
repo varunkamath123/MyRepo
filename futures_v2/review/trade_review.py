@@ -116,6 +116,9 @@ def section_stock_book():
     print(f"\n  longs: n={len(L)}, mean return {L.ret.mean():+.2f}%, mean vs NIFTY {L.hedged.mean():+.2f}%, winners {int((L.ret > 0).sum())}/{len(L)}")
     print(f"  entry price vs that day's official close: mean {L.gap.mean():+.3f}%, median {L.gap.median():+.3f}%, range {L.gap.min():+.2f}% .. {L.gap.max():+.2f}% (n={int(L.gap.notna().sum())}); "
           f"for a long a NEGATIVE number means the 15:25 print was below the close (a better fill than the research's close convention)")
+    L = L.assign(ret_close=(L.px / (L.entry_px / (1 + L.gap / 100)) - 1) * 100)
+    print(f"  restated as if filled at the official close of the entry day (decide ~15:25, fill in the closing auction): mean {L.ret_close.mean():+.2f}% vs booked {L.ret.mean():+.2f}%"
+          f"  -> the booked paper entries are {L.ret.mean() - L.ret_close.mean():+.2f}% per trade better than a realistic close fill")
     print("  by entry day (cohort):  " + " | ".join(f"{d}: n={len(g)} mean {g.ret.mean():+.2f}% (vs NIFTY {g.hedged.mean():+.2f}%)" for d, g in L.groupby("entry")))
     print("  by sector:              " + " | ".join(f"{s}: n={len(g)} mean {g.ret.mean():+.2f}%" for s, g in L.groupby("sector")))
     print("  by Kronos read:         " + " | ".join(f"{k}: n={len(g)} mean {g.ret.mean():+.2f}%" for k, g in L.groupby("kdir")))
