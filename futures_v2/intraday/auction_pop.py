@@ -30,19 +30,19 @@ for u in uni:
         if pre.empty or last.empty or g.hm.min() != "09:15":
             continue
         px, close = float(pre.c.iloc[-1]), float(last.c.iloc[-1]); cum = float(pre.v.sum())
-        rows.append(dict(sym=u["symbol"], day=day, px=px, close=close, pop=(close / px - 1) * 100, flagged=bool(px > hi20[day] and cum * 1.03 / av20[day] >= 1.5),
+        rows.append(dict(sym=u["symbol"], day=day, px=px, close=close, jump=(close / px - 1) * 100, flagged=bool(px > hi20[day] and cum * 1.03 / av20[day] >= 1.5),
                          sig_close=bool(close > hi20[day] and float(dly.loc[day, "v"]) / av20[day] >= 1.5), above=bool(px > hi20[day]), volpct_after=float(g[g.hm >= "15:15"].v.sum() / g.v.sum() * 100)))
 R = pd.DataFrame(rows)
 print(f"{R.day.nunique()} sessions x {R.sym.nunique()} stocks = {len(R)} stock-days since {AUC.date()}")
 print(f"\n  {'group':<58}{'n':>6}{'mean pop%':>10}{'median%':>9}{'% up':>6}{'sd%':>7}")
-for lab, m in (("ALL stock-days (baseline: 15:14 price -> official close)", R.pop.notna()), ("price above the prior-20d high at 15:14 (any volume)", R.above),
+for lab, m in (("ALL stock-days (baseline: 15:14 price -> official close)", R.jump.notna()), ("price above the prior-20d high at 15:14 (any volume)", R.above),
                ("FLAGGED at 15:14 (what the live book sees)", R.flagged), ("official-close breakout signals (the research definition, hindsight)", R.sig_close),
                ("flagged at 15:14 AND still a signal at the close", R.flagged & R.sig_close), ("flagged at 15:14 but NOT a signal at the close", R.flagged & ~R.sig_close)):
     g = R[m]
     if len(g) >= 3:
-        print(f"  {lab:<58}{len(g):>6}{g.pop.mean():>+10.3f}{g.pop.median():>+9.3f}{(g.pop > 0).mean()*100:>6.0f}{g.pop.std():>7.2f}")
+        print(f"  {lab:<58}{len(g):>6}{g.jump.mean():>+10.3f}{g.jump.median():>+9.3f}{(g.jump > 0).mean()*100:>6.0f}{g.jump.std():>7.2f}")
 print(f"\n  share of the day's volume that prints after 15:15 (the auction): mean {R.volpct_after.mean():.1f}%")
 F = R[R.flagged]
 if len(F):
-    se = F.pop.std() / np.sqrt(len(F)); print(f"  flagged: mean pop {F.pop.mean():+.3f}% +/- {1.96*se:.3f} (95% interval)")
-    print("  by month: " + "  ".join(f"{k}: n={len(g)} {g.pop.mean():+.2f}%" for k, g in F.groupby(F.day.dt.to_period('M'))))
+    se = F.jump.std() / np.sqrt(len(F)); print(f"  flagged: mean pop {F.jump.mean():+.3f}% +/- {1.96*se:.3f} (95% interval)")
+    print("  by month: " + "  ".join(f"{k}: n={len(g)} {g.jump.mean():+.2f}%" for k, g in F.groupby(F.day.dt.to_period('M'))))
