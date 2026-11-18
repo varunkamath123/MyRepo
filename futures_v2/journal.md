@@ -17,7 +17,7 @@ Edge = net expectancy above break-even after costs (win% x avg win > loss% x avg
 | H7 | Stock breakout longs have positive expectancy after costs | 0 closed; 10 open +0.52% mean but +0.04% after stripping NIFTY | need >= 30 closed signal-book trades, both halves | open |
 | H8 | The 15:25 paper fill is realistic | NO: entry price (15:15 print) was below that day's official close on 10 of 10 entries, mean -0.48% (range -0.09..-1.31%). A real closing-auction fill is the close | decision needed: book fills at the official close (decide 15:25, fill ~15:31) | LEARNED (10/10) |
 | H9 | Stock entries are clustered, so trade count overstates evidence | Nov 11: 7 entries on one day; banks/fin +2.2% avg, autos -2.2%: ~3 sector bets, not 7 | judge by cohort / sector-adjusted results | SUGGESTED |
-| H10 | The short side stays negative | short shadow: 0 closed | revisit at 30 closed | open |
+| H10 | The short side stays negative | short shadow: 0 closed live; history: breakdown shorts -1.31%/trade, and 5 reversal-short rules on failed breakouts (below the breakout level, >=1 ATR down, stop-and-reverse, red on day 5, down >3% on day 5) ALL lost -1.1..-2.5% per short trade (PF 0.38-0.61, both halves negative, also after hedging NIFTY) and made the combined long+short worse by 0.1-1.1% per signal | revisit at 30 closed | open |
 | H11 | NIFTY > 200-DMA filter helps the capital book | NIFTY has been above it throughout | cannot be tested until it falls below | UNKNOWN |
 | H12 | Cutting breakout losers earlier would pay | NO as a blanket rule: 5 variants all lowered expectancy (+1.06% live rules vs +0.53..+0.94%). Conditional hint (post hoc, new look): longs down >3% on day 5 finished +8% win / -4.6% mean / 79% stopped (n=48 of 509); those down 0-1% finished +0.91% | pre-register "exit if down >3% on day 5" and judge it on the live cohort (day-5 return is derivable from daily candles) before touching the rules | open |
 
@@ -38,3 +38,7 @@ of reads: the opposite (contrarian at 5 days, ~neutral vs the 20-day trend). The
 HDFCLIFE 1.9%, INDIGO and M&M 3.2%. On 3 years of NIFTY 50 breakouts every earlier-cut variant lowered expectancy because the edge lives in a fat right tail (42% win, avg win +8.2% vs avg loss -4.2%):
 tighter exits raise the payoff but drop the win rate faster. A trade down >3% on day 5 (like MARUTI) usually does stop out (79%), but only 9% of trades look like that: worth ~+0.05% per trade, not
 enough to rewrite the rules on a 5-day sample. Tracked as H12.
+
+**Nov 18, "we could have shorted the losers".** Tested five reversal rules on 582 NIFTY 50 breakout signals over 3 years: every one loses (short-leg win rate 14-32%, expectancy -1.1% to -2.5%
+per trade, negative in both halves and after hedging NIFTY). Failed breakouts in large caps tend to bounce and take out the short's stop; stocks down >3% on day 5 (MARUTI-like) are the worst shorts
+(14% win). The long's own result at those points (-0.6% to -5.8%) is bad, but turning it into a short made it worse. Short shadow ledger keeps collecting forward evidence.
