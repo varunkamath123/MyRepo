@@ -19,6 +19,7 @@ Edge = net expectancy above break-even after costs (win% x avg win > loss% x avg
 | H9 | Stock entries are clustered, so trade count overstates evidence | Nov 11: 7 entries on one day; banks/fin +2.2% avg, autos -2.2%: ~3 sector bets, not 7 | judge by cohort / sector-adjusted results | SUGGESTED |
 | H10 | The short side stays negative | short shadow: 0 closed | revisit at 30 closed | open |
 | H11 | NIFTY > 200-DMA filter helps the capital book | NIFTY has been above it throughout | cannot be tested until it falls below | UNKNOWN |
+| H12 | Cutting breakout losers earlier would pay | NO as a blanket rule: 5 variants all lowered expectancy (+1.06% live rules vs +0.53..+0.94%). Conditional hint (post hoc, new look): longs down >3% on day 5 finished +8% win / -4.6% mean / 79% stopped (n=48 of 509); those down 0-1% finished +0.91% | pre-register "exit if down >3% on day 5" and judge it on the live cohort (day-5 return is derivable from daily candles) before touching the rules | open |
 
 ## Lessons log
 **Nov 13 short, closed Nov 16 (ST_FLIP, -11,173).** Entered with SuperTrend BULL (allowed since the gates are off), so the SuperTrend-flip exit fired at the next run:
@@ -32,3 +33,8 @@ longs historically did better (right direction 47-69%, mean +0.3..+0.9%) but mos
 of reads: the opposite (contrarian at 5 days, ~neutral vs the 20-day trend). The live sequence is the exception.
 
 **Stock book, day 5.** Booked fills are flattered by ~0.5% per trade (H8); the first cohort is mostly market beta (+0.04% vs NIFTY); sector dispersion dominates (H9).
+
+**Nov 18, "why not exit the losers?"** The stock book has only three exits (2 ATR stop, 10-day-low channel, 30 sessions) and no discretionary loss-cutting; MARUTI (-3.7%) is 0.8% above its stop,
+HDFCLIFE 1.9%, INDIGO and M&M 3.2%. On 3 years of NIFTY 50 breakouts every earlier-cut variant lowered expectancy because the edge lives in a fat right tail (42% win, avg win +8.2% vs avg loss -4.2%):
+tighter exits raise the payoff but drop the win rate faster. A trade down >3% on day 5 (like MARUTI) usually does stop out (79%), but only 9% of trades look like that: worth ~+0.05% per trade, not
+enough to rewrite the rules on a 5-day sample. Tracked as H12.
