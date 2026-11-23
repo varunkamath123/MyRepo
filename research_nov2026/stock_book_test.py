@@ -171,6 +171,39 @@ ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 98.5, "vol": 2000.0}}, TO
 check("a breakdown exits the long (channel) and opens the short shadow, independently, same day",
       [(e["event"], e["book"]) for e in ev_] == [("EXIT", "long"), ("ENTRY", "short_shadow")] and "AAA" not in st["positions"] and "AAA" in st["shorts"])
 
+print("RB: risk book (equal risk, count and gross caps)")
+st = fresh()
+sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 102.0, "vol": 2000.0}}, TODAY, vol_adj=1.0, regime=ABOVE)
+# flat tape: ATR 2 -> stop distance 4; lot 100; risk 1% of Rs30L = Rs30,000 -> 30000 / (4 x 100) = 75 lots
+check("equal-risk lots = round(1% x capital / (2 ATR x lot)) = 75", st["positions"]["AAA"]["risk_lots"] == 75, f"({st['positions']['AAA']['risk_lots']})")
+e = [json.loads(l) for l in sb.TRADES_LOG.read_text().splitlines()][-1]
+check("ENTRY record carries risk_lots", e["risk_lots"] == 75)
+st = fresh()
+UNI6 = [{"symbol": s, "key": f"k{s}", "lot": 100} for s in ("A1", "A2", "A3", "A4", "A5", "A6")]
+sb.run_day(st, UNI6, {u["symbol"]: {"df": DF, "px": 102.0, "vol": 2000.0 + i} for i, u in enumerate(UNI6)}, TODAY, vol_adj=1.0, regime=ABOVE)
+rl = sorted([p["risk_lots"] for p in st["positions"].values()], reverse=True)
+check("6 signals: all in the signal book, only 5 in the risk book (count cap)", len(st["positions"]) == 6 and rl == [75] * 5 + [0], f"({rl})")
+st = fresh()
+UNI2 = [{"symbol": s, "key": f"k{s}", "lot": 100} for s in ("B1", "B2")]
+sb.run_day(st, UNI2, {u["symbol"]: {"df": DF, "px": 400.0, "vol": 2000.0 + i} for i, u in enumerate(UNI2)}, TODAY, vol_adj=1.0, regime=ABOVE)
+rl = sorted([p["risk_lots"] for p in st["positions"].values()], reverse=True)
+check("gross notional cap (1.3 x Rs30L): the second Rs30L position is refused", rl == [75, 0], f"({rl})")
+st = fresh()
+st["positions"]["AAA"] = sb.asdict(sb.StockPos("AAA", "2026-11-05", 102.0, 2.0, 100, False, 1.7, risk_lots=75))
+ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 97.9, "vol": 1000.0}}, TODAY, vol_adj=1.0, regime=ABOVE)
+per_lot = (97.9 - 102.0) * 100 - 0.001 * 102.0 * 100
+check("risk ledger P&L = per-lot net x lots; signal ledger stays per lot; capital ledger untouched (slot False)",
+      abs(st["stats"]["risk"]["pnl_inr"] - per_lot * 75) < 1e-6 and abs(st["stats"]["signal"]["pnl_inr"] - per_lot) < 1e-6 and st["stats"]["capital"]["n"] == 0
+      and st["stats"]["risk"]["n"] == 1, f"(risk Rs{st['stats']['risk']['pnl_inr']:+,.0f} = {st['stats']['risk']['pnl_inr']/sb.RISK_CAPITAL*100:+.2f}% of capital; the stop was sized to lose ~1%)")
+st = fresh()
+st["positions"]["AAA"] = {k: v for k, v in sb.asdict(sb.StockPos("AAA", "2026-11-05", 102.0, 2.0, 100, True, 1.7)).items() if k != "risk_lots"}
+sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 97.9, "vol": 1000.0}}, TODAY, vol_adj=1.0, regime=ABOVE)
+check("a position saved before the risk book existed (no risk_lots key) exits cleanly and is not counted in it", st["stats"]["risk"]["n"] == 0 and st["stats"]["signal"]["n"] == 1)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    sb.print_status(fresh())
+check("status prints the risk book line", "RISK BOOK" in buf.getvalue())
+
 print("S6: status renders; empty state loads")
 st = fresh()
 buf = io.StringIO()

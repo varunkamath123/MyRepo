@@ -39,12 +39,16 @@ Rules (research/stk_triggers.py, stk_expectancy.py; same definitions)
           the prior-10-session high; 30 sessions).
   No re-entry in a stock on the day it exits. No entry when the quote is stale (holiday).
 
-Three ledgers from one engine
+Four ledgers from one engine
   signal book  : every long signal, one lot each, uncapped, any regime. Roughly 45 signals a quarter, which
                  is what the statistics need. Reported as Rs per lot.
   capital book : the subset that fit while fewer than MAX_SLOTS (3) capital-book positions were open AND
                  NIFTY was above its 200-day average (strongest volume first). What Rs3.5L could carry.
   short shadow : the mirrored short signals, uncapped, no capital.
+  risk book    : Rs30L paper capital, positions sized for equal risk (the 2-ATR stop loses RISK_PCT = 1% of capital: lots = round(1% x capital / (2 ATR x lot)), at least 1),
+                 at most 5 open and gross notional <= 1.3x capital, no regime filter. Added Nov 2026 after the portfolio lab (futures_v2/research/portfolio_lab*.py): equal-risk sizing
+                 was the one overlay that helped (Sharpe 0.85 -> 0.99, alpha t 1.9 -> 2.5 over 13.6 years); ranking, the 200-DMA filter and a beta-1 hedge did not. One stock-future
+                 lot is ~Rs7L, so holding one lot per position at 1% risk takes ~Rs30L of capital; the Rs3.5L capital book risks ~9% of capital per position.
 
 Usage
   python stock_book.py                    daily run (cron, 15:25 IST)
@@ -84,7 +88,7 @@ UNIVERSE_FILE = HERE / "stock_universe.json"
 STATE_FILE    = HERE / "stock_state.json"
 TRADES_LOG    = HERE / "stock_trades.jsonl"
 SIGNALS_LOG   = HERE / "stock_signals.jsonl"
-BOOKS         = ("signal", "capital", "short_shadow")
+BOOKS         = ("signal", "capital", "short_shadow", "risk")
 
 CHANNEL_IN, CHANNEL_OUT = 20, 10      # Donchian entry / exit windows (completed sessions)
 VOL_AVG, VOL_MULT       = 20, 1.5     # volume expansion vs prior-20-session average
@@ -95,6 +99,10 @@ MAX_SLOTS               = 3           # capital-book concurrency (Rs3.5L of marg
 LIVE_VOLUME_ADJ         = 1.03        # 15:25 volume is ~97% of the day: approximation
 REGIME_FILTER           = True        # capital slots only while NIFTY > its 200-day average
 HEDGE_COST_PCT          = 0.0003      # NIFTY-futures hedge round trip, for the hedged-return column
+RISK_CAPITAL            = 3_000_000   # Rs30L paper capital for the risk book
+RISK_PCT                = 0.01        # capital lost if the 2-ATR stop is hit
+RISK_MAX_POS            = 5
+RISK_MAX_GROSS          = 1.30        # of RISK_CAPITAL
 CONTEXT_BARS            = 150
 _BASE                   = "https://api.upstox.com/v2"
 
@@ -113,6 +121,7 @@ class StockPos:
     side: int = 1                      # +1 long, -1 short shadow
     nifty_entry: Optional[float] = None
     regime_above200: Optional[bool] = None
+    risk_lots: int = 0                 # > 0 = also in the risk book, this many lots
 
 
 def _empty_stats() -> dict:
@@ -224,12 +233,18 @@ def run_day(st: dict, universe: list[dict], data: dict, today: str, vol_adj: flo
                 s_["n"] += 1; s_["wins"] += 1 if net > 0 else 0
                 s_["pnl_inr"] += net; s_["cost_inr"] += cost; s_["sum_ret_pct"] += ret_pct
                 s_["sum_hedged_pct"] += hedged if hedged is not None else 0.0
+            if side == 1 and pos.risk_lots > 0:
+                s_ = st["stats"]["risk"]
+                s_["n"] += 1; s_["wins"] += 1 if net > 0 else 0
+                s_["pnl_inr"] += net * pos.risk_lots; s_["cost_inr"] += cost * pos.risk_lots; s_["sum_ret_pct"] += ret_pct
+                s_["sum_hedged_pct"] += hedged if hedged is not None else 0.0
             rec = {"event": "EXIT", "book": bname, "symbol": sym, "direction": "LONG" if side == 1 else "SHORT",
                    "entry_date": pos.entry_date, "entry_price": pos.entry_price, "exit_date": today, "exit_price": d["px"],
                    "exit_reason": reason, "lot": pos.lot, "slot": pos.slot, "pnl_gross_inr": gross, "cost_inr": cost,
                    "pnl_inr": net, "ret_pct": ret_pct, "nifty_entry": pos.nifty_entry, "nifty_exit": nifty_now,
                    "nifty_ret_pct": nret, "hedged_ret_pct": hedged, "regime_above200": pos.regime_above200,
-                   "volx": pos.volx, "kronos_dir": pos.kronos_dir, "kronos_conf": pos.kronos_conf}
+                   "volx": pos.volx, "kronos_dir": pos.kronos_dir, "kronos_conf": pos.kronos_conf,
+                   "risk_lots": pos.risk_lots, "pnl_risk_inr": net * pos.risk_lots}
             events.append(rec)
             if write_logs:
                 _append(TRADES_LOG, rec)
@@ -274,22 +289,29 @@ def run_day(st: dict, universe: list[dict], data: dict, today: str, vol_adj: flo
                     kd, kc = kronos_fn(d["df"])
                 except Exception as e:
                     log.warning("[%s] Kronos read failed (logging only): %s", sym, e)
+            risk_lots = 0
+            if side == 1:                                                   # risk book: equal risk at the 2-ATR stop, capped by count and gross notional
+                want = max(1, int(round(RISK_PCT * RISK_CAPITAL / (STOP_ATR * ev["atr"] * lots[sym]))))
+                open_risk = [p for p in st["positions"].values() if p.get("risk_lots", 0) > 0]
+                gross_now = sum(p["risk_lots"] * p["lot"] * p["entry_price"] for p in open_risk)
+                if len(open_risk) < RISK_MAX_POS and gross_now + want * lots[sym] * d["px"] <= RISK_MAX_GROSS * RISK_CAPITAL:
+                    risk_lots = want
             pos = StockPos(symbol=sym, entry_date=today, entry_price=d["px"], atr=ev["atr"], lot=lots[sym], slot=slot,
                            volx=round(volx, 3), kronos_dir=kd, kronos_conf=(round(kc, 3) if kc is not None else None),
-                           side=side, nifty_entry=nifty_now, regime_above200=above200)
+                           side=side, nifty_entry=nifty_now, regime_above200=above200, risk_lots=risk_lots)
             book[sym] = asdict(pos)
             rec = {"event": "ENTRY", "book": bname, "symbol": sym, "direction": "LONG" if side == 1 else "SHORT",
                    "entry_date": today, "entry_price": d["px"], "atr": ev["atr"], "stop": d["px"] - side * STOP_ATR * ev["atr"],
                    "lot": pos.lot, "slot": slot, "volx": pos.volx, "volx_raw": round(ev["volx_raw"], 3),
                    "hi20": ev["hi_in"], "lo20": ev["lo_in"], "nifty": nifty_now, "regime_above200": above200,
-                   "capital_blocked_by_regime": (side == 1 and not regime_ok),
+                   "capital_blocked_by_regime": (side == 1 and not regime_ok), "risk_lots": risk_lots,
                    "kronos_dir": kd, "kronos_conf": pos.kronos_conf,
                    "kronos_agrees": (kd == "LONG") if kd is not None else None}
             events.append(rec)
             if write_logs:
                 _append(TRADES_LOG, rec)
-            log.info("[%s] %sENTRY %s @ %.2f  volx=%.2f  stop=%.2f  lot=%d  slot=%s%s  kronos=%s/%s",
-                     sym, "SHADOW " if side == -1 else "", rec["direction"], d["px"], volx, rec["stop"], pos.lot, slot,
+            log.info("[%s] %sENTRY %s @ %.2f  volx=%.2f  stop=%.2f  lot=%d  slot=%s  risk_lots=%d%s  kronos=%s/%s",
+                     sym, "SHADOW " if side == -1 else "", rec["direction"], d["px"], volx, rec["stop"], pos.lot, slot, risk_lots,
                      " (regime below 200-DMA: signal book only)" if rec["capital_blocked_by_regime"] else "", kd, pos.kronos_conf)
     return events
 
@@ -418,9 +440,13 @@ def print_status(st: dict):
     print(f"{chr(10)}{sep}{chr(10)}  STOCK BOOK (NIFTY 50, breakout + volume)  |  paper, 1 lot each{chr(10)}{sep}")
     for name, key in (("SIGNAL BOOK  long, uncapped, any regime", "signal"),
                       (f"CAPITAL BOOK long, max {MAX_SLOTS} open, NIFTY > 200-DMA", "capital"),
-                      ("SHORT SHADOW mirrored shorts, no capital", "short_shadow")):
+                      ("SHORT SHADOW mirrored shorts, no capital", "short_shadow"),
+                      (f"RISK BOOK equal-risk sizing, max {RISK_MAX_POS}, Rs{RISK_CAPITAL/1e5:.0f}L", "risk")):
         s = st["stats"][key]
-        if s["n"]:
+        if key == "risk" and s["n"]:
+            print(f"  {name}: {s['n']} closed, win {s['wins']/s['n']*100:.0f}%, net INR {s['pnl_inr']:+,.0f} = {s['pnl_inr']/RISK_CAPITAL*100:+.2f}% of capital; "
+                  f"{s['sum_ret_pct']/s['n']:+.2f}%/trade")
+        elif s["n"]:
             print(f"  {name}: {s['n']} closed, win {s['wins']/s['n']*100:.0f}%, net INR {s['pnl_inr']:+,.0f} "
                   f"(avg {s['pnl_inr']/s['n']:+,.0f}/trade); {s['sum_ret_pct']/s['n']:+.2f}%/trade, "
                   f"beta-hedged {s['sum_hedged_pct']/s['n']:+.2f}%/trade")
@@ -432,7 +458,7 @@ def print_status(st: dict):
             for sym, p in sorted(book.items()):
                 sd = p.get("side", 1)
                 print(f"    {sym:<12} entry {p['entry_date']} @ {p['entry_price']:.2f}  stop {p['entry_price'] - sd * STOP_ATR * p['atr']:.2f}  "
-                      f"lot {p['lot']}  {'CAPITAL' if p['slot'] else 'signal-only'}  volx {p['volx']:.2f}  "
+                      f"lot {p['lot']}  {'CAPITAL' if p['slot'] else 'signal-only'}{'+RISK x' + str(p['risk_lots']) if p.get('risk_lots', 0) else ''}  volx {p['volx']:.2f}  "
                       f"NIFTY>200DMA {p.get('regime_above200')}  kronos {p['kronos_dir']}/{p['kronos_conf']}")
     if not st["positions"] and not st["shorts"]:
         print("  No open positions.")
@@ -440,7 +466,7 @@ def print_status(st: dict):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="NIFTY 50 stock-futures paper book (long-only breakout + volume)")
+    ap = argparse.ArgumentParser(description="NIFTY 50 stock-futures paper book (breakout + volume; long capital books, short shadow)")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--refresh-universe", action="store_true")
