@@ -42,7 +42,7 @@ def row(lab, R, lo=start):
     m = int(np.searchsorted(cal[lo:], pd.Timestamp("2020-01-01")))
     h = lambda a, b: ((np.cumprod(1 + R[lo:][a:b])[-1]) ** (252 / max(b - a, 1)) - 1) * 100
     beta, alpha, t = reg(R, lo, T)
-    print(f"  {lab:<44}{cagr:>6.1f}{vol:>6.1f}{(r.mean()*252)/vol:>7.2f}{dd:>7.0f}{beta:>7.2f}{alpha:>8.1f}{t:>7.1f} | {h(0, m):>6.1f}{h(m, len(r)):>6.1f}")
+    print(f"  {lab:<44}{cagr:>6.1f}{vol*100:>6.1f}{(r.mean()*252)/vol:>7.2f}{dd:>7.0f}{beta:>7.2f}{alpha:>8.1f}{t:>7.1f} | {h(0, m):>6.1f}{h(m, len(r)):>6.1f}")
 
 
 bh = nret.copy()
