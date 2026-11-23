@@ -5,6 +5,7 @@ import json
 import math
 import sys
 import tempfile
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,7 @@ import costs
 import build_dataset as B
 import candle_recorder as R
 import depth_recorder as D
+import chain_recorder as CH
 
 results = []
 
@@ -118,6 +120,28 @@ with tempfile.TemporaryDirectory() as td:
     p = Path(td); (p / "X.jsonl").write_text(json.dumps(rec) + "\n" + json.dumps(rec) + "\n")
     D.compress_day(p)
     check("compress_day: plain file replaced by .gz that reads back", not (p / "X.jsonl").exists() and len(gzip.open(p / "X.jsonl.gz", "rt").read().splitlines()) == 2)
+
+print("option chain recorder")
+today_ = date(2026, 11, 23)
+mk = lambda exp, weekly: {"expiry": exp, "weekly": weekly}
+nifty_c = [mk("2026-11-17", True), mk("2026-11-23", True), mk("2026-12-01", True), mk("2026-12-08", True), mk("2026-12-15", True), mk("2026-12-29", False), mk("2027-01-25", False)]
+check("NIFTY: next 3 expiries (expired ones skipped) + the next monthly", CH.pick_expiries(nifty_c, "NIFTY", today_) == ["2026-11-23", "2026-12-01", "2026-12-08", "2026-12-29"], f"({CH.pick_expiries(nifty_c, 'NIFTY', today_)})")
+check("NIFTY: a monthly already inside the first 3 is not duplicated", CH.pick_expiries([mk("2026-11-23", False), mk("2026-12-01", True), mk("2026-12-08", True), mk("2026-12-29", False)], "NIFTY", today_) == ["2026-11-23", "2026-12-01", "2026-12-08", "2026-12-29"])
+check("BANKNIFTY: next 2", CH.pick_expiries([mk("2026-11-23", False), mk("2026-12-29", False), mk("2027-01-25", False)], "BANKNIFTY", today_) == ["2026-11-23", "2026-12-29"])
+opt = lambda ltp, bid, ask, iv: {"instrument_key": "x", "market_data": {"ltp": ltp, "bid_price": bid, "bid_qty": 65, "ask_price": ask, "ask_qty": 130, "volume": 1000, "oi": 5000.0, "prev_oi": 4000.0, "close_price": ltp - 1},
+                                "option_greeks": {"iv": iv, "delta": 0.5, "gamma": 0.001, "theta": -10.0, "vega": 20.0}}
+chain = [{"strike_price": k, "underlying_spot_price": 25000.0, "call_options": opt(300.0, 299.0, 301.0, 14.0), "put_options": opt(250.0, 249.0, 251.0, 16.0)} for k in (20000.0, 22400.0, 24000.0, 25000.0, 26000.0, 27600.0, 29000.0)]
+spot, rows = CH.shape(chain)
+check("strikes outside +/-10% of spot are dropped (22,500..27,500 kept)", spot == 25000.0 and [r[0] for r in rows] == [24000.0, 25000.0, 26000.0], f"({[r[0] for r in rows]})")
+check("each row lines up with COLUMNS (strike + 14 call + 14 put fields)", all(len(r) == len(CH.COLUMNS) == 29 for r in rows))
+ci = {c: i for i, c in enumerate(CH.COLUMNS)}; r0 = rows[0]
+check("fields map to the right columns (call bid, put ask, put iv, call theta)", r0[ci["c_bid"]] == 299.0 and r0[ci["p_ask"]] == 251.0 and r0[ci["p_iv"]] == 16.0 and r0[ci["c_theta"]] == -10.0)
+check("spread computable per strike", abs((r0[ci["c_ask"]] - r0[ci["c_bid"]]) - 2.0) < 1e-9)
+check("a strike with no greeks / market data does not crash (None stays None)", CH.shape([{"strike_price": 25000.0, "underlying_spot_price": 25000.0, "call_options": {}, "put_options": {}}])[1][0][1:] == [None] * 28)
+with tempfile.TemporaryDirectory() as td:
+    p = Path(td); (p / "NIFTY.jsonl").write_text(json.dumps({"t": "x", "exp": {}}) + chr(10))
+    CH.compress_day(p)
+    check("chain day compresses to .jsonl.gz and reads back", not (p / "NIFTY.jsonl").exists() and json.loads(gzip.open(p / "NIFTY.jsonl.gz", "rt").read())["t"] == "x")
 
 print()
 print("ALL PASSED" if all(results) else f"FAILURES: {results.count(False)} of {len(results)}")
