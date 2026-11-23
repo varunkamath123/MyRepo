@@ -6,6 +6,7 @@ Built Nov 11 2026 as the data and economics foundation for a 10-minute futures s
 |---|---|---|
 | `candle_recorder.py` | 1-minute and 10-minute bars, with volume and open interest for the futures, for both indices and the near / next / far futures. Cross-checks 10m against resampled 1m. | cron 16:00 IST (`--today`); `--backfill` for history |
 | `depth_recorder.py` | One batched quote every 15 s: 5-level depth, total buy/sell quantity, volume, OI, average price (4 futures + 2 indices). Gzips the day at the end. Holiday-aware, lock-protected. | cron 09:10 IST, exits 15:45 IST |
+| `chain_recorder.py` | Option chains from Upstox `/option/chain` every 5 minutes: NIFTY (next 3 expiries + next monthly) and BANKNIFTY (next 2), +/-10% of spot, per strike and side: ltp, bid/ask and quantities, volume, OI, previous OI, close, IV, delta, gamma, theta, vega. About 3 MB a day compressed. Holiday-aware, lock-protected. | cron 09:10 IST (waits for the 09:15 slot), exits 15:32 |
 | `build_dataset.py` | Validated, flagged 10-minute index dataset, 2022-01 -> today, cross-checked against Upstox daily bars. | cron Saturdays; manual |
 | `costs.py` | Fee model (brokerage, STT, exchange, SEBI, stamp, GST + slippage), break-even maths, required predictive correlation by holding period and selectivity. | manual |
 | `test_intraday.py` | 37 offline checks. | before every change |
@@ -40,3 +41,11 @@ placeholder with the spread measured by the depth recorder after a few weeks.
 30 10 * * 1-5 cd /opt/kronos_bot/repo/futures_v2/intraday && /opt/kronos_bot/venv/bin/python candle_recorder.py --today >> /opt/kronos_bot/data/intraday/logs/candles_cron.log 2>&1
 30 4 * * 6    cd /opt/kronos_bot/repo/futures_v2/intraday && /opt/kronos_bot/venv/bin/python build_dataset.py >> /opt/kronos_bot/data/intraday/logs/build_cron.log 2>&1
 ```
+30 4 * * 6    (build_dataset, above)
+40 3 * * 1-5  cd /opt/kronos_bot/repo/futures_v2/intraday && /opt/kronos_bot/venv/bin/python chain_recorder.py >> /opt/kronos_bot/data/intraday/logs/chain_cron.log 2>&1
+```
+
+## Option chains: what existed, what was added (Nov 23 2026)
+The separate options project already records BANKNIFTY chains (nearest expiry, +/-15 strikes, every 5 minutes) on its own instance: NSE-sourced Oct 23 -> Nov 13, Fyers-sourced Oct 28 -> still running.
+A read-only copy of that history sits in `/opt/kronos_bot/data/options_ext/` (see the README there). It has no full NIFTY chain and one expiry, so this project records its own: both indices, several expiries,
+Upstox as the only source (no scraping, no shared quota). Output: `/opt/kronos_bot/data/intraday/options/<date>/<UNDERLYING>.jsonl.gz`, one line per snapshot with a `columns` header and per-expiry `rows`.

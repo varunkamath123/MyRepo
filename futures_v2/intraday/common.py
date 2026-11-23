@@ -4,6 +4,7 @@ Storage layout (INTRADAY_DATA, default /opt/kronos_bot/data/intraday -- outside 
   candles/<label>_<N>m.csv.gz   one file per instrument and interval, columns ts,o,h,l,c,v,oi (ts = IST wall time of the bar START)
                                 label = NIFTY_IDX / BANKNIFTY_IDX or the futures trading symbol (e.g. NIFTY26NOVFUT)
   depth/<YYYY-MM-DD>/<label>.jsonl.gz   quote snapshots with 5-level depth (see depth_recorder.py)
+  options/<YYYY-MM-DD>/<UNDERLYING>.jsonl.gz   option-chain snapshots every 5 minutes (see chain_recorder.py)
   clean/index_10m_<UNDERLYING>.csv.gz   validated, flagged index 10-minute bars (see build_dataset.py)
   contracts.csv                 daily log of which contract was near / next / far
   master/fut_<date>.json        cached NIFTY / BANKNIFTY futures from the Upstox instrument master

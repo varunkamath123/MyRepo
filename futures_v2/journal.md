@@ -73,3 +73,8 @@ Event shorts all lost; as portfolio constructs (momentum bottom-10, long-short, 
 
 **Nov 23, "futures + options?"** Treated as a fresh design in this project (the separate options bot's code and findings were deliberately not used). First pass with modelled option prices says the obvious combinations do not pay: protective puts cost 8-13% a year (more than the book's ~8% alpha) and the monthly option hedge gave a worse Sharpe and no better drawdown than the conditional futures hedge; selling straddles earns ~3.8% a year of
 notional with a -16% tail month and has faded to ~0 since 2020; covered calls would remove the tail the stock edge lives in. Real option history is the missing piece.
+
+**Nov 23, option data.** Checked whether chains were already being recorded: this instance had none; the separate options project records BANKNIFTY near-expiry chains (every 5 minutes, NSE then Fyers; Fyers still running, the NSE-fed file stops after Nov 13) and a thin NIFTY/BANKNIFTY IV/skew summary since Apr 28.
+Built `chain_recorder.py` here (Upstox, NIFTY next 3 expiries + next monthly, BANKNIFTY next 2, +/-10% of spot, 5-minute slots, ~3 MB/day), live from Nov 24 09:15, and archived a read-only copy of the other history. H19 (options) stays closed until there is real data to test it on; first questions once ~2 months exist: measured option spreads, IV skew,
+term structure, and whether realised option P&L for the modelled hedge and straddle ideas matches the Black-Scholes first pass.
+
