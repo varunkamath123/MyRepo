@@ -145,3 +145,109 @@ windows) and `research/intraday_study.py` (420 sessions, in bps of spot).
   the new shadow `oi_levels.py` replaced the old module of the same name. And the 5-minute
   OI/PCR/IV snapshots stopped on Oct 21 13:05 when the old bots were parked.
 
+
+### Addendum 3 (2026-11-23): what 22 live paper trades and three shadow arms say
+
+Purpose: sharpen the strategy BEFORE real capital. This is a status report, not a verdict. The
+pre-registered verdict (EVALUATION.md: 30 closed trades, bootstrap CI of the total > 0 AND both halves
+> 0) has not been reached. Review points are listed at the end; this section is updated at each.
+
+**What changed since Addendum 2.** Two changes ever touched live decisions: the OI/PCR gate
+(blocking Oct 22-24, then SHADOW) and the volume gate OFF (Oct 27). Everything since is logging or
+virtual: Fyers chain as the gate's source, expiry-day skip, three shadow arms (stale-off, profit-wait,
+early-entry), a coil-gate switch (live stays ON). A test asserts the real trades are identical with every
+shadow arm on or off. Since Oct 27 no entry gate, exit rule, stop, target or sizing parameter has changed.
+
+#### A. The live record (current config, Oct 27 - Nov 23)
+
+* 22 trades, **net +Rs8,676**, win rate 50%, average win +Rs2,062, average loss -Rs1,273 (payoff ratio
+  1.62, break-even win rate 38%, profit factor 1.62).
+* **Expectancy +Rs394 a trade, bootstrap 95% CI [-511, +1,339]: includes zero** (t = 0.81).
+* **Halves flip:** first 11 trades +Rs18,321, last 11 trades -Rs9,645.
+* **Concentration:** the top trade is 65% of the net, the top two 115%; without them -Rs1,312 over 20 trades.
+* **The verdict rule is not met.** A Monte Carlo of the next 12 trades says that even if the live record
+  were the truth the 30-trade rule passes only ~18% of the time, so a FAIL at 30 will not prove there is
+  no edge, and a PASS needs both halves to hold.
+
+#### B. What the live trades show (descriptive; samples are small)
+
+| cut | result |
+|---|---|
+| exit rule | trail: 9 trades **+Rs14,804** (7 winners). thesis-broken: 4 trades **-Rs11,105** (0 winners, average -Rs2,776). stale: 7 trades -Rs455. force-close: 2 trades +Rs5,432 |
+| side | CALL +Rs391 a trade, PUT +Rs400: no difference |
+| entry time | before 11:30 +Rs237; 11:30-13:00 -Rs196; after 13:00 +Rs2,547 (3 trades) |
+| days to expiry at entry | 21+ days **+Rs16,910** (11); 10-20 days **-Rs7,118** (8); under 8 days or the December series -Rs1,116 (3) |
+| OI-shadow verdict | "would block" 7 trades -Rs380; "would pass" 15 trades +Rs9,056: the gate adds nothing |
+| first / second trade of the day | first +Rs159 (13); second +Rs8,517 (9). **Not supported by history**: replay first -0.088%, second -0.052%, second after a loss -0.076%, all negative; treat as noise |
+
+* **The trailing stop is the engine; thesis-broken is the drain.** That matches the replay (Learning 5 and
+  7). Thesis-broken losses are the cost of a failed breakout, not a mis-set rule: on Nov 6 the same rule
+  saved ~Rs8,000 on the PUT while costing ~Rs1,200 on the CALL.
+* **Time to expiry is a HYPOTHESIS.** The profitable stretch was 21-28 days to expiry; the weak stretch
+  10-19 days. The market also changed (a trend, then chop), so this cannot be separated yet. The roll to
+  the next monthly (35 days) is the natural test.
+* **Premium sensitivity is not constant.** About 27% of premium per 1% of index at 27 days and 16-17% IV;
+  about 38-40% at 18 days and 12.7% IV; and higher still a week from expiry (on Nov 17 a 0.6% index move
+  took one option +57%). The replay's 71.4 belongs to week-dated options. Realistic replays use ~30 (research/quantum_exits.py).
+* **Costs:** Rs2,046 over 22 trades (average Rs93, 0.38% of the premium outlay) = **19% of the net gross P&L
+  of Rs10,722** (8.6% of the gross of the winners alone). Paper fills are at the ask and the bid, the median
+  spread ~0.35% of premium (~Rs115 a round trip on a Rs1,087 option, about the whole cost line).
+
+#### C. The shadow arms (forward, virtual, no orders)
+
+| arm | n | result | read |
+|---|---|---|---|
+| **stale rule off** | 3 | shadow +Rs1,765 vs real, CI [-5,622, +11,953]; better in 1 of 3 | the rule saved Rs346 and Rs1,874, then cost Rs3,984: small frequent saves, a rare big miss. No conclusion at n=3. |
+| **profit-wait** | 8 | shadow +Rs2,407, CI [-433, +7,710]; 7 of 8 identical to real within Rs140 | one trade (Nov 12, +Rs2,581) is the whole gain: most trades were already profitable when the rules fired. Replay said it turns small losers into small winners (win rate 30% -> 58%) at the price of bigger losers (payoff 1.00 -> 0.46). |
+| **early entry** (coil gate off) | 8 trades, +Rs8,824 | per session +Rs1,736, CI [-255, +3,918] over 8 sessions | before the coil can be computed: 3 of 3 winners, +Rs9,572; the live gate would also have entered: 0 of 2, -Rs1,930; the gate would have refused: 1 of 3, +Rs1,182. Two single trades (+Rs7,896 target, +Rs9,338 hold) carry it. History: open-break entries averaged -0.059% a trade vs -0.101% random. |
+
+#### D. What is established, what is not
+
+* **Established (several independent tests):** no entry signal tested (direction models, volume, PCR/OI,
+  compression, volatility forecast, a graded gate score, regime variants) beats a random entry in the
+  replay; the trail carries the P&L; costs take 19% of the net gross P&L; the exits are roughly a wash on average but
+  shape the loss distribution.
+* **Not established:** any forward edge. The live record is flattered by two trades and a first half that
+  has not repeated. The shadow arms are three-to-eight records each and each depends on one or two trades.
+* **Known gaps:** NSE's feed (implied vol, skew, PCR history) has been down since Nov 13, so we are
+  collecting no IV; no option quotes for other strikes were ever logged; real fills are unmeasured.
+
+#### E. Risks found that matter before real money
+
+1. **The 1-lot floor overrides every risk limit.** On the December series (premium ~Rs1,250-1,630) one lot
+   is 68-84% of a Rs58k book and a 25% stop risks Rs9-12k (16-21% of the book), against a stated 8% risk
+   and 50% deployment cap. Nothing has gone wrong yet; a full stop-out would be the largest loss to date.
+2. **The regime gate has missed trend days** (Oct 30; Nov 20, a +2.9% day it sat out, ~Rs10k at one lot).
+   The history test found no regime definition that beats the shipped one, so this is not a reason to
+   change it, but it is a known shape of loss.
+3. **Concentration:** two trades are the whole profit. A real-money run must expect long flat or negative
+   stretches (the last 11 trades are -Rs9.6k).
+4. **Transient Fyers "Bad request" replies** (about once in three days) have so far hit only when no
+   position was open.
+
+#### F. Proposed go-live readiness checklist (a PROPOSAL for the owner to agree, nothing here is decided)
+
+1. **Evidence:** the 30-trade verdict rule is met, AND the three shadow-arm reviews below are complete.
+   Any rule change from a review restarts the count. No live money on a streak alone.
+2. **Rules frozen:** stale, profit-wait and early-entry decisions made from the pre-registered reviews, then
+   one config, unchanged, for at least 30 more paper trades.
+3. **Sizing decided:** the real capital, the per-trade risk budget and a hard daily/weekly loss limit
+   chosen explicitly; resolve the 1-lot-floor problem (more capital, a cheaper contract, or a tighter
+   stop - tested, not assumed).
+4. **Execution realism:** a dry-run order path (limit orders, expected fills, rejects, partial fills), a
+   check of Fyers order permissions and any static-IP requirement, a kill-switch file, a measured comparison
+   of real vs paper spreads and slippage, and exits that still work when a quote fails.
+5. **Data:** an implied-vol record restored from Fyers prices (independent of NSE) so the strategy's pricing
+   assumptions can be checked on live data.
+6. **First live stretch is for measuring fills, not for making money:** smallest size, money that can be
+   lost entirely, and a pre-agreed stop.
+
+#### G. Review points (pre-registered in EVALUATION.md)
+
+| review | now | at |
+|---|---|---|
+| live verdict rule | 22 trades | 30 trades |
+| stale arm | 3 records | 20 |
+| profit-wait arm | 8 records | 20 |
+| early-entry arm | 8 sessions | 20 sessions |
+| days-to-expiry hypothesis | one contract cycle | after the Nov 24 roll plus ~10 trades |
