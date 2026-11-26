@@ -233,3 +233,39 @@ read "DISAGREES" on went 1 winner of 5, -Rs8,608; trades it agreed with or passe
 - Review: at 20 gated trades, compare the setups the gate refused (logged with direction and thesis in bnf_decisions, scored by
   research/oi_gate_shadow.py) against those it allowed. If the refused setups did no worse than the allowed, switch it off.
   The wall rule is judged on the recorded verdicts the same way before it is ever allowed to veto.
+
+## Amendment 2026-11-27: overnight carry shadow arm (owner's request; research only, no effect on any trade)
+
+**What it is.** `bnf_overnight.py`, a virtual arm that places no order. Every session at 15:20 it records the ATM
+straddle (and a +-500-point wing strangle) of the contract the strategy trades; the next session it re-quotes the same
+contracts at 09:16, 09:20, 09:30, 10:00, 11:00, 15:00 and 15:25. One record per carried night (`bnf_overnight_<date>.jsonl`,
+kind `overnight_carry`) holds the P&L of ce / pe / straddle / strangle, LONG and SHORT, at the real bid/ask with exact
+round-trip costs, the same at mid (the difference is the spread), the official close -> official open change per contract,
+VIX and index at both ends, the weekday / nights held / days to expiry, and the 5-level depth of the ATM legs at the primary
+entry and exit (top size, how a 1-lot and a MAX_LOTS order would walk the book, open interest, circuit limits, tick size).
+About 15 API requests a day, all non-essential. Review: `research/overnight_review.py <logs>`.
+
+**Why.** Overnight option holding cannot be backtested (Fyers delists expired contracts; the owner chose not to use Breeze;
+the dominant overnight factor, IV moving between close and open, is not in Black-Scholes). A rough calculation on 338
+sessions (weekday overnight gap std 0.47% vs 0.66% intraday; ~16% IV, ~30 DTE) says a long ATM option should lose about 1% of
+premium a night net of gamma, i.e. slightly negative before spread, and is far too noisy to resolve with a few dozen nights.
+That is a prior, not a result.
+
+**Pre-registered rule (so the 7 exit times and 8 structures cannot be mined).**
+- Only the PRIMARY pair, entry 15:20 -> exit 09:20, and only straddle long, straddle short, ce long, pe long are judged.
+- Below 60 carried nights, or fewer than 10 that crossed a weekend/holiday: DESCRIPTIVE ONLY, no decision.
+- At >= 60 nights and >= 10 weekend nights a side is "worth a live test" only if the bootstrap 95% CI of its mean net P&L
+  per night is above 0 AND both halves of the record are above 0.
+- Everything else printed (other exit times, strangle, entry ladder) is EXPLORATORY. A different pair can be judged only on
+  sessions recorded after it was chosen.
+- Short results exclude margin and cannot show tail risk; a pass on the short side is a prompt to study margin and the tail
+  (the largest overnight gaps in the history are +4.8% and -4.2%), never a reason to sell premium.
+
+**Facts found while building it (live Fyers, after hours).** The ATM BANKNIFTY option book is thin: 30 units (one lot) at the
+best bid and ask, then 30 at each next level; the spread on a ~Rs1,500 option is 0.5-0.8%. A one-lot ATM straddle costs about
+Rs80,000 of premium, above the whole paper book, so a live version at this capital means a single leg or a wider strangle.
+Overnight holding needs the NRML product (INTRADAY/MIS is squared off by the broker). The pre-open session (09:00-09:08) is not
+sampled: the runner is idle then, and whether Fyers serves option quotes in pre-open is unverified.
+
+**Consequences.** None for the verdict on the real strategy: the arm never touches the position, state or trade log (a test
+asserts the real trades are identical with it on or off).

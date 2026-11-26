@@ -145,6 +145,22 @@ SHADOW_PROFIT_WAIT_ENABLED = True # a second shadow arm that follows EVERY entry
 PROFIT_WAIT_MIN_NET_RS = 0.0      # 'profitable' = net P&L after round-trip costs above this, at a premium poll
 SHADOW_EARLY_ENTRY_ENABLED = True # a virtual copy of the strategy with the coil gate off (enters from 09:55, no compression needed)
 SHADOW_POLL_SECONDS = 60          # premium poll for a shadow (the real position polls every 20 s)
+
+# ── overnight carry shadow (2026-11-27, owner's request): is holding an option overnight worth anything? ──
+# Virtual, no orders. Every session it 'buys' the ATM straddle (+ a wing strangle) of the contract the strategy
+# trades at OVN_ENTRY_SAMPLES[0], re-quotes it at the next session's OVN_EXIT_SAMPLES, and records both the long and
+# the short result at real bid/ask plus 5-level depth. See bnf_overnight.py and EVALUATION.md (amendment 2026-11-27).
+SHADOW_OVERNIGHT_ENABLED = True
+OVN_ENTRY_SAMPLES = ('15:20', '15:25', '15:28')   # the FIRST is the pre-registered entry; later ones are for the record
+OVN_EXIT_SAMPLES = ('09:16', '09:20', '09:30', '10:00', '11:00', '15:00', '15:25')
+OVN_EXIT_PRIMARY = '09:20'        # the pre-registered exit; the others are exploratory (descriptive only)
+OVN_LOTS = 1
+OVN_WING_POINTS = 500             # strangle legs this many index points out (0 = no strangle)
+OVN_DEPTH = True                  # 5-level book for the ATM legs at the primary entry and exit
+OVN_PRIMARY_TOLERANCE_MIN = 3     # a primary sample later than this is recorded as missed, not taken late
+OVN_SAMPLE_TOLERANCE_MIN = 2
+OVN_MAX_HOLD_DAYS = 6             # an entry with no exit session inside this many calendar days is abandoned
+VIX_SYMBOL = 'NSE:INDIAVIX-INDEX'
 OI_SOURCE = 'fyers'              # 'fyers' | 'nse'. Where the GATE reads its chain from. 'fyers' = the broker's option
                                   # chain for the series the bot actually TRADES (the next monthly on the nearest
                                   # series' expiry day), ~77 calls/day. 'nse' = NSE's public page, which only ever
@@ -273,6 +289,17 @@ def validate() -> list:
         p.append('CHAIN_RECORD_EVERY_MIN under 5 would hammer NSE, which rate-limits')
     if OI_ON_MISSING not in ('block', 'pass'):
         p.append("OI_ON_MISSING must be 'block' or 'pass'")
+    if SHADOW_OVERNIGHT_ENABLED:
+        if not OVN_ENTRY_SAMPLES or list(OVN_ENTRY_SAMPLES) != sorted(OVN_ENTRY_SAMPLES) \
+                or OVN_ENTRY_SAMPLES[0] <= FORCE_CLOSE or OVN_ENTRY_SAMPLES[-1] > '15:29':
+            p.append('OVN_ENTRY_SAMPLES must be ascending, after FORCE_CLOSE and no later than 15:29')
+        if (not OVN_EXIT_SAMPLES or list(OVN_EXIT_SAMPLES) != sorted(OVN_EXIT_SAMPLES)
+                or OVN_EXIT_SAMPLES[0] < '09:16' or OVN_EXIT_SAMPLES[-1] > '15:28'):
+            p.append('OVN_EXIT_SAMPLES must be ascending, between 09:16 and 15:28')
+        if OVN_EXIT_PRIMARY not in OVN_EXIT_SAMPLES:
+            p.append('OVN_EXIT_PRIMARY must be one of OVN_EXIT_SAMPLES')
+        if OVN_LOTS < 1 or OVN_WING_POINTS < 0:
+            p.append('OVN_LOTS must be >= 1 and OVN_WING_POINTS >= 0')
     if OI_GATE_ENABLED and not (OI_USE_PCR or OI_USE_WALLS):
         p.append('OI_GATE_ENABLED with neither OI_USE_PCR nor OI_USE_WALLS gates nothing')
     if PAPER_TRADE_MODE is not True:
