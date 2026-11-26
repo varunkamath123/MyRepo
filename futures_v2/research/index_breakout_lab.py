@@ -98,7 +98,7 @@ for u in ("NIFTY", "BANKNIFTY"):
         by = T.assign(y=T.entry.dt.year).groupby("y").ret.agg(["count", "mean"]); by["mean"] *= 100
         print("        by entry year (n, exp%): " + "  ".join(f"{y}:{int(r['count'])}/{r['mean']:+.1f}" for y, r in by.iterrows()))
     print(f"\n  sensitivity, LONG net exp %/trade (n) and Sharpe at 1x:   [exploratory, not pre-registered]")
-    print(f"  {'entry\\exit':<11}" + "".join(f"{'exit '+str(m):>22}" for m in (5, 10, 20)))
+    print("  " + "entry/exit".ljust(11) + "".join(("exit " + str(m)).rjust(22) for m in (5, 10, 20)))
     for n_in in (10, 20, 50, 100):
         row = f"  {n_in:<11}"
         for n_out in (5, 10, 20):
