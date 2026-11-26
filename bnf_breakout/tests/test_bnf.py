@@ -71,6 +71,7 @@ def mk_cfg(**kw):
     ns.OI_GATE_BLOCKS = True          # tests of the gate exercise blocking; shadow has its own tests
     ns.OI_WALLS_BLOCKS = True         # the shipped config records walls only; the older tests exercise them as a veto
     ns.OI_ON_MISSING = 'block'        # shipped is 'pass' since 2026-11-26; the older tests exercise the strict form
+    ns.SHADOW_OVERNIGHT_ENABLED = False   # the overnight arm has its own section (and fake exchange)
     for k, v in kw.items():
         setattr(ns, k, v)
     return ns
@@ -2047,6 +2048,244 @@ for r_ in (rA, rB):
     r_.go('10:40', 5)
     r_.go('15:00', 10)
 eq('THE REAL TRADES ARE IDENTICAL with all three shadow arms on or off', key(rA), key(rB))
+
+
+# --- 8m2. overnight carry shadow ---
+print('\n--- overnight carry shadow ---')
+import bnf_overnight as OV      # noqa: E402
+
+# pure pricing: long = buy at ask / sell at bid; short = sell at bid / buy at ask
+L_in = dict(CE=dict(bid=100.0, ask=101.0, ltp=100.5), PE=dict(bid=90.0, ask=91.0, ltp=90.5))
+L_out = dict(CE=dict(bid=110.0, ask=111.0, ltp=110.5), PE=dict(bid=85.0, ask=86.0, ltp=85.5))
+cO = mk_cfg()
+rl = OV.structure_result(L_in, L_out, ('CE', 'PE'), 'long', 1, cO)
+approx('long straddle gross = (110+85) - (101+91) = +3 a unit x 30', rl['gross'], 90.0, 0.05)
+approx('...at MID it would have been +5 a unit', rl['mid_gross'], 150.0, 0.05)
+approx('...so the spread cost is the difference', rl['spread_cost'], 60.0, 0.05)
+approx('...net = gross minus the exact round-trip costs', rl['net'],
+       90.0 - (S.round_trip_cost(101, 110, 1, cO) + S.round_trip_cost(91, 85, 1, cO)), 0.05)
+rs = OV.structure_result(L_in, L_out, ('CE', 'PE'), 'short', 1, cO)
+approx('short straddle gross = (100+90) - (111+86) = -7 a unit x 30', rs['gross'], -210.0, 0.05)
+eq('a structure with a missing leg is not priced',
+   OV.structure_result(L_in, dict(CE=L_out['CE']), ('CE', 'PE'), 'long', 1, cO), None)
+eq('a quote with no price is not a leg', OV.leg_from_quote(dict(bid=1, ask=2)), None)
+eq('a leg with no bid/ask is priced off LTP and flagged approximate',
+   OV.structure_result(dict(CE=dict(bid=None, ask=None, ltp=100.0)), dict(CE=dict(bid=None, ask=None, ltp=100.0)),
+                       ('CE',), 'long', 1, cO)['approx'], True)
+eq('walking a thin book: 60 units against 30@100 and 30@101', OV.walk_book([[100.0, 30], [101.0, 30], [102.0, 30]], 60),
+   dict(requested=60, filled=60, vwap=100.5))
+eq('...and a book too thin to fill it says so', OV.walk_book([[100.0, 30]], 90)['filled'], 30)
+
+
+class FakeOvnFyers:
+    """quotes() accepts several comma-joined symbols; depth() returns a 5-level book."""
+    def __init__(self):
+        self.spot, self.vix = 55849.0, 17.0
+        self.q = {}                      # symbol -> (bid, ask)
+        self.calls, self.fail = 0, False
+        self.depth_calls = 0
+
+    def quotes(self, req):
+        self.calls += 1
+        if self.fail:
+            return dict(s='error', code=500, message='boom')
+        d = []
+        for sym in req['symbols'].split(','):
+            if sym == 'NSE:NIFTYBANK-INDEX':
+                d.append(dict(n=sym, s='ok', v=dict(lp=self.spot, open_price=self.spot - 50, high_price=self.spot + 40,
+                                                    low_price=self.spot - 90, prev_close_price=self.spot - 30)))
+            elif sym == 'NSE:INDIAVIX-INDEX':
+                d.append(dict(n=sym, s='ok', v=dict(lp=self.vix, prev_close_price=self.vix + 0.2)))
+            elif sym in self.q:
+                b, a = self.q[sym]
+                d.append(dict(n=sym, s='ok', v=dict(lp=(a + b) / 2, bid=b, ask=a, spread=a - b, volume=1000,
+                                                    open_price=b - 1, prev_close_price=b - 2, atp=b)))
+        return dict(s='ok', d=d)
+
+    def depth(self, req):
+        self.depth_calls += 1
+        sym = req['symbol']
+        b, a = self.q[sym]
+        return dict(s='ok', d={sym: dict(totalbuyqty=5000, totalsellqty=900, oi=100000, pdoi=90000, tick_Size=0.05,
+                                         upper_ckt=900.0, lower_ckt=0.05, ltt=1, v=1000,
+                                         ask=[dict(price=a + i * 0.5, volume=30, ord=1) for i in range(5)],
+                                         bids=[dict(price=b - i * 0.5, volume=30, ord=1) for i in range(5)])})
+
+
+OVN_BOOK = {'NSE:BANKNIFTY26OCT55800CE': (100.0, 101.0), 'NSE:BANKNIFTY26OCT55800PE': (90.0, 91.0),
+            'NSE:BANKNIFTY26OCT56300CE': (40.0, 41.0), 'NSE:BANKNIFTY26OCT55300PE': (30.0, 31.0)}
+
+
+def ovn_rig(**kw):
+    fy = FakeOvnFyers()
+    fy.q.update(OVN_BOOK)
+    d_ = tempfile.mkdtemp()
+    bud = BR.ApiBudget(d_, 100, 0.0, '2026-10-22', sleep=lambda s: None)
+    brk_ = BR.Broker(fy, bud, None)
+    c_ = mk_cfg(SHADOW_OVERNIGHT_ENABLED=True, **kw)
+    out = []
+    arm_ = OV.OvernightShadow(brk_, c_, d_, d_, append=lambda n, r: out.append((n, r)), day_fn=lambda: '2026-10-22')
+    return fy, brk_, arm_, out, d_, c_
+
+
+def kind_of(out, k):
+    return [r for _, r in out if r.get('kind') == k]
+
+
+fyO, brO, armO, outO, dirO, cfO = ovn_rig()
+armO.step(at('15:19', 50))
+eq('nothing is sampled before the primary entry time', (fyO.calls, armO.st['open']), (0, []))
+armO.step(at('15:20', 5))
+eq('at 15:20 the ATM straddle (+ wing strangle) is entered, virtually', len(armO.st['open']), 1)
+pO = armO.st['open'][0]
+eq('...on the contract the strategy trades: nearest monthly, ATM strike from the index at that moment',
+   (pO['strike'], pO['expiry'], pO['dte']), (55800, '2026-10-27', 5))
+eq('...with the call, the put and the two wing legs', sorted(pO['entry_samples'][0]['legs']), ['CE', 'PE', 'WCE', 'WPE'])
+ok('...and the 5-level depth of the ATM legs is recorded for live-execution planning',
+   pO['depth_entry'] is not None and len(pO['depth_entry']['CE']['asks']) == 5 and pO['depth_entry']['CE']['tick'] == 0.05)
+ok('...with the index, the VIX and the previous close on the sample', pO['entry_samples'][0]['spot'] == 55849.0
+   and pO['entry_samples'][0]['vix'] == 17.0 and pO['entry_samples'][0]['spot_prev_close'] == 55819.0)
+armO.step(at('15:20', 40))
+eq('the same day it does not enter twice', len(armO.st['open']), 1)
+armO.step(at('15:25', 5))
+armO.step(at('15:28', 5))
+eq('later entry samples re-quote the same contracts (for the record)',
+   [s['label'] for s in armO.st['open'][0]['entry_samples']], ['15:20', '15:25', '15:28'])
+ok('...and a persisted state file exists', os.path.exists(os.path.join(dirO, 'shadow_overnight_state.json')))
+arm2 = OV.OvernightShadow(brO, cfO, dirO, dirO, append=lambda n, r: outO.append((n, r)), day_fn=lambda: '2026-10-23')
+eq('the position survives a restart', len(arm2.st['open']), 1)
+fyO.q.update({'NSE:BANKNIFTY26OCT55800CE': (110.0, 111.0), 'NSE:BANKNIFTY26OCT55800PE': (85.0, 86.0),
+              'NSE:BANKNIFTY26OCT56300CE': (45.0, 46.0), 'NSE:BANKNIFTY26OCT55300PE': (28.0, 29.0)})
+fyO.spot = 55900.0
+D2 = '2026-10-23'
+for hhmm in ('09:16', '09:20', '09:30', '10:00', '11:00', '15:00', '15:25'):
+    arm2.step(at(hhmm, 5, D2))
+recs = kind_of(outO, 'overnight_carry')
+eq('one record is written when the last exit sample is in', len(recs), 1)
+rc = recs[0]
+eq('...for a one-night hold on a weekday', (rc['entry_day'], rc['exit_day'], rc['nights'], rc['weekend']),
+   ('2026-10-22', '2026-10-23', 1, False))
+eq('...which has all seven exit samples', len(rc['exit_samples']), 7)
+pp_ = rc['primary_pair']
+approx('...the primary pair (15:20 -> 09:20) long straddle gross = +3 a unit x 30', pp_['straddle_long']['gross'], 90.0, 0.05)
+approx('...and the short side is the mirror at the real bid/ask', pp_['straddle_short']['gross'], -210.0, 0.05)
+approx('...the index move over the night is reported', pp_['spot_move_pct'], (55900.0 / 55849.0 - 1) * 100, 1e-3)
+ok('...every structure on both sides is present', all(k in pp_ for k in (
+    'ce_long', 'ce_short', 'pe_long', 'pe_short', 'straddle_long', 'straddle_short', 'strangle_long', 'strangle_short')))
+ok('...pairs include every exit time and the later entry times against the primary exit',
+   'E15:20->X15:25' in rc['pairs'] and 'E15:28->X09:20' in rc['pairs'])
+eq('...the official close->open change is recorded per contract (exchange prev-close and open prices)',
+   rc['official_close_to_open']['legs']['CE']['change'], 1.0)
+ok('...with how a 1-lot and a MAX_LOTS order would walk the recorded book',
+   rc['exec']['entry_buy_CE_1lot']['filled'] == 30
+   and rc['exec']['entry_buy_CE_%dlot' % cfO.MAX_LOTS]['filled'] == cfO.MAX_LOTS * 30
+   and rc['exec']['exit_sell_PE_1lot']['vwap'] == 85.0)
+ok('...and the NRML note, lot size and symbols a live order needs',
+   'NRML' in rc['product'] and rc['lot_size'] == 30 and rc['symbols']['CE'].endswith('55800CE'))
+eq('the arm holds nothing after the record', arm2.st['open'], [])
+ok('its API cost for the whole round trip is small', fyO.calls + fyO.depth_calls <= 20, fyO.calls + fyO.depth_calls)
+
+# a weekend hold
+fyW, brW, armW, outW, dirW, cfW = ovn_rig()
+armW.step(at('15:20', 5, '2026-10-23'))
+for hhmm in ('09:16', '09:20', '09:30', '10:00', '11:00', '15:00', '15:25'):
+    armW.step(at(hhmm, 5, '2026-10-26'))
+rw = kind_of(outW, 'overnight_carry')
+eq('a Friday entry exits Monday: 3 nights, flagged weekend', (rw[0]['nights'], rw[0]['weekend'], rw[0]['weekday']),
+   (3, True, 'Fri'))
+
+# late / missing samples are recorded, never invented
+fyM, brM, armM, outM, dirM, cfM = ovn_rig()
+armM.step(at('15:27', 0))
+eq('a primary entry that wakes up too late is recorded as not taken',
+   (len(armM.st['open']), len(kind_of(outM, 'overnight_no_entry'))), (0, 1))
+armM.step(at('15:28', 0))
+eq('...and not retried that day', fyM.calls, 0)
+fyE, brE, armE, outE, dirE, cfE = ovn_rig()
+armE.step(at('15:20', 5))
+for hhmm in ('10:00', '11:00'):
+    armE.step(at(hhmm, 5, '2026-10-23'))
+armE.step(at('15:31', 0, '2026-10-23'))
+re_ = kind_of(outE, 'overnight_carry')
+eq('exits sampled only at 10:00 and 11:00: the others are listed as missed',
+   (len(re_[0]['exit_samples']), sorted(re_[0]['exit_missed'])),
+   (2, ['09:16', '09:20', '09:30', '15:00', '15:25']))
+eq('...and a record with no primary exit has no primary pair', re_[0]['primary_pair'], None)
+
+# failures
+fyF, brF, armF, outF, dirF, cfF = ovn_rig()
+fyF.fail = True
+armF.step(at('15:20', 5))
+eq('a failing API opens nothing and does not raise', armF.st['open'], [])
+fyF.fail = False
+armF.step(at('15:21', 5))
+eq('...and the next pass inside the window enters', len(armF.st['open']), 1)
+fyB, brB, armB, outB, dirB, cfB = ovn_rig()
+brB.budget.calls = 10 ** 6
+armB.step(at('15:20', 5))
+eq('with the API budget spent the arm makes no request and does not enter', (fyB.calls, armB.st['open']), (0, []))
+fyS, brS, armS, outS, dirS, cfS = ovn_rig()
+armS.step(at('15:20', 5))
+armS.step(at('09:20', 5, '2026-10-30'))
+eq('an entry with no exit session inside OVN_MAX_HOLD_DAYS is abandoned, not priced',
+   (armS.st['open'], len(kind_of(outS, 'overnight_abandoned'))), ([], 1))
+
+# wake hints
+fyH, brH, armH, outH, dirH, cfH = ovn_rig()
+ok('far from any sample time the arm lets the runner sleep', armH.wake_secs(at('11:00', 0)) is None)
+ok('four minutes before the primary entry it asks to be woken before it is due',
+   200 < armH.wake_secs(at('15:16', 0)) < 240, armH.wake_secs(at('15:16', 0)))
+eq('inside the window it asks for a short sleep', armH.wake_secs(at('15:21', 0)), 15.0)
+
+# config
+eq('the shipped config enables the arm with the pre-registered primary pair',
+   (bnf_config.SHADOW_OVERNIGHT_ENABLED, bnf_config.OVN_ENTRY_SAMPLES[0], bnf_config.OVN_EXIT_PRIMARY), (True, '15:20', '09:20'))
+ok('validate() rejects an entry sample before the force close',
+   any('OVN_ENTRY_SAMPLES' in x for x in validate_with(OVN_ENTRY_SAMPLES=('14:50',))))
+ok('validate() rejects a primary exit that is not in the list',
+   any('OVN_EXIT_PRIMARY' in x for x in validate_with(OVN_EXIT_PRIMARY='09:21')))
+ok('...and accepts the shipped values', not any('OVN' in x for x in validate_with()))
+
+
+class FakeOvnRunnerFyers(FakeFyers):
+    """The runner's fake exchange, but quotes() also understands several comma-joined symbols."""
+    def __init__(self):
+        super().__init__()
+        self.ovn = FakeOvnFyers()
+        self.ovn.q.update(OVN_BOOK)
+
+    def quotes(self, req):
+        if ',' in req['symbols']:
+            return self.ovn.quotes(req)
+        return super().quotes(req)
+
+    def depth(self, req):
+        return self.ovn.depth(req)
+
+
+def ovn_runner_rig(on):
+    rg = Rig(flat_tape(55800), MAX_TRADES_PER_DAY=1, SHADOW_OVERNIGHT_ENABLED=on)
+    rg.ff = FakeOvnRunnerFyers()
+    rg.ff.today_str = DAY
+    rg.ff.premium['*'] = 400.0
+    rg.build()
+    return rg
+
+
+rOn, rOff = ovn_runner_rig(True), ovn_runner_rig(False)
+for r_ in (rOn, rOff):
+    r_.go('09:55')
+    r_.go('10:35')
+    r_.ff.premium['*'] = dict(lp=520.0, bid=519.0, ask=521.0)
+    r_.go('10:40', 5)
+    r_.go('15:00', 10)
+    r_.go('15:20', 8)
+    r_.go('15:25', 8)
+eq('RUNNER: the overnight arm only exists when enabled', (rOn.r.overnight is not None, rOff.r.overnight), (True, None))
+eq('RUNNER: it entered a virtual straddle at 15:20', len(rOn.r.overnight.st['open']), 1)
+trk = lambda g: [(t['symbol'], t['kind'], t['pnl_net']) for t in g.trades()]
+eq('THE REAL TRADES ARE IDENTICAL with the overnight arm on or off', trk(rOn), trk(rOff))
+ok('RUNNER: the heartbeat reports the arm', json.load(open(os.path.join(rOn.dir, 'status.json')))['shadow_overnight']['open'] == 1)
 
 # --- 8n. preflight ---
 rig = Rig(flat_tape(55800))

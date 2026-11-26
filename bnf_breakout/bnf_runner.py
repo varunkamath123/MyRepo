@@ -39,6 +39,7 @@ import bnf_broker
 import bnf_chain
 import bnf_config as cfg
 import bnf_data
+import bnf_overnight
 import bnf_shadow
 import bnf_strategy as S
 
@@ -71,7 +72,7 @@ def _atomic_write(path: str, obj) -> None:
 class Runner:
     def __init__(self, broker, c=cfg, clock=None, sleep=time.sleep, history=None,
                  state_dir=None, log_dir=None, logger=None, is_holiday=None,
-                 reload_client=None, chain=None, pcr_hist=None, chain_log=None, shadow=None, shadow_pw=None, shadow_early=None):
+                 reload_client=None, chain=None, pcr_hist=None, chain_log=None, shadow=None, shadow_pw=None, shadow_early=None, overnight=None):
         self.b, self.c, self.sleep = broker, c, sleep
         self.clock = clock or (lambda: datetime.now(IST))
         self.state_dir = state_dir or c.STATE_DIR
@@ -100,6 +101,10 @@ class Runner:
                                         real_fn=lambda: bool(self.state and self.state.get('position')),
                                         logger=self.log)
             if getattr(c, 'SHADOW_EARLY_ENTRY_ENABLED', False) and broker is not None else None)
+        self.overnight = overnight if overnight is not None else (
+            bnf_overnight.OvernightShadow(broker, c, self.state_dir, self.log_dir, append=self._append,
+                                          day_fn=lambda: self.day, logger=self.log)
+            if getattr(c, 'SHADOW_OVERNIGHT_ENABLED', False) and broker is not None else None)
         self.ctx = None
         self.day = None
         self.state = None
@@ -287,6 +292,10 @@ class Runner:
             secs = self._step(now)
             if any(a is not None and a.active() for a in (self.shadow, self.shadow_pw, self.shadow_early)):
                 secs = min(secs, float(self.c.SHADOW_POLL_SECONDS))      # wake in time to poll a shadow
+            if self.overnight is not None:
+                hint = self.overnight.wake_secs(now)                    # wake in time for a due overnight sample
+                if hint is not None:
+                    secs = min(secs, hint)
             return secs
         finally:
             self._status(now, self._last_note)
@@ -329,6 +338,11 @@ class Runner:
                     arm.step(now)
                 except Exception as e:
                     self.log.warning(f'[SHADOW] step failed: {e}')
+        if self.overnight is not None:
+            try:
+                self.overnight.step(now)
+            except Exception as e:
+                self.log.warning(f'[OVN] step failed: {e}')
         return secs
 
     def _ensure_client(self, now: datetime, day: str) -> bool:
@@ -566,6 +580,7 @@ class Runner:
                 shadow=(self.shadow.status() if self.shadow is not None else None),
                 shadow_pw=(self.shadow_pw.status() if self.shadow_pw is not None else None),
                 shadow_early=(self.shadow_early.status() if self.shadow_early is not None else None),
+                shadow_overnight=(self.overnight.status() if self.overnight is not None else None),
                 api_by_label=getattr(bb, 'by_label', None)))
         except Exception:
             pass

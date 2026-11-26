@@ -297,6 +297,28 @@ class Broker:
                     bid=float(bid) if bid not in (None, 0, '0') else None,
                     ask=float(ask) if ask not in (None, 0, '0') else None), 'ok'
 
+    def quotes_multi(self, symbols: list, essential: bool = False):
+        """Several symbols in ONE request (the overnight arm's sample: index, VIX, four options).
+        Returns ({symbol: raw 'v' dict}, status). Symbols the exchange did not answer are simply absent."""
+        resp, st = self._call('ovn_quote', lambda: self.f.quotes(dict(symbols=','.join(symbols))), essential)
+        if resp is None or st != 'ok':
+            return None, st
+        out = {}
+        for it in resp.get('d') or []:
+            try:
+                out[it.get('n') or it['v']['symbol']] = it['v']
+            except Exception:
+                continue
+        return out, 'ok'
+
+    def depth(self, symbol: str, essential: bool = False):
+        """5-level market depth, open interest and circuit limits for one contract. (dict | None, status)."""
+        resp, st = self._call('ovn_depth', lambda: self.f.depth(dict(symbol=symbol, ohlcv_flag='1')), essential)
+        if resp is None or st != 'ok':
+            return None, st
+        d = (resp.get('d') or {}).get(symbol)
+        return (d, 'ok') if isinstance(d, dict) and d else (None, 'no depth')
+
     def resolve_option(self, spot: float, direction: int, today: date):
         """Find a listed contract near the money. Probes a NEIGHBOURHOOD of strikes
         for each candidate expiry, because one dead strike is not a dead expiry

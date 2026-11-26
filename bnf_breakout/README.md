@@ -26,6 +26,7 @@ This is a testbed built to produce a clean forward verdict, not a claim of edge.
 | `bnf_runner.py` | the live paper loop, state, logs, heartbeat | operations change |
 | `bnf_replay.py` | replays `bnf_strategy` over history vs a random baseline | you want to try a config |
 | `bnf_shadow.py` | three virtual shadow arms (the third, early-entry, is the strategy without the coil gate, tracked forward): one follows every trade the stale rule closes as if it had stayed open; the other follows every entry and waits for a profit before applying the soft exit rules. Results are recorded beside the real trade. No orders, no effect on the real position. | you want to review the stale rule or the exits |
+| `bnf_overnight.py` | the overnight carry shadow: every session at 15:20 it records the ATM straddle (and a wing strangle) of the traded contract, re-quotes it the next session at seven times, and writes one record per night with long and short P&L at real bid/ask, spread cost, VIX and 5-level depth for live-execution planning. No orders, no effect on the real position. Review with `research/overnight_review.py`. | you want to review the overnight arm |
 | `bnf_chain.py` | records the option chain in a background thread and supplies the latest snapshot to the OI/PCR entry gate. | you want more fields recorded |
 | `tests/test_bnf.py` | 282 assertions, incl. a simulated trading day | always, before deploying |
 | `research/` | the pre-registered studies behind `LEARNINGS.md` | — |
