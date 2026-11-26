@@ -203,8 +203,11 @@ def _oi_gate(oi, direction: int, cfg) -> tuple:
             parts.append('no wall in range')
         else:
             clear = dist >= cfg.OI_WALL_CLEAR_PCT
-            ok &= clear
-            parts.append(f"wall {strike:.0f}@{dist:.2f}% {'clear' if clear else 'BLOCKS'}")
+            if getattr(cfg, 'OI_WALLS_BLOCKS', True):
+                ok &= clear
+                parts.append(f"wall {strike:.0f}@{dist:.2f}% {'clear' if clear else 'BLOCKS'}")
+            else:                       # recorded for the review, never decides
+                parts.append(f"wall {strike:.0f}@{dist:.2f}% {'clear' if clear else 'would block (wall rule is recorded only)'}")
     return bool(ok), ' | '.join(parts)
 
 

@@ -127,14 +127,13 @@ DIRECTION = 'toward'              # 'toward' = anticipate the break (the thesis)
 # Expect it to cut the trade count, which lengthens the time to a verdict; every setup it blocks
 # is logged with its would-be direction so its effect can be measured (research/oi_gate_shadow.py).
 OI_GATE_ENABLED = True
-OI_GATE_BLOCKS = False            # SHADOW (2026-10-24): evaluate and LOG the gate on every bar and on every
-                                  # taken trade, but do not block. True = it refuses entries. Switched to
-                                  # shadow after day 2: the gate blocked all 7 PUT setups on a -1.2% day
-                                  # (the 'wall' was a modest 54,000 strike, 4.9% of put OI) and left almost
-                                  # no trades to measure. Shadow keeps the trades flowing AND records what
-                                  # the gate would have said, so gated vs ungated P&L can be compared.
+OI_GATE_BLOCKS = True             # 2026-11-26 (owner's call): the PCR half REFUSES entries again. Shadow from 2026-10-24
+                                  # (the 'wall' rule blocked all 7 PUT setups on a -1.2% day and left no trades to
+                                  # measure). See EVALUATION.md, amendment 2026-11-26, for the evidence and its limits.
 OI_USE_PCR = True
-OI_USE_WALLS = True
+OI_USE_WALLS = True               # still evaluated and written to the decision/trade log ...
+OI_WALLS_BLOCKS = False           # ... but only RECORDED: live, the 7 wall-blocked trades netted +Rs1,507 (4 winners)
+                                  # and included the best winner, so the wall rule has not earned a veto. True = it also blocks.
 OI_PCR_Z_MIN = 0.0                # direction-signed PCR z must be >= this (CALL: z>=+min, PUT: z<=-min)
 OI_WALL_CLEAR_PCT = 0.5           # the biggest wall toward the trade must be farther than this (% of spot)
 OI_WALL_LOOKAHEAD_PCT = 1.5       # walls are searched within this distance of spot
@@ -155,9 +154,10 @@ OI_SKIP_ON_EXPIRY_DAY = True      # On the nearest series' expiry day the chain 
                                   # (the next monthly). Its PCR and OI collapse over the day (Oct 27: PCR 0.80 -> 0.60,
                                   # ATM IV 20.7 -> 5.3) and are not comparable with the history, so the gate is skipped
                                   # (passes, and says so) rather than judging on a different instrument.
-OI_ON_MISSING = 'block'           # 'block' | 'pass'. Block, so the test only counts trades where
-                                  # the condition could actually be evaluated, and it is VISIBLE
-                                  # in the decision log. 'pass' would silently trade unfiltered.
+OI_ON_MISSING = 'pass'            # 'block' | 'pass'. 'pass' since 2026-11-26, when the gate began to refuse for real: a
+                                  # chain outage must not stop the bot trading. The decision/trade log says
+                                  # 'no chain data' / 'pcr n/a' so those trades can be excluded from the gate's score.
+                                  # ('block' while the gate was shadow, so only evaluable trades were counted.)
 OI_PCR_HISTORY_SESSIONS = 20
 OI_PCR_MIN_HISTORY = 10
 

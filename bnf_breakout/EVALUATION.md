@@ -203,3 +203,33 @@ sessions. Consider dropping the coil gate (a rule change; restarts the n=30 coun
 is not wholly below zero. The 'before the coil can be computed' and 'gate would have refused' groups are the ones
 that decide it: they are the trades the live strategy does not take.
 
+
+## Amendment 2026-11-26: the PCR half of the OI gate REFUSES entries again (owner's call)
+
+**What changed.** `OI_GATE_BLOCKS = True`: an entry is refused when the PCR z-score (same time of day, prior 20
+sessions) disagrees with the trade's direction. The wall rule is still evaluated and written to the trade/decision log
+but no longer vetoes (`OI_WALLS_BLOCKS = False`). Missing chain data now PASSES (`OI_ON_MISSING = 'pass'`) so a feed
+outage cannot stop trading; those trades are marked `no chain data` / `pcr n/a` and are excluded from the gate's score.
+The shadow arms are unchanged (early-entry keeps the OI gate off by design).
+
+**Why.** Live, since the PCR history warmed up (first PCR z available Oct 27; every disagreement seen is Nov 19 or later), trades the PCR
+read "DISAGREES" on went 1 winner of 5, -Rs8,608; trades it agreed with or passed went 8 of 15, +Rs9,056. The wall rule's
+"would block" trades netted +Rs1,507 (4 of 7), including the largest winner, so it does not get a veto.
+
+**Evidence against it, stated up front.**
+- Five trades, all but one a loss, all in one 6-session stretch, and the slice was chosen AFTER seeing the results.
+- research/oi_pcr_adx_study.py (121 sessions) found no directional information in PCR, and the history test of the whole gate
+  moved the mean not at all (gate on n=200 -0.089%/trade; off n=268 -0.086%; random -0.080%).
+- Rule 3 above (check a change suggested by paper results on a held-out period) cannot be met: there is no PCR history older
+  than the recorder.
+- Rule 1 (no config change before n = 30) is overridden by the owner, as on 2026-10-22 and 10-24.
+
+**Consequences for the verdict.**
+- This is a strategy change. The count for the GATED configuration starts at 0 on 2026-11-27. The 25 trades since Oct 27 and the
+  26 since Oct 22 are the record of the ungated strategy and are not pooled with it.
+- The gate only removes trades, so reaching 30 takes longer.
+- Applied retroactively to the live record the PCR rule would have removed 5 trades (-Rs8,608), but removing a trade changes later
+  entries the same day (cooldown, second trade), so that is a bound, not a forecast.
+- Review: at 20 gated trades, compare the setups the gate refused (logged with direction and thesis in bnf_decisions, scored by
+  research/oi_gate_shadow.py) against those it allowed. If the refused setups did no worse than the allowed, switch it off.
+  The wall rule is judged on the recorded verdicts the same way before it is ever allowed to veto.

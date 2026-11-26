@@ -69,6 +69,8 @@ def mk_cfg(**kw):
     # test asks for it. (Shipped config has it ON; test_oi_gate_ships_on checks that.)
     ns.OI_GATE_ENABLED = False
     ns.OI_GATE_BLOCKS = True          # tests of the gate exercise blocking; shadow has its own tests
+    ns.OI_WALLS_BLOCKS = True         # the shipped config records walls only; the older tests exercise them as a veto
+    ns.OI_ON_MISSING = 'block'        # shipped is 'pass' since 2026-11-26; the older tests exercise the strict form
     for k, v in kw.items():
         setattr(ns, k, v)
     return ns
@@ -1294,9 +1296,18 @@ eq('SHADOW still refuses when ANOTHER gate fails', ev(oi_feat(), cfg_=cfgS, day_
 import bnf_config as _bc2       # noqa: E402
 eq('the shipped config evaluates the OI gate', _bc2.OI_GATE_ENABLED, True)
 eq('the shipped config has the volume gate OFF since 2026-10-27', _bc2.VOLUME_MODE, 'off')
-eq('...in SHADOW mode (logs the verdict, does not block) since 2026-10-24', _bc2.OI_GATE_BLOCKS, False)
-eq('...blocking when data is missing', _bc2.OI_ON_MISSING, 'block')
-eq('...using both conditions', (_bc2.OI_USE_PCR, _bc2.OI_USE_WALLS), (True, True))
+eq('...and REFUSES entries again since 2026-11-26 (owner call; shadow 2026-10-24..11-25)', _bc2.OI_GATE_BLOCKS, True)
+eq('...passing (visibly) when chain data is missing, so an outage cannot stop trading', _bc2.OI_ON_MISSING, 'pass')
+eq('...evaluating both conditions', (_bc2.OI_USE_PCR, _bc2.OI_USE_WALLS), (True, True))
+eq('...but only PCR vetoes; the wall rule is recorded only', _bc2.OI_WALLS_BLOCKS, False)
+# PCR-only veto, as shipped
+cfgP = mk_cfg(OI_GATE_ENABLED=True, OI_WALLS_BLOCKS=False, COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL'))
+eq('shipped form: a wall on top does NOT block when PCR agrees (z is on the trade side)', ev(oi_feat(up=0.1), cfg_=cfgP).enter, True)
+dwall = ev(oi_feat(up=0.1), cfg_=cfgP)
+ok('...and the wall verdict is still written to the gate detail', 'recorded only' in dwall.gates['oi'][1], dwall.gates['oi'][1])
+eq('shipped form: a disagreeing PCR still blocks', ev(oi_feat(pcr_z=-2.0), cfg_=cfgP).enter, False)
+eq('shipped form: missing chain data passes under OI_ON_MISSING=pass',
+   ev(None, cfg_=mk_cfg(OI_GATE_ENABLED=True, OI_WALLS_BLOCKS=False, OI_ON_MISSING='pass', COIL_RATIO_MAX=0.812, LEVELS=('PDH', 'PDL'))).enter, True)
 ok('validate() rejects a gate that checks nothing',
    any('gates nothing' in x for x in validate_with(OI_USE_PCR=False, OI_USE_WALLS=False)))
 ok("validate() rejects an unknown OI_ON_MISSING", any('OI_ON_MISSING' in x for x in validate_with(OI_ON_MISSING='maybe')))
