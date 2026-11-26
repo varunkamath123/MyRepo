@@ -41,6 +41,13 @@ Rules (research/stk_triggers.py, stk_expectancy.py; same definitions)
           running (31% of trades hit it, mean +11%); the 4-ATR trail lifted a 5-slot portfolio from CAGR 12.8% / Sharpe 0.85 /
           max drawdown -34% to 18.8% / 1.07 / -27%. Volume- and profit-based exit rules added nothing on top of it.
           Caveats: today's constituents (survivorship) flatter ride-the-runner exits; the edge sits in a few large winners.
+  STALE ROTATION (CAPITAL and RISK ledgers only; since Nov 26 2026, tag kronos-fut-v1.7-stale-rotation; rollback = ROTATE_STALE = False or tag kronos-fut-v1.6-trail-exit):
+          when a new signal finds the capital ledger (3 slots) or the risk ledger (5 positions / gross cap) full, the weakest STALE holder is closed in THAT ledger at the
+          day's price and the slot goes to the new signal. Stale = held >= 15 sessions and peak gain since entry < 1.5 entry-ATRs (never a big winner); weakest = lowest
+          return since entry. The position stays open in the SIGNAL ledger and keeps running under the trail, so the signal ledger is the unrotated control and nothing is
+          double counted. Why: futures_v2/research/stock_rotation_lab.py (H28): 14.9 years, 3 and 5 slots, swapping stale holders for fresh signals lifted CAGR / Sharpe
+          (15.8% / 0.83 -> 19.3% / 0.95 and 18.2% / 1.03 -> 20.6% / 1.15) and the replacement beat the dropped stock over the next 20 sessions in both halves; the LOSER and
+          LAGGARD variants did not pass. Caveats: survivorship, drawdown ~3 points worse, whole-life forward yield of stale holders equals a fresh signal's (Part 1).
   BASE-EXIT SHADOW: every long also carries the OLD exits (channel 10 / 30 sessions) as a no-capital paper outcome on the same
           entry, so each closed trade has a paired "what the old rules would have paid" (base_exit_* / paired_gain_pct on EXIT).
   Short shadow: the mirror, with the OLD exits (price below the prior-20-session low on 1.5x volume; stop +2 ATR; exit above
@@ -104,6 +111,9 @@ ATR_N, STOP_ATR         = 14, 2.0     # initial stop = 2 ATR from entry
 MAX_HOLD                = 30          # sessions: OLD (base / short-shadow) time exit
 TRAIL_ATR               = 4.0         # LONG exit: price < highest close since entry - 4 x current ATR14
 BACKSTOP_DAYS           = 365         # LONG housekeeping backstop (calendar days since entry); never expected to fire
+ROTATE_STALE            = True        # when a new signal finds the capital (3) or risk (5) ledger full, free a slot from the weakest STALE holder. Revert: False
+STALE_MIN_HELD          = 15          # sessions held (incl. today) before a position can be called stale
+STALE_PEAK_ATR          = 1.5         # stale = peak gain since entry still below this many entry-ATRs
 COST_PCT                = 0.0010      # round trip, deducted at exit
 MAX_SLOTS               = 3           # capital-book concurrency (Rs3.5L of margin)
 LIVE_VOLUME_ADJ         = 1.03        # 15:25 volume is ~97% of the day: approximation
@@ -136,10 +146,12 @@ class StockPos:
     base_exit_date: Optional[str] = None     # when the OLD exits (channel 10 / 30 sessions / stop) first fired on this position
     base_exit_price: Optional[float] = None
     base_exit_reason: Optional[str] = None
+    capital_rotated_date: Optional[str] = None   # stale rotation: when this position left the CAPITAL ledger (it stays in the signal ledger)
+    risk_rotated_date: Optional[str] = None      # ... and the RISK ledger
 
 
 def _empty_stats() -> dict:
-    return {"n": 0, "wins": 0, "pnl_inr": 0.0, "cost_inr": 0.0, "sum_ret_pct": 0.0, "sum_hedged_pct": 0.0}
+    return {"n": 0, "wins": 0, "pnl_inr": 0.0, "cost_inr": 0.0, "sum_ret_pct": 0.0, "sum_hedged_pct": 0.0, "rotated": 0}
 
 
 def _load_state() -> dict:
@@ -246,6 +258,59 @@ def check_exit(pos: StockPos, df: pd.DataFrame, px: float, day_high: Optional[fl
     return None
 
 
+def _stale_victim(positions: dict, data: dict, today: str, ledger: str) -> Optional[str]:
+    """The weakest STALE long in `ledger` ('capital' or 'risk'), or None.  Stale = held >= STALE_MIN_HELD sessions and the peak gain since entry
+    still below STALE_PEAK_ATR entry-ATRs (never a big winner).  Weakest = lowest return since entry.  Positions opened today, or without a quote today, never qualify."""
+    best = None
+    for sym, p in positions.items():
+        if ledger == "capital" and not p.get("slot"):
+            continue
+        if ledger == "risk" and p.get("risk_lots", 0) <= 0:
+            continue
+        d = data.get(sym)
+        if d is None or p["entry_date"] == today or p.get("side", 1) != 1:
+            continue
+        held = int((d["df"]["datetime"].dt.normalize() > pd.Timestamp(p["entry_date"])).sum()) + 1
+        if held < STALE_MIN_HELD:
+            continue
+        if (p.get("hwm") or p["entry_price"]) - p["entry_price"] >= STALE_PEAK_ATR * p["atr"]:
+            continue
+        ret = d["px"] / p["entry_price"] - 1
+        if best is None or ret < best[0]:
+            best = (ret, sym)
+    return best[1] if best else None
+
+
+def _rotate_out(st: dict, sym: str, ledger: str, px: float, today: str, nifty_now: Optional[float], replaced_by: str,
+                write_logs: bool, events: list) -> None:
+    """Close the position in ONE ledger ('capital' or 'risk') at today's price to free its slot for `replaced_by`.  The position stays open in the signal ledger
+    (the unrotated control) and keeps running under the trail; the ledger's P&L is booked here, so its later exit must not book it again (slot / risk_lots are cleared)."""
+    p = st["positions"][sym]; pos = StockPos(**p)
+    mult = pos.risk_lots if ledger == "risk" else 1
+    gross = (px - pos.entry_price) * pos.lot; cost = COST_PCT * pos.entry_price * pos.lot; net = gross - cost
+    ret_pct = ((px - pos.entry_price) / pos.entry_price - COST_PCT) * 100
+    nret = ((nifty_now / pos.nifty_entry - 1) * 100) if (nifty_now and pos.nifty_entry) else None
+    hedged = (ret_pct - nret - HEDGE_COST_PCT * 100) if nret is not None else None
+    s_ = st["stats"][ledger]
+    s_["n"] += 1; s_["wins"] += 1 if net > 0 else 0
+    s_["pnl_inr"] += net * mult; s_["cost_inr"] += cost * mult; s_["sum_ret_pct"] += ret_pct
+    s_["sum_hedged_pct"] += hedged if hedged is not None else 0.0
+    s_["rotated"] = s_.get("rotated", 0) + 1
+    if ledger == "capital":
+        p["slot"] = False; p["capital_rotated_date"] = today
+    else:
+        p["risk_lots"] = 0; p["risk_rotated_date"] = today
+    held = int(max(0, (pd.Timestamp(today) - pd.Timestamp(pos.entry_date)).days))
+    rec = {"event": "ROTATE_OUT", "book": ledger, "symbol": sym, "direction": "LONG", "entry_date": pos.entry_date, "entry_price": pos.entry_price,
+           "rotate_date": today, "rotate_price": px, "replaced_by": replaced_by, "calendar_days_held": held, "ret_pct": ret_pct, "pnl_inr": net,
+           "pnl_ledger_inr": net * mult, "lots": mult, "hedged_ret_pct": hedged, "peak_ret_pct": ((p.get("hwm") or pos.entry_price) / pos.entry_price - 1) * 100,
+           "still_open_in_signal_ledger": True}
+    events.append(rec)
+    if write_logs:
+        _append(TRADES_LOG, rec)
+    log.info("[%s] ROTATE OUT of the %s ledger @ %.2f (%+.2f%%, stale after %d calendar days) to make room for %s; stays in the signal ledger", sym, ledger, px, ret_pct, held, replaced_by)
+
+
 def run_day(st: dict, universe: list[dict], data: dict, today: str, vol_adj: float = LIVE_VOLUME_ADJ,
             kronos_fn=None, write_logs: bool = True, regime: Optional[dict] = None) -> list[dict]:
     """One daily run on already-fetched data: data[symbol] = {"df", "px", "vol", "high", "low"}.
@@ -324,7 +389,8 @@ def run_day(st: dict, universe: list[dict], data: dict, today: str, vol_adj: flo
                    "pnl_inr": net, "ret_pct": ret_pct, "nifty_entry": pos.nifty_entry, "nifty_exit": nifty_now,
                    "nifty_ret_pct": nret, "hedged_ret_pct": hedged, "regime_above200": pos.regime_above200,
                    "volx": pos.volx, "kronos_dir": pos.kronos_dir, "kronos_conf": pos.kronos_conf,
-                   "risk_lots": pos.risk_lots, "pnl_risk_inr": net * pos.risk_lots}
+                   "risk_lots": pos.risk_lots, "pnl_risk_inr": net * pos.risk_lots,
+                   "capital_rotated_date": pos.capital_rotated_date, "risk_rotated_date": pos.risk_rotated_date}
             if base:
                 rec.update(base)
             events.append(rec)
@@ -362,9 +428,16 @@ def run_day(st: dict, universe: list[dict], data: dict, today: str, vol_adj: flo
         for volx, sym, ev in sorted(cands[side], reverse=True):            # strongest volume first
             d = data[sym]
             slot = False
+            cap_victim = risk_victim = None
             if side == 1:
                 slot = regime_ok and open_slots < MAX_SLOTS
-                open_slots += 1 if slot else 0
+                if slot:
+                    open_slots += 1
+                elif regime_ok and ROTATE_STALE:                           # all capital slots taken: free one from the weakest stale holder
+                    cap_victim = _stale_victim(st["positions"], data, today, "capital")
+                    if cap_victim:
+                        _rotate_out(st, cap_victim, "capital", data[cap_victim]["px"], today, nifty_now, sym, write_logs, events)
+                        slot = True                                         # one out, one in: open_slots is unchanged
             kd = kc = None
             if side == 1 and kronos_fn is not None:
                 try:
@@ -376,7 +449,18 @@ def run_day(st: dict, universe: list[dict], data: dict, today: str, vol_adj: flo
                 want = max(1, int(round(RISK_PCT * RISK_CAPITAL / (STOP_ATR * ev["atr"] * lots[sym]))))
                 open_risk = [p for p in st["positions"].values() if p.get("risk_lots", 0) > 0]
                 gross_now = sum(p["risk_lots"] * p["lot"] * p["entry_price"] for p in open_risk)
-                if len(open_risk) < RISK_MAX_POS and gross_now + want * lots[sym] * d["px"] <= RISK_MAX_GROSS * RISK_CAPITAL:
+                new_gross = want * lots[sym] * d["px"]
+                fits = len(open_risk) < RISK_MAX_POS and gross_now + new_gross <= RISK_MAX_GROSS * RISK_CAPITAL
+                if not fits and ROTATE_STALE:                               # a cap blocks the new position: try freeing room from the weakest stale risk holder
+                    risk_victim = _stale_victim(st["positions"], data, today, "risk")
+                    if risk_victim:
+                        vp = st["positions"][risk_victim]; vg = vp["risk_lots"] * vp["lot"] * vp["entry_price"]
+                        if len(open_risk) - 1 < RISK_MAX_POS and gross_now - vg + new_gross <= RISK_MAX_GROSS * RISK_CAPITAL:
+                            _rotate_out(st, risk_victim, "risk", data[risk_victim]["px"], today, nifty_now, sym, write_logs, events)
+                            fits = True
+                        else:
+                            risk_victim = None
+                if fits:
                     risk_lots = want
             pos = StockPos(symbol=sym, entry_date=today, entry_price=d["px"], atr=ev["atr"], lot=lots[sym], slot=slot,
                            volx=round(volx, 3), kronos_dir=kd, kronos_conf=(round(kc, 3) if kc is not None else None),
@@ -388,6 +472,7 @@ def run_day(st: dict, universe: list[dict], data: dict, today: str, vol_adj: flo
                    "hi20": ev["hi_in"], "lo20": ev["lo_in"], "nifty": nifty_now, "regime_above200": above200,
                    "capital_blocked_by_regime": (side == 1 and not regime_ok), "risk_lots": risk_lots,
                    "exit_rule": "trail4" if side == 1 else "channel10_30d",
+                   "rotated_out_for_capital": cap_victim, "rotated_out_for_risk": risk_victim,
                    "kronos_dir": kd, "kronos_conf": pos.kronos_conf,
                    "kronos_agrees": (kd == "LONG") if kd is not None else None}
             events.append(rec)
@@ -529,11 +614,11 @@ def print_status(st: dict):
         s = st["stats"][key]
         if key == "risk" and s["n"]:
             print(f"  {name}: {s['n']} closed, win {s['wins']/s['n']*100:.0f}%, net INR {s['pnl_inr']:+,.0f} = {s['pnl_inr']/RISK_CAPITAL*100:+.2f}% of capital; "
-                  f"{s['sum_ret_pct']/s['n']:+.2f}%/trade")
+                  f"{s['sum_ret_pct']/s['n']:+.2f}%/trade" + (f"; {s['rotated']} closed by stale rotation" if s.get("rotated") else ""))
         elif s["n"]:
             print(f"  {name}: {s['n']} closed, win {s['wins']/s['n']*100:.0f}%, net INR {s['pnl_inr']:+,.0f} "
                   f"(avg {s['pnl_inr']/s['n']:+,.0f}/trade); {s['sum_ret_pct']/s['n']:+.2f}%/trade, "
-                  f"beta-hedged {s['sum_hedged_pct']/s['n']:+.2f}%/trade")
+                  f"beta-hedged {s['sum_hedged_pct']/s['n']:+.2f}%/trade" + (f"; {s['rotated']} closed by stale rotation" if s.get("rotated") else ""))
         else:
             print(f"  {name}: no closed trades yet")
     for title, book in (("OPEN (long)", st["positions"]), ("OPEN (short shadow)", st["shorts"])):
@@ -545,7 +630,9 @@ def print_status(st: dict):
                       f"lot {p['lot']}  {'CAPITAL' if p['slot'] else 'signal-only'}{'+RISK x' + str(p['risk_lots']) if p.get('risk_lots', 0) else ''}  volx {p['volx']:.2f}  "
                       f"NIFTY>200DMA {p.get('regime_above200')}  kronos {p['kronos_dir']}/{p['kronos_conf']}"
                       + (f"  hwm {p['hwm']:.2f}" if p.get("hwm") and sd == 1 else "")
-                      + (f"  [old exits would have closed {p['base_exit_date']} @ {p['base_exit_price']:.2f} ({p['base_exit_reason']})]" if p.get("base_exit_date") else ""))
+                      + (f"  [old exits would have closed {p['base_exit_date']} @ {p['base_exit_price']:.2f} ({p['base_exit_reason']})]" if p.get("base_exit_date") else "")
+                      + (f"  [rotated out of CAPITAL {p['capital_rotated_date']}]" if p.get("capital_rotated_date") else "")
+                      + (f"  [rotated out of RISK {p['risk_rotated_date']}]" if p.get("risk_rotated_date") else ""))
     if not st["positions"] and not st["shorts"]:
         print("  No open positions.")
     print(sep)

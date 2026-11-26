@@ -235,6 +235,98 @@ with contextlib.redirect_stdout(buf):
     sb.print_status(st)
 check("status shows the base-exit shadow ledger, the hwm and the old-exit note on an open position", "BASE-EXIT SHADOW" in buf.getvalue() and "hwm 110.00" in buf.getvalue() and "old exits would have closed" in buf.getvalue())
 
+print("ROT: stale rotation (capital and risk ledgers; the signal ledger is the untouched control)")
+OLD = str(DF["datetime"].iloc[-21].date())          # 20 completed sessions after this date -> held 21 sessions today
+RECENT = "2026-11-05"
+def mkpos(sym, entry, ep, slot=True, risk_lots=0, hwm=None, nifty_entry=None):
+    return sb.asdict(sb.StockPos(sym, entry, ep, 2.0, 100, slot, 1.7, risk_lots=risk_lots, hwm=(ep if hwm is None else hwm), nifty_entry=nifty_entry))
+def cap_state(entries=(OLD, OLD, OLD), prices=(100.0, 103.0, 101.0), hwms=(None, None, None), nifty=None):
+    st = fresh()
+    for s, e, ep, h in zip(("AAA", "BBB", "CCC"), entries, prices, hwms):
+        st["positions"][s] = mkpos(s, e, ep, slot=True, hwm=h, nifty_entry=nifty)
+    return st
+DROT = {"AAA": {"df": DF, "px": 101.0, "vol": 1000.0}, "BBB": {"df": DF, "px": 102.0, "vol": 1000.0}, "CCC": {"df": DF, "px": 101.5, "vol": 1000.0}, "DDD": {"df": DF, "px": 102.0, "vol": 2000.0}}
+st = cap_state(nifty=24000.0)
+ev_ = sb.run_day(st, UNI, DROT, TODAY, vol_adj=1.0, regime=ABOVE)
+rot = [e for e in ev_ if e["event"] == "ROTATE_OUT"]
+check("3 capital slots full of stale holders + a new signal -> exactly one rotation, the LOWEST return (BBB -0.97%) replaced by DDD",
+      len(rot) == 1 and rot[0]["symbol"] == "BBB" and rot[0]["replaced_by"] == "DDD" and rot[0]["book"] == "capital", f"({[(r['symbol'], round(r['ret_pct'], 2)) for r in rot]})")
+check("DDD takes the capital slot, BBB loses it but stays open in the signal ledger, capital slots stay at 3",
+      st["positions"]["DDD"]["slot"] is True and st["positions"]["BBB"]["slot"] is False and "BBB" in st["positions"] and st["positions"]["BBB"]["capital_rotated_date"] == TODAY
+      and sum(1 for p in st["positions"].values() if p["slot"]) == 3)
+want_net = (102.0 - 103.0) * 100 - 0.001 * 103.0 * 100
+check("capital ledger books the rotated trade at today's price (net P&L, 1 closed, rotated counter); the signal ledger books nothing yet",
+      st["stats"]["capital"]["n"] == 1 and abs(st["stats"]["capital"]["pnl_inr"] - want_net) < 1e-6 and st["stats"]["capital"]["rotated"] == 1 and st["stats"]["signal"]["n"] == 0,
+      f"({st['stats']['capital']['pnl_inr']:+.1f} vs {want_net:+.1f})")
+check("rotation hedged return = trade return - NIFTY move (0%) - 0.03%", abs(rot[0]["hedged_ret_pct"] - (rot[0]["ret_pct"] - 0.03)) < 1e-9)
+e = [r for r in ev_ if r["event"] == "ENTRY"][0]
+check("ENTRY record names the stock it rotated out, and ROTATE_OUT is logged before it", e["rotated_out_for_capital"] == "BBB" and [x["event"] for x in ev_] == ["ROTATE_OUT", "ENTRY"])
+# later exit of the rotated holder must not double count in the capital ledger
+ev2 = sb.run_day(st, UNI[:2], {"BBB": {"df": DF, "px": 97.0, "vol": 1000.0}}, "2026-11-10", vol_adj=1.0, regime=ABOVE)
+x = [r for r in ev2 if r["event"] == "EXIT"][0]
+check("the rotated holder later stops out: signal ledger books it, capital ledger does NOT book it again, EXIT carries the rotation date",
+      st["stats"]["capital"]["n"] == 1 and st["stats"]["signal"]["n"] == 1 and x["slot"] is False and x["capital_rotated_date"] == TODAY)
+st = cap_state(hwms=(105.0, 108.0, 106.0))
+sb.run_day(st, UNI, DROT, TODAY, vol_adj=1.0, regime=ABOVE)
+check("holders that peaked >= 1.5 ATR (not stale) are never rotated: the new signal is signal-only", st["positions"]["DDD"]["slot"] is False and st["stats"]["capital"]["n"] == 0)
+st = cap_state(entries=(RECENT, RECENT, RECENT))
+sb.run_day(st, UNI, DROT, TODAY, vol_adj=1.0, regime=ABOVE)
+check("holders younger than 15 sessions are not stale: no rotation", st["positions"]["DDD"]["slot"] is False and st["stats"]["capital"]["n"] == 0)
+st = cap_state()
+sb.run_day(st, UNI, DROT, TODAY, vol_adj=1.0, regime=BELOW)
+check("NIFTY below its 200-DMA: no capital slot and no rotation", st["positions"]["DDD"]["slot"] is False and st["stats"]["capital"]["n"] == 0)
+st = cap_state(entries=(OLD, RECENT, RECENT))
+D2 = dict(DROT); D2["DDD"] = {"df": DF, "px": 102.0, "vol": 3000.0}; D2["EEE"] = {"df": DF, "px": 102.0, "vol": 2000.0}
+sb.run_day(st, UNI, D2, TODAY, vol_adj=1.0, regime=ABOVE)
+check("two signals, one stale holder: the stronger volume (DDD) gets the rotated slot, EEE is signal-only, one rotation",
+      st["positions"]["DDD"]["slot"] is True and st["positions"]["EEE"]["slot"] is False and st["stats"]["capital"]["rotated"] == 1 and st["positions"]["AAA"]["slot"] is False)
+st = cap_state()
+D3 = {k: v for k, v in DROT.items() if k != "BBB"}
+sb.run_day(st, UNI, D3, TODAY, vol_adj=1.0, regime=ABOVE)
+check("a stale holder with no quote today is skipped; the next-weakest (CCC) is rotated", st["positions"]["CCC"]["slot"] is False and st["positions"]["BBB"]["slot"] is True and st["positions"]["DDD"]["slot"] is True)
+sb.ROTATE_STALE = False
+st = cap_state()
+sb.run_day(st, UNI, DROT, TODAY, vol_adj=1.0, regime=ABOVE)
+check("ROTATE_STALE = False (the revert switch): no rotation, DDD signal-only", st["positions"]["DDD"]["slot"] is False and st["stats"]["capital"]["n"] == 0 and st["stats"]["capital"]["rotated"] == 0)
+sb.ROTATE_STALE = True
+UNI6 = [{"symbol": s, "key": f"k{s}", "lot": 100} for s in ("A1", "A2", "A3", "A4", "A5", "A6")]
+st = fresh()
+for s in ("A1", "A2", "A3", "A4", "A5"):
+    st["positions"][s] = mkpos(s, OLD, 100.0, slot=False, risk_lots=75)
+DR = {s: {"df": DF, "px": px, "vol": 1000.0} for s, px in (("A1", 101.0), ("A2", 100.5), ("A3", 99.5), ("A4", 100.0), ("A5", 101.5))}
+DR["A6"] = {"df": DF, "px": 102.0, "vol": 2000.0}
+ev_ = sb.run_day(st, UNI6, DR, TODAY, vol_adj=1.0, regime=ABOVE)
+rr = [e for e in ev_ if e["event"] == "ROTATE_OUT"]
+per_lot = (99.5 - 100.0) * 100 - 0.001 * 100.0 * 100
+check("risk ledger at its 5-position cap + a new signal -> the weakest stale risk holder (A3) is rotated out of the risk ledger only",
+      len(rr) == 1 and rr[0]["book"] == "risk" and rr[0]["symbol"] == "A3" and st["positions"]["A3"]["risk_lots"] == 0 and "A3" in st["positions"] and st["positions"]["A6"]["risk_lots"] == 75
+      and sum(1 for p in st["positions"].values() if p["risk_lots"] > 0) == 5, f"({[(r['book'], r['symbol']) for r in rr]})")
+check("risk ledger books the rotated trade x lots (per-lot net x 75), counter incremented, signal ledger untouched",
+      st["stats"]["risk"]["n"] == 1 and abs(st["stats"]["risk"]["pnl_inr"] - per_lot * 75) < 1e-6 and st["stats"]["risk"]["rotated"] == 1 and st["stats"]["signal"]["n"] == 0 and st["stats"]["capital"]["rotated"] == 0,
+      f"({st['stats']['risk']['pnl_inr']:+,.0f} vs {per_lot * 75:+,.0f})")
+ev3 = sb.run_day(st, UNI6[:3], {"A3": {"df": DF, "px": 95.0, "vol": 1000.0}}, "2026-11-10", vol_adj=1.0, regime=ABOVE)
+check("a risk-rotated holder that later exits is not booked again in the risk ledger", st["stats"]["risk"]["n"] == 1 and st["stats"]["signal"]["n"] == 1)
+st = fresh()
+for s in ("A1", "A2", "A3", "A4", "A5"):
+    st["positions"][s] = mkpos(s, OLD, 100.0, slot=False, risk_lots=75)
+UB = [dict(u) for u in UNI6[:5]] + [{"symbol": "B1", "key": "kB1", "lot": 100}]
+DR2 = {s: {"df": DF, "px": px, "vol": 1000.0} for s, px in (("A1", 101.0), ("A2", 100.5), ("A3", 99.5), ("A4", 100.0), ("A5", 101.5))}
+DR2["B1"] = {"df": DF, "px": 400.0, "vol": 2000.0}
+ev_ = sb.run_day(st, UB, DR2, TODAY, vol_adj=1.0, regime=ABOVE)
+check("a position too big for the gross cap even after freeing one stale holder: no risk rotation, entry is signal-only",
+      not [e for e in ev_ if e["event"] == "ROTATE_OUT" and e["book"] == "risk"] and st["positions"]["B1"]["risk_lots"] == 0 and st["stats"]["risk"]["n"] == 0)
+buf = io.StringIO()
+st = cap_state(nifty=24000.0)
+sb.run_day(st, UNI, DROT, TODAY, vol_adj=1.0, regime=ABOVE)
+with contextlib.redirect_stdout(buf):
+    sb.print_status(st)
+check("status shows 'closed by stale rotation' on the capital ledger and the rotated-out note on the position", "closed by stale rotation" in buf.getvalue() and "rotated out of CAPITAL" in buf.getvalue())
+st = fresh()
+st["positions"]["AAA"] = {k: v for k, v in mkpos("AAA", OLD, 100.0).items() if k not in ("capital_rotated_date", "risk_rotated_date")}
+st["stats"]["capital"] = {k: v for k, v in st["stats"]["capital"].items() if k != "rotated"}
+ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 101.0, "vol": 1000.0}}, TODAY, vol_adj=1.0, regime=ABOVE)
+check("a position / stats saved before rotation existed (no rotated keys) still runs", ev_ == [] and "AAA" in st["positions"])
+
 print("RB: risk book (equal risk, count and gross caps)")
 st = fresh()
 sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 102.0, "vol": 2000.0}}, TODAY, vol_adj=1.0, regime=ABOVE)
@@ -349,6 +441,10 @@ print(f"  reference (independent numpy sim of the trail rule): {len(rr)} closed 
 check("long signal book (4-ATR trail): trade count within 5% of the independent reference sim", abs(eng_n - ref_n) <= max(6, 0.05 * ref_n), f"(engine {eng_n}, reference {ref_n})")
 check("long signal book (4-ATR trail): expectancy within 0.8 pt of the independent reference", abs(eng_mean - ref_mean) <= 0.8, f"(engine {eng_mean:+.2f}, reference {ref_mean:+.2f})")
 check("every closed live long has a paired base-exit outcome (ledger counts match)", bsl["n"] == sg["n"], f"({bsl['n']} vs {sg['n']})")
+cp, rk = st["stats"]["capital"], st["stats"]["risk"]
+print(f"  capital ledger: {cp['n']} closed ({cp.get('rotated', 0)} by stale rotation), win {cp['wins']/max(cp['n'],1)*100:.0f}%, {cp['sum_ret_pct']/max(cp['n'],1):+.2f}%/trade, Rs{cp['pnl_inr']:+,.0f} per lot;   risk ledger: {rk['n']} closed ({rk.get('rotated', 0)} by rotation), Rs{rk['pnl_inr']:+,.0f}")
+check("stale rotation leaves the SIGNAL ledger untouched (same 368 closed trades and +3.58%/trade as before rotation existed)", sg["n"] == 368 and abs(eng_mean - 3.58) <= 0.01, f"({sg['n']}, {eng_mean:+.2f})")
+check("stale rotation fired in the 3y replay (capital ledger)", cp.get("rotated", 0) > 0, f"({cp.get('rotated', 0)})")
 check("short shadow loses, as the research found (-1.25% short-only sim): within 0.35 pt", abs(sh["sum_ret_pct"] / sh["n"] - (-1.25)) <= 0.35, f"({sh['sum_ret_pct']/sh['n']:+.2f})")
 check("short shadow trade count within 8% of the research short-only sim (400)", abs((sh["n"] + len(st["shorts"])) - 400) <= 32, f"({sh['n'] + len(st['shorts'])})")
 

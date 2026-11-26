@@ -26,7 +26,9 @@ for side, book in ((1, st["positions"]), (-1, st["shorts"])):
         stop = pos.entry_price - side * sb.STOP_ATR * pos.atr
         if side == 1:
             hw = sb._hwm(pos, df, px); atr = sb._atr_now(df, px); trail = hw - sb.TRAIL_ATR * atr
-            lvl = f"trail {trail:,.1f} ({(px / trail - 1) * 100:+.1f}%)"
+            held = int((df["datetime"].dt.normalize() > pd.Timestamp(pos.entry_date)).sum()) + 1
+            stale = held >= sb.STALE_MIN_HELD and (hw - pos.entry_price) < sb.STALE_PEAK_ATR * pos.atr
+            lvl = f"trail {trail:,.1f} ({(px / trail - 1) * 100:+.1f}%)  held {held}d" + ("  STALE" if stale else (f"  (stale from day {sb.STALE_MIN_HELD} if peak < {sb.STALE_PEAK_ATR} ATR)" if (hw - pos.entry_price) < sb.STALE_PEAK_ATR * pos.atr else ""))
         else:
             hw = None; lvl = "old rules (10d high / 30d)"
         peak = (hw / pos.entry_price - 1) * 100 if hw else None
