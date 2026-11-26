@@ -55,7 +55,7 @@ sigs = [json.loads(l) for l in sb.SIGNALS_LOG.read_text().splitlines()]
 check("one signal-log row per stock evaluated (long signals only on this tape)", len(sigs) == 5 and all(r["long_signal"] and not r["short_signal"] for r in sigs))
 
 print("S2: stop, channel, time exits and P&L / cost")
-for label, px, want in (("stop", 97.9, "STOP_LOSS"), ("channel (above the stop, below the 10d low)", 98.9, "CHANNEL_EXIT"), ("hold", 100.0, None)):
+for label, px, want in (("stop", 97.9, "STOP_LOSS"), ("old channel breach (above the stop, below the 10d low): the trail HOLDS", 98.9, None), ("hold", 100.0, None)):
     st = fresh()
     st["positions"]["AAA"] = sb.asdict(sb.StockPos("AAA", "2026-11-05", 102.0, 2.0, 100, True, 1.7))
     ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": px, "vol": 1000.0}}, TODAY, vol_adj=1.0)
@@ -77,14 +77,14 @@ st = fresh(); st["positions"]["AAA"] = sb.asdict(sb.StockPos("AAA", str(entry_d.
 check("session 29 -> still held", sb.check_exit(sb.StockPos(**st["positions"]["AAA"]), d_hold, 100.0) is None)
 entry_d = d_hold["datetime"].iloc[-30]                       # 29 bars after -> today is session 30
 p30 = sb.StockPos("AAA", str(entry_d.date()), 102.0, 2.0, 100, True, 1.7)
-check("session 30 -> TIME_EXIT", sb.check_exit(p30, d_hold, 100.0) == "TIME_EXIT")
+check("session 30 -> the OLD rule says TIME_EXIT, the live long rule holds", sb.check_exit_base(p30, d_hold, 100.0) == "TIME_EXIT" and sb.check_exit(p30, d_hold, 100.0) is None)
 
 print("S3: no re-entry on the exit day; no double processing; entry-day positions are not exited")
 st = fresh()
-st["positions"]["AAA"] = sb.asdict(p30)
-ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": d_hold, "px": 103.0, "vol": 5000.0}}, TODAY, vol_adj=1.0)
-check("time exit AND breakout on the same day -> exit only, no re-entry",
-      [e["event"] for e in ev_] == ["EXIT"] and "AAA" not in st["positions"])
+st["positions"]["AAA"] = sb.asdict(sb.StockPos("AAA", "2026-11-05", 102.0, 2.0, 100, True, 1.7, hwm=200.0))
+ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 103.0, "vol": 5000.0}}, TODAY, vol_adj=1.0)
+check("trail exit AND breakout on the same day -> exit only, no re-entry",
+      [e["event"] for e in ev_] == ["EXIT"] and ev_[0]["exit_reason"] == "TRAIL_EXIT" and "AAA" not in st["positions"])
 st = fresh()
 sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 102.0, "vol": 2000.0}}, TODAY, vol_adj=1.0)
 ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 102.0, "vol": 2000.0}}, TODAY, vol_adj=1.0)
@@ -167,9 +167,73 @@ for label, px, want in (("stop (price up 2 ATR)", 102.2, "STOP_LOSS"), ("channel
               and st["stats"]["capital"]["n"] == 0 and abs(ex[0]["nifty_ret_pct"] + 1.0) < 1e-9, f"({ex[0]['pnl_inr']:+.1f}, hedged {ex[0]['hedged_ret_pct']:+.2f}%)")
 st = fresh()
 st["positions"]["AAA"] = sb.asdict(sb.StockPos("AAA", "2026-11-05", 102.0, 2.0, 100, True, 1.7))
-ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 98.5, "vol": 2000.0}}, TODAY, vol_adj=1.0, regime=ABOVE)
-check("a breakdown exits the long (channel) and opens the short shadow, independently, same day",
+ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 97.9, "vol": 2000.0}}, TODAY, vol_adj=1.0, regime=ABOVE)
+check("a breakdown stops out the long and opens the short shadow, independently, same day",
       [(e["event"], e["book"]) for e in ev_] == [("EXIT", "long"), ("ENTRY", "short_shadow")] and "AAA" not in st["positions"] and "AAA" in st["shorts"])
+
+print("TR: 4-ATR trail for longs, base-exit shadow, high-water mark")
+P0 = lambda **kw: sb.StockPos("AAA", "2026-11-05", 102.0, 2.0, 100, True, 1.7, **kw)
+check("trail: hwm 130, ATR 2 -> level 122; price 121 -> TRAIL_EXIT, 123 -> hold", sb.check_exit(P0(hwm=130.0), DF, 121.0) == "TRAIL_EXIT" and sb.check_exit(P0(hwm=130.0), DF, 123.0) is None)
+check("trail: price exactly at the level (122.0) holds (strictly below exits)", sb.check_exit(P0(hwm=130.0), DF, 122.0) is None)
+check("stop still comes first (price below entry - 2 ATR)", sb.check_exit(P0(hwm=130.0), DF, 97.0) == "STOP_LOSS")
+dh = flat_df(); dh.loc[dh.index[-1], "close"] = 130.0      # the completed 2026-11-06 session closed at 130, after the 2026-11-05 entry
+check("hwm derived from completed closes after entry when none is stored", abs(sb._hwm(P0(), dh, 105.0) - 130.0) < 1e-9 and abs(sb._hwm(P0(), DF, 105.0) - 105.0) < 1e-9 and abs(sb._hwm(P0(), DF, 100.0) - 102.0) < 1e-9)
+st = fresh(); st["positions"]["AAA"] = sb.asdict(P0(hwm=102.0))
+sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 110.0, "vol": 1000.0}}, TODAY, vol_adj=1.0)
+h1 = st["positions"]["AAA"]["hwm"]
+sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 105.0, "vol": 1000.0}}, "2026-11-10", vol_adj=1.0)
+check("hwm is persisted each run and never falls", h1 == 110.0 and st["positions"]["AAA"]["hwm"] == 110.0, f"({h1}, {st['positions']['AAA']['hwm']})")
+check("a day-high spike widens the ATR (today's range counts): a wider trail holds where a flat-tape ATR would exit",
+      sb.check_exit(P0(hwm=130.0), DF, 121.0, day_high=140.0, day_low=100.0) is None and sb.check_exit(P0(hwm=130.0), DF, 121.0) == "TRAIL_EXIT")
+old400 = P0(); old400.entry_date = "2025-10-01"
+check("365-day backstop -> TIME_EXIT (housekeeping)", sb.check_exit(old400, DF, 103.0) == "TIME_EXIT")
+check("short shadow keeps the OLD rules (channel exit above the 10d high)", sb.check_exit(sb.StockPos("AAA", "2026-11-05", 98.0, 2.0, 100, False, 1.7, side=-1), DF, 101.5) == "CHANNEL_EXIT")
+
+# base shadow: the old rules fire, the trail holds, then the trail closes it later
+st = fresh(); st["positions"]["AAA"] = sb.asdict(P0(hwm=102.0))
+ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 98.9, "vol": 1000.0}}, TODAY, vol_adj=1.0)
+b = [e for e in ev_ if e["event"] == "BASE_SHADOW"]
+p_ = st["positions"]["AAA"]
+check("old channel breach, trail holds: position stays open, a BASE_SHADOW event and the stored base exit",
+      len(b) == 1 and not [e for e in ev_ if e["event"] == "EXIT"] and p_["base_exit_reason"] == "CHANNEL_EXIT" and p_["base_exit_price"] == 98.9 and p_["base_exit_date"] == TODAY)
+ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 99.5, "vol": 1000.0}}, "2026-11-10", vol_adj=1.0)
+check("the base exit is recorded once (not overwritten when the old rules keep firing)", st["positions"]["AAA"]["base_exit_date"] == TODAY and not [e for e in ev_ if e["event"] == "BASE_SHADOW"])
+ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 97.9, "vol": 1000.0}}, "2026-11-11", vol_adj=1.0)
+x = [e for e in ev_ if e["event"] == "EXIT"][0]
+live_ret = ((97.9 - 102.0) / 102.0 - 0.001) * 100; base_ret = ((98.9 - 102.0) / 102.0 - 0.001) * 100
+check("EXIT carries the paired base outcome: base exit 98.9 CHANNEL_EXIT, paired gain = live - base",
+      x["base_exit_reason"] == "CHANNEL_EXIT" and x["base_exit_price"] == 98.9 and abs(x["base_ret_pct"] - base_ret) < 1e-9 and abs(x["paired_gain_pct"] - (live_ret - base_ret)) < 1e-9,
+      f"(live {live_ret:+.2f}%, base {base_ret:+.2f}%, gain {x['paired_gain_pct']:+.2f}%)")
+bs = st["stats"]["base_shadow"]
+check("base_shadow ledger books the paired base trade (n=1, base net P&L), signal ledger books the live one",
+      bs["n"] == 1 and abs(bs["pnl_inr"] - ((98.9 - 102.0) * 100 - 0.001 * 102.0 * 100)) < 1e-6 and st["stats"]["signal"]["n"] == 1)
+# old rules never fired before the live exit -> same outcome
+st = fresh(); st["positions"]["AAA"] = sb.asdict(P0(hwm=130.0))
+ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 121.0, "vol": 1000.0}}, TODAY, vol_adj=1.0)
+x = [e for e in ev_ if e["event"] == "EXIT"][0]
+check("trail exit while the old rules were still holding: base = same exit (LIVE_FIRST), paired gain 0, no stray BASE_SHADOW event",
+      x["exit_reason"] == "TRAIL_EXIT" and x["base_exit_reason"] == "LIVE_FIRST" and abs(x["paired_gain_pct"]) < 1e-9 and not [e for e in ev_ if e["event"] == "BASE_SHADOW"])
+# both fire the same day (stop)
+st = fresh(); st["positions"]["AAA"] = sb.asdict(P0(hwm=102.0))
+ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 97.9, "vol": 1000.0}}, TODAY, vol_adj=1.0)
+x = [e for e in ev_ if e["event"] == "EXIT"][0]
+check("stop: old and new rules agree the same day -> base_exit_reason STOP_LOSS, paired gain 0, ledgers match",
+      x["base_exit_reason"] == "STOP_LOSS" and abs(x["paired_gain_pct"]) < 1e-9 and abs(st["stats"]["base_shadow"]["pnl_inr"] - st["stats"]["signal"]["pnl_inr"]) < 1e-6)
+check("EXIT record carries the peak (hwm, peak_ret_pct) for the capture ratio", x["hwm"] == 102.0 and abs(x["peak_ret_pct"]) < 1e-9)
+ev_ = sb.run_day(fresh(), UNI[:1], {"AAA": {"df": DF, "px": 102.0, "vol": 2000.0}}, TODAY, vol_adj=1.0)
+e = [r for r in ev_ if r["event"] == "ENTRY"][0]
+check("ENTRY record names the exit rule", e["exit_rule"] == "trail4")
+st = fresh(); sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 102.0, "vol": 2000.0}}, TODAY, vol_adj=1.0)
+check("new position stores hwm = entry price and no base exit yet", st["positions"]["AAA"]["hwm"] == 102.0 and st["positions"]["AAA"]["base_exit_date"] is None)
+st = fresh()
+st["positions"]["AAA"] = {k: v for k, v in sb.asdict(P0()).items() if k not in ("hwm", "base_exit_date", "base_exit_price", "base_exit_reason")}
+ev_ = sb.run_day(st, UNI[:1], {"AAA": {"df": DF, "px": 103.0, "vol": 1000.0}}, TODAY, vol_adj=1.0)
+check("a position saved before the trail (no hwm / base keys) loads, gets a hwm and keeps running", st["positions"]["AAA"]["hwm"] == 103.0 and ev_ == [])
+buf = io.StringIO()
+st = fresh(); st["positions"]["AAA"] = sb.asdict(P0(hwm=110.0, base_exit_date="2026-11-09", base_exit_price=98.9, base_exit_reason="CHANNEL_EXIT"))
+with contextlib.redirect_stdout(buf):
+    sb.print_status(st)
+check("status shows the base-exit shadow ledger, the hwm and the old-exit note on an open position", "BASE-EXIT SHADOW" in buf.getvalue() and "hwm 110.00" in buf.getvalue() and "old exits would have closed" in buf.getvalue())
 
 print("RB: risk book (equal risk, count and gross caps)")
 st = fresh()
@@ -254,10 +318,37 @@ def line(name, k, extra=""):
 line("signal book (long, any regime)", "signal", f"  (+{len(st['positions'])} open)")
 line("capital book (3 slots, NIFTY>200-DMA)", "capital")
 line("short shadow", "short_shadow", f"  (+{len(st['shorts'])} open)")
-print("  research (N50): long 569 trades +1.07% (hedged +0.58%); short 389 trades -1.31% (hedged -0.58%)")
+print("  research (N50, OLD exits): long 569 trades +1.07% (hedged +0.58%); short 389 trades -1.31% (hedged -0.58%); the shorts still use the old exits")
 sg, sh = st["stats"]["signal"], st["stats"]["short_shadow"]
-check("long signal book: trade count within 3% of research (582 long-only sim)", abs((sg["n"] + len(st["positions"])) - 582) <= 18, f"({sg['n'] + len(st['positions'])})")
-check("long signal book expectancy within 0.25 pt of the research +1.06%/trade", abs(sg["sum_ret_pct"] / sg["n"] - 1.06) <= 0.25, f"({sg['sum_ret_pct']/sg['n']:+.2f})")
+bsl = st["stats"]["base_shadow"]
+print(f"  base-exit shadow (same entries, OLD exits): {bsl['n']} closed, win {bsl['wins']/max(bsl['n'],1)*100:.0f}%, {bsl['sum_ret_pct']/max(bsl['n'],1):+.2f}%/trade")
+
+
+def ref_trail(s):
+    """Independent reference for the live LONG rule (simple-mean ATR14 instead of the engine's Wilder ATR): same entries, 2-ATR stop, 4-ATR trail from the highest close."""
+    d = full[s]; c, h, l, v = (d[k].values.astype(float) for k in ("close", "high", "low", "volume")); n = len(c)
+    pc = np.r_[np.nan, c[:-1]]; tr = np.fmax(h - l, np.fmax(np.abs(h - pc), np.abs(l - pc))); tr[0] = h[0] - l[0]
+    atr = pd.Series(tr).rolling(14).mean().values; rets, op, pos, last = [], 0, False, -1
+    for t in range(200, n):
+        if pos:
+            hc = max(hc, c[t])
+            if c[t] <= ep - 2 * ea or c[t] < hc - 4 * atr[t]:
+                rets.append(c[t] / ep - 1 - 0.001); pos = False; last = t
+            continue
+        if t != last and c[t] > h[t - 20:t].max() and v[t - 20:t].mean() > 0 and v[t] / v[t - 20:t].mean() >= 1.5:
+            pos, ep, ea, hc = True, c[t], atr[t], c[t]
+    return rets, int(pos)
+
+
+rr, ro = [], 0
+for s in names:
+    r_, o_ = ref_trail(s); rr += r_; ro += o_
+ref_n, ref_mean = len(rr) + ro, float(np.mean(rr)) * 100
+eng_n, eng_mean = sg["n"] + len(st["positions"]), sg["sum_ret_pct"] / sg["n"]
+print(f"  reference (independent numpy sim of the trail rule): {len(rr)} closed + {ro} open, {ref_mean:+.2f}%/trade   engine: {sg['n']} closed + {len(st['positions'])} open, {eng_mean:+.2f}%/trade")
+check("long signal book (4-ATR trail): trade count within 5% of the independent reference sim", abs(eng_n - ref_n) <= max(6, 0.05 * ref_n), f"(engine {eng_n}, reference {ref_n})")
+check("long signal book (4-ATR trail): expectancy within 0.8 pt of the independent reference", abs(eng_mean - ref_mean) <= 0.8, f"(engine {eng_mean:+.2f}, reference {ref_mean:+.2f})")
+check("every closed live long has a paired base-exit outcome (ledger counts match)", bsl["n"] == sg["n"], f"({bsl['n']} vs {sg['n']})")
 check("short shadow loses, as the research found (-1.25% short-only sim): within 0.35 pt", abs(sh["sum_ret_pct"] / sh["n"] - (-1.25)) <= 0.35, f"({sh['sum_ret_pct']/sh['n']:+.2f})")
 check("short shadow trade count within 8% of the research short-only sim (400)", abs((sh["n"] + len(st["shorts"])) - 400) <= 32, f"({sh['n'] + len(st['shorts'])})")
 

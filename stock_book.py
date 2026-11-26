@@ -33,10 +33,18 @@ Rules (research/stk_triggers.py, stk_expectancy.py; same definitions)
           prior-20-session average. Today's volume is partial at 15:25, so it is scaled by
           LIVE_VOLUME_ADJ (approximation; the raw ratio is logged as well).
   ATR   : Wilder ATR14 including today's true range (day high/low from the quote), measured at entry.
-  Exit  : STOP_LOSS price <= entry - 2 x ATR14 (ATR at entry) | CHANNEL_EXIT price < lowest low of
-          the prior 10 completed sessions | TIME_EXIT after 30 sessions. Checked in that order.
-  Short shadow: the mirror (price below the prior-20-session low on 1.5x volume; stop +2 ATR; exit above
-          the prior-10-session high; 30 sessions).
+  Exit (LONGS, since Nov 26 2026, tag kronos-fut-v1.6-trail-exit; rollback = tag kronos-fut-v1.5-risk-book):
+          STOP_LOSS price <= entry - 2 x ATR14 (ATR at entry) | TRAIL_EXIT price < (highest close since entry) - 4 x ATR14
+          (current ATR, today's range included) | TIME_EXIT after 365 calendar days (housekeeping backstop, not a rule).
+          Why: futures_v2/research/stock_exit_lab.py and stock_exit_lab2.py (H23/H24), 14.9 years, identical entries: the old
+          10-day-low channel exit closed trades at about break-even mid-trend and the 30-session cap cut winners that kept
+          running (31% of trades hit it, mean +11%); the 4-ATR trail lifted a 5-slot portfolio from CAGR 12.8% / Sharpe 0.85 /
+          max drawdown -34% to 18.8% / 1.07 / -27%. Volume- and profit-based exit rules added nothing on top of it.
+          Caveats: today's constituents (survivorship) flatter ride-the-runner exits; the edge sits in a few large winners.
+  BASE-EXIT SHADOW: every long also carries the OLD exits (channel 10 / 30 sessions) as a no-capital paper outcome on the same
+          entry, so each closed trade has a paired "what the old rules would have paid" (base_exit_* / paired_gain_pct on EXIT).
+  Short shadow: the mirror, with the OLD exits (price below the prior-20-session low on 1.5x volume; stop +2 ATR; exit above
+          the prior-10-session high; 30 sessions). The trail was only tested on longs, so shorts are unchanged.
   No re-entry in a stock on the day it exits. No entry when the quote is stale (holiday).
 
 Four ledgers from one engine
@@ -88,12 +96,14 @@ UNIVERSE_FILE = HERE / "stock_universe.json"
 STATE_FILE    = HERE / "stock_state.json"
 TRADES_LOG    = HERE / "stock_trades.jsonl"
 SIGNALS_LOG   = HERE / "stock_signals.jsonl"
-BOOKS         = ("signal", "capital", "short_shadow", "risk")
+BOOKS         = ("signal", "capital", "short_shadow", "risk", "base_shadow")
 
-CHANNEL_IN, CHANNEL_OUT = 20, 10      # Donchian entry / exit windows (completed sessions)
+CHANNEL_IN, CHANNEL_OUT = 20, 10      # Donchian entry window; exit window of the OLD (base / short-shadow) rules (completed sessions)
 VOL_AVG, VOL_MULT       = 20, 1.5     # volume expansion vs prior-20-session average
 ATR_N, STOP_ATR         = 14, 2.0     # initial stop = 2 ATR from entry
-MAX_HOLD                = 30          # sessions
+MAX_HOLD                = 30          # sessions: OLD (base / short-shadow) time exit
+TRAIL_ATR               = 4.0         # LONG exit: price < highest close since entry - 4 x current ATR14
+BACKSTOP_DAYS           = 365         # LONG housekeeping backstop (calendar days since entry); never expected to fire
 COST_PCT                = 0.0010      # round trip, deducted at exit
 MAX_SLOTS               = 3           # capital-book concurrency (Rs3.5L of margin)
 LIVE_VOLUME_ADJ         = 1.03        # 15:25 volume is ~97% of the day: approximation
@@ -122,6 +132,10 @@ class StockPos:
     nifty_entry: Optional[float] = None
     regime_above200: Optional[bool] = None
     risk_lots: int = 0                 # > 0 = also in the risk book, this many lots
+    hwm: Optional[float] = None        # highest close / last price since entry (longs; the trail anchors on it)
+    base_exit_date: Optional[str] = None     # when the OLD exits (channel 10 / 30 sessions / stop) first fired on this position
+    base_exit_price: Optional[float] = None
+    base_exit_reason: Optional[str] = None
 
 
 def _empty_stats() -> dict:
@@ -184,7 +198,8 @@ def evaluate_entry(df: pd.DataFrame, px: float, vol_today: float, vol_adj: float
     return {"signal": sig, "hi_in": hi_in, "lo_in": lo_in, "volx": volx, "volx_raw": volx_raw, "atr": atr}
 
 
-def check_exit(pos: StockPos, df: pd.DataFrame, px: float) -> Optional[str]:
+def check_exit_base(pos: StockPos, df: pd.DataFrame, px: float) -> Optional[str]:
+    """The OLD exits (until Nov 26 2026 for longs; still the rule for the short shadow): stop, 10-session channel, 30 sessions."""
     d = df.tail(CONTEXT_BARS)
     if pos.side * (px - pos.entry_price) <= -STOP_ATR * pos.atr:
         return "STOP_LOSS"
@@ -194,6 +209,39 @@ def check_exit(pos: StockPos, df: pd.DataFrame, px: float) -> Optional[str]:
         return "CHANNEL_EXIT"
     held = int((df["datetime"].dt.normalize() > pd.Timestamp(pos.entry_date)).sum()) + 1   # sessions incl. today
     if held >= MAX_HOLD:
+        return "TIME_EXIT"
+    return None
+
+
+def _atr_now(df: pd.DataFrame, px: float, day_high: Optional[float] = None, day_low: Optional[float] = None) -> float:
+    """Current ATR14, with today's range (quote high / low) included when available, as at entry."""
+    d = df.tail(CONTEXT_BARS)
+    if day_high is not None and day_low is not None:
+        today_bar = pd.DataFrame([{"datetime": pd.NaT, "open": px, "high": max(day_high, px), "low": min(day_low, px), "close": px, "volume": 0.0}])
+        return _atr(pd.concat([d, today_bar], ignore_index=True))
+    return _atr(d)
+
+
+def _hwm(pos: StockPos, df: pd.DataFrame, px: float) -> float:
+    """Highest close since entry: the stored high-water mark, the entry price, every completed close after the entry date, and today's price."""
+    h = max(pos.hwm if pos.hwm is not None else pos.entry_price, pos.entry_price, px)
+    after = df[df["datetime"].dt.normalize() > pd.Timestamp(pos.entry_date)]
+    if len(after):
+        h = max(h, float(after["close"].max()))
+    return float(h)
+
+
+def check_exit(pos: StockPos, df: pd.DataFrame, px: float, day_high: Optional[float] = None, day_low: Optional[float] = None) -> Optional[str]:
+    """Longs: stop at 2 ATR (entry ATR), then the 4-ATR trail below the highest close since entry, then the 365-day backstop.
+    The short shadow keeps the old mirrored rules (the trail was only tested on longs)."""
+    if pos.side != 1:
+        return check_exit_base(pos, df, px)
+    if px - pos.entry_price <= -STOP_ATR * pos.atr:
+        return "STOP_LOSS"
+    if px < _hwm(pos, df, px) - TRAIL_ATR * _atr_now(df, px, day_high, day_low):
+        return "TRAIL_EXIT"
+    today = datetime.now(IST).date() if df.empty else df["datetime"].iloc[-1].date() + timedelta(days=1)
+    if (today - pd.Timestamp(pos.entry_date).date()).days >= BACKSTOP_DAYS:
         return "TIME_EXIT"
     return None
 
@@ -219,7 +267,23 @@ def run_day(st: dict, universe: list[dict], data: dict, today: str, vol_adj: flo
             pos = StockPos(**book[sym])
             if pos.entry_date == today:
                 continue
-            reason = check_exit(pos, d["df"], d["px"])
+            reason = check_exit(pos, d["df"], d["px"], d.get("high"), d.get("low"))
+            base_reason = None
+            if side == 1:
+                book[sym]["hwm"] = _hwm(pos, d["df"], d["px"])                      # persist the high-water mark every run
+                if pos.base_exit_date is None:
+                    base_reason = check_exit_base(pos, d["df"], d["px"])           # what the OLD exits would do on this position
+                    if base_reason and not reason:                                  # old rules would be out, the trail holds: record the paper exit
+                        book[sym].update(base_exit_date=today, base_exit_price=d["px"], base_exit_reason=base_reason)
+                        bn = (d["px"] - pos.entry_price) * pos.lot - COST_PCT * pos.entry_price * pos.lot
+                        brec = {"event": "BASE_SHADOW", "book": "base_shadow", "symbol": sym, "direction": "LONG", "entry_date": pos.entry_date,
+                                "entry_price": pos.entry_price, "base_exit_date": today, "base_exit_price": d["px"], "base_exit_reason": base_reason,
+                                "base_ret_pct": ((d["px"] - pos.entry_price) / pos.entry_price - COST_PCT) * 100, "base_pnl_inr": bn,
+                                "live_exit_rule_still_holding": True}
+                        events.append(brec)
+                        if write_logs:
+                            _append(TRADES_LOG, brec)
+                        log.info("[%s] BASE SHADOW: old exits would close LONG @ %.2f (%s, %+.2f%%); the 4-ATR trail still holds", sym, d["px"], base_reason, brec["base_ret_pct"])
             if not reason:
                 continue
             gross = side * (d["px"] - pos.entry_price) * pos.lot
@@ -228,6 +292,22 @@ def run_day(st: dict, universe: list[dict], data: dict, today: str, vol_adj: flo
             ret_pct = (side * (d["px"] - pos.entry_price) / pos.entry_price - COST_PCT) * 100
             nret = ((nifty_now / pos.nifty_entry - 1) * 100) if (nifty_now and pos.nifty_entry) else None
             hedged = (ret_pct - side * nret - HEDGE_COST_PCT * 100) if nret is not None else None
+            base = None
+            if side == 1:                                                           # paired outcome of the OLD exits on this same entry
+                if pos.base_exit_date is not None:
+                    bdate, bpx, breason = pos.base_exit_date, pos.base_exit_price, pos.base_exit_reason
+                elif base_reason:
+                    bdate, bpx, breason = today, d["px"], base_reason                  # old and new rules both fire today
+                else:
+                    bdate, bpx, breason = today, d["px"], "LIVE_FIRST"                 # old rules were still holding: same exit
+                bnet = (bpx - pos.entry_price) * pos.lot - cost
+                bret = ((bpx - pos.entry_price) / pos.entry_price - COST_PCT) * 100
+                bs = st["stats"]["base_shadow"]
+                bs["n"] += 1; bs["wins"] += 1 if bnet > 0 else 0
+                bs["pnl_inr"] += bnet; bs["cost_inr"] += cost; bs["sum_ret_pct"] += bret
+                base = {"base_exit_date": bdate, "base_exit_price": bpx, "base_exit_reason": breason, "base_ret_pct": bret,
+                        "base_pnl_inr": bnet, "paired_gain_pct": ret_pct - bret, "paired_gain_inr": net - bnet,
+                        "hwm": book[sym]["hwm"], "peak_ret_pct": (book[sym]["hwm"] / pos.entry_price - 1) * 100}
             for bk in (("signal",) + (("capital",) if pos.slot else ())) if side == 1 else ("short_shadow",):
                 s_ = st["stats"][bk]
                 s_["n"] += 1; s_["wins"] += 1 if net > 0 else 0
@@ -245,6 +325,8 @@ def run_day(st: dict, universe: list[dict], data: dict, today: str, vol_adj: flo
                    "nifty_ret_pct": nret, "hedged_ret_pct": hedged, "regime_above200": pos.regime_above200,
                    "volx": pos.volx, "kronos_dir": pos.kronos_dir, "kronos_conf": pos.kronos_conf,
                    "risk_lots": pos.risk_lots, "pnl_risk_inr": net * pos.risk_lots}
+            if base:
+                rec.update(base)
             events.append(rec)
             if write_logs:
                 _append(TRADES_LOG, rec)
@@ -298,13 +380,14 @@ def run_day(st: dict, universe: list[dict], data: dict, today: str, vol_adj: flo
                     risk_lots = want
             pos = StockPos(symbol=sym, entry_date=today, entry_price=d["px"], atr=ev["atr"], lot=lots[sym], slot=slot,
                            volx=round(volx, 3), kronos_dir=kd, kronos_conf=(round(kc, 3) if kc is not None else None),
-                           side=side, nifty_entry=nifty_now, regime_above200=above200, risk_lots=risk_lots)
+                           side=side, nifty_entry=nifty_now, regime_above200=above200, risk_lots=risk_lots, hwm=d["px"])
             book[sym] = asdict(pos)
             rec = {"event": "ENTRY", "book": bname, "symbol": sym, "direction": "LONG" if side == 1 else "SHORT",
                    "entry_date": today, "entry_price": d["px"], "atr": ev["atr"], "stop": d["px"] - side * STOP_ATR * ev["atr"],
                    "lot": pos.lot, "slot": slot, "volx": pos.volx, "volx_raw": round(ev["volx_raw"], 3),
                    "hi20": ev["hi_in"], "lo20": ev["lo_in"], "nifty": nifty_now, "regime_above200": above200,
                    "capital_blocked_by_regime": (side == 1 and not regime_ok), "risk_lots": risk_lots,
+                   "exit_rule": "trail4" if side == 1 else "channel10_30d",
                    "kronos_dir": kd, "kronos_conf": pos.kronos_conf,
                    "kronos_agrees": (kd == "LONG") if kd is not None else None}
             events.append(rec)
@@ -441,7 +524,8 @@ def print_status(st: dict):
     for name, key in (("SIGNAL BOOK  long, uncapped, any regime", "signal"),
                       (f"CAPITAL BOOK long, max {MAX_SLOTS} open, NIFTY > 200-DMA", "capital"),
                       ("SHORT SHADOW mirrored shorts, no capital", "short_shadow"),
-                      (f"RISK BOOK equal-risk sizing, max {RISK_MAX_POS}, Rs{RISK_CAPITAL/1e5:.0f}L", "risk")):
+                      (f"RISK BOOK equal-risk sizing, max {RISK_MAX_POS}, Rs{RISK_CAPITAL/1e5:.0f}L", "risk"),
+                      ("BASE-EXIT SHADOW same entries, OLD exits (paired with the signal book)", "base_shadow")):
         s = st["stats"][key]
         if key == "risk" and s["n"]:
             print(f"  {name}: {s['n']} closed, win {s['wins']/s['n']*100:.0f}%, net INR {s['pnl_inr']:+,.0f} = {s['pnl_inr']/RISK_CAPITAL*100:+.2f}% of capital; "
@@ -459,7 +543,9 @@ def print_status(st: dict):
                 sd = p.get("side", 1)
                 print(f"    {sym:<12} entry {p['entry_date']} @ {p['entry_price']:.2f}  stop {p['entry_price'] - sd * STOP_ATR * p['atr']:.2f}  "
                       f"lot {p['lot']}  {'CAPITAL' if p['slot'] else 'signal-only'}{'+RISK x' + str(p['risk_lots']) if p.get('risk_lots', 0) else ''}  volx {p['volx']:.2f}  "
-                      f"NIFTY>200DMA {p.get('regime_above200')}  kronos {p['kronos_dir']}/{p['kronos_conf']}")
+                      f"NIFTY>200DMA {p.get('regime_above200')}  kronos {p['kronos_dir']}/{p['kronos_conf']}"
+                      + (f"  hwm {p['hwm']:.2f}" if p.get("hwm") and sd == 1 else "")
+                      + (f"  [old exits would have closed {p['base_exit_date']} @ {p['base_exit_price']:.2f} ({p['base_exit_reason']})]" if p.get("base_exit_date") else ""))
     if not st["positions"] and not st["shorts"]:
         print("  No open positions.")
     print(sep)
