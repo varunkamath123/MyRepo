@@ -78,7 +78,7 @@ for lab, g in (("yes", T[T.newhi]), ("no", T[~T.newhi])):
 a5 = T[T.alive5]
 print("\n  H12 cell (trades still open after 5 sessions): by the return after 5 sessions")
 for lab, m in (("down > 3%", a5.r5 < -0.03), ("-3% .. 0%", (a5.r5 >= -0.03) & (a5.r5 < 0)), ("0% .. +3%", (a5.r5 >= 0) & (a5.r5 < 0.03)), ("up > 3%", a5.r5 >= 0.03)):
-    g = a5[m]; print(f"    {lab:<32}{len(g):>6}{(g.ret>0).mean()*100:>6.0f}{g.ret.mean()*100:>+8.2f}{g.stop.mean()*100:>7.0f}   final return of these trades")
+    g = a5[m]; print(f"    {lab:<32}{len(g):>6}{(g.ret>0).mean()*100:>6.0f}{g.ret.mean()*100:>+8.2f}{g.stop.mean()*100:>7.0f}   day-5 level {g.r5.mean()*100:+.2f}% -> final {g.ret.mean()*100:+.2f}%  (what happened AFTER day 5: {(g.ret - g.r5).mean()*100:+.2f}%)")
 
 # ---------------- PART 2: live book
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -107,4 +107,4 @@ L = pd.DataFrame(L).sort_values("ret")
 print(f"\nPART 2  the live book's longs, worst first, with the entry features (compare with the Part 1 tables):")
 print(f"  {'symbol':<11}{'entered':<11}{'ret now%':>9}{'volx':>6}{'ext ATR':>8}{'day ret%':>9}{'loc':>6}{'run20%':>8}{'new 252d hi':>12}{'ATR%':>6}{'NIFTY day%':>11}")
 for _, r in L.iterrows():
-    print(f"  {r.sym:<11}{r.entry:<11}{r.ret:>+9.2f}{r.volx:>6.2f}{r.ext:>8.2f}{r.day*100:>+9.2f}{r.loc:>6.2f}{r.run20*100:>+8.1f}{('yes' if r.newhi else 'no'):>12}{r.atrpct*100:>6.1f}{r.nday*100 if not np.isnan(r.nday) else float('nan'):>+11.2f}")
+    print(f"  {r['sym']:<11}{r['entry']:<11}{r['ret']:>+9.2f}{r['volx']:>6.2f}{r['ext']:>8.2f}{r['day']*100:>+9.2f}{r['loc']:>6.2f}{r['run20']*100:>+8.1f}{('yes' if r['newhi'] else 'no'):>12}{r['atrpct']*100:>6.1f}{r['nday']*100:>+11.2f}")
